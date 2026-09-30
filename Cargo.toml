@@ -10,6 +10,10 @@ publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+subtle = "2"
+zeroize = { version = "1", features = ["alloc", "derive"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -17,6 +21,9 @@ predicates = "3"
 # Test harness (SHA-216). reqwest has default features off so no TLS crates
 # arrive until SHA-273 settles the license allowlist.
 reqwest = { version = "0.12", default-features = false }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 wiremock = "0.6"

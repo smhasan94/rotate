@@ -29,3 +29,28 @@ Three kinds of test, and where each lives:
 Never print a request body or a secret in a test: recorded calls show
 `body_len` in `Debug`, and assertion messages name calls by method and path.
 If a test must inspect a body, call `.body()` and assert on it.
+
+## Handling secret values
+
+Every credential the tool touches is a `rotate::secret::SecretValue`
+(SHA-217). Never hold a secret in a `String`, `Vec<u8>` or `&str` outside of
+the closure that uses it.
+
+- Build one with `SecretValue::from(...)` or `SecretValue::from_reader(...)`,
+  or let serde build it: the type implements `Deserialize`, so report and
+  stdin structs can declare `raw: SecretValue` directly.
+- Read the bytes only with `expose_secret(|bytes| ...)` or
+  `expose_secret_str(|s| ...)`, at the call that sends them (a request
+  header, a request body). Keep the closure small and return a non-secret
+  result from it.
+- Print or log the `fingerprint()` instead. `Debug` and `Display` on
+  `SecretValue` already do this, so `{:?}` and `{}` are safe; the plaintext
+  has no formatting path at all.
+- Never derive `Serialize` on a struct that holds a `SecretValue`; it will
+  not compile, and that is the point. Serialize the `Fingerprint` instead.
+- For AWS keys use `SecretPair { key_id, secret }`; only the secret half is
+  protected and the fingerprint is computed over it.
+- Every ticket that touches secret values adds a test proving the value never
+  reaches stdout, stderr, tracing output or the audit log. `tests/secret_leak.rs`
+  shows the pattern: format into an in-memory writer, capture tracing with a
+  subscriber writing to a shared buffer, and assert the plaintext is absent.
