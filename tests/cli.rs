@@ -118,3 +118,9 @@ fn missing_flag_value_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("--config"));
 }
+
+#[test]
+fn   fmt_canary( ) {
+    let n   = 2;
+    assert_eq!(n,2);
+}
