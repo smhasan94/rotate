@@ -1,0 +1,2 @@
+# Lint configuration. `disallowed-macros` for println!/eprintln! outside the
+# console module is added in SHA-246 once the redacted console exists.
