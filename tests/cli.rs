@@ -118,3 +118,10 @@ fn missing_flag_value_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("--config"));
 }
+
+/// Throwaway: triggers clippy::len_zero.
+#[test]
+fn clippy_canary() {
+    let v = vec![1];
+    assert!(!(v.len() == 0));
+}
