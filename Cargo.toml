@@ -1,0 +1,16 @@
+[package]
+name = "rotate"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "Revoke and rotate leaked secrets safely, end to end"
+repository = "https://github.com/smhasan94/rotate"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
