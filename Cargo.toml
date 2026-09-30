@@ -8,10 +8,6 @@ description = "Revoke and rotate leaked secrets safely, end to end"
 repository = "https://github.com/smhasan94/rotate"
 publish = false
 
-[[bin]]
-name = "rotate"
-path = "src/main.rs"
-
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 

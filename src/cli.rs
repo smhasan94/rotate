@@ -17,7 +17,7 @@ pub struct Cli {
 
     /// Subcommand to run. Defaults to `plan`.
     #[command(subcommand)]
-    pub command: Option<Command>,
+    pub subcommand: Option<Command>,
 }
 
 /// Flags accepted before or after any subcommand.
@@ -64,7 +64,7 @@ impl Command {
 impl Cli {
     /// The subcommand to run, applying the `plan` default.
     pub fn subcommand(&self) -> Command {
-        self.command.unwrap_or(Command::Plan)
+        self.subcommand.unwrap_or(Command::Plan)
     }
 }
 

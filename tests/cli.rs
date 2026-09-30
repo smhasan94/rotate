@@ -7,6 +7,17 @@ fn rotate() -> Command {
     Command::cargo_bin("rotate").expect("rotate binary builds")
 }
 
+fn assert_stub(name: &str) {
+    rotate()
+        .arg(name)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(format!(
+            "rotate {name}: not implemented"
+        )));
+}
+
 /// T2 covers AC2.
 #[test]
 fn version_prints_crate_version() {
@@ -29,17 +40,20 @@ fn no_args_runs_plan_stub() {
 
 /// T4 covers AC4.
 #[test]
-fn subcommand_stubs_exit_2() {
-    for name in ["apply", "rollback", "status"] {
-        rotate()
-            .arg(name)
-            .assert()
-            .code(2)
-            .stdout(predicate::str::is_empty())
-            .stderr(predicate::str::contains(format!(
-                "rotate {name}: not implemented"
-            )));
-    }
+fn apply_stub_exits_2() {
+    assert_stub("apply");
+}
+
+/// T4 covers AC4.
+#[test]
+fn rollback_stub_exits_2() {
+    assert_stub("rollback");
+}
+
+/// T4 covers AC4.
+#[test]
+fn status_stub_exits_2() {
+    assert_stub("status");
 }
 
 /// T5 covers AC5.
@@ -49,7 +63,25 @@ fn unknown_subcommand_exits_2() {
         .arg("bogus")
         .assert()
         .code(2)
+        .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("Usage"));
+}
+
+/// T5 covers AC5: a token typed where a subcommand or flag goes is never
+/// echoed, so a pasted secret cannot reach stderr.
+#[test]
+fn unknown_arg_is_not_echoed() {
+    let canary = "AKIAIOSFODNN7EXAMPLE_canary_9f3c";
+    for args in [vec![canary], vec!["plan", canary], vec!["--nope", canary]] {
+        rotate()
+            .args(&args)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains(canary).not())
+            .stderr(predicate::str::contains("--stdin"))
+            .stderr(predicate::str::contains("Usage"));
+    }
 }
 
 /// T6 covers AC6.
@@ -75,4 +107,14 @@ fn global_flags_accepted_before_subcommand() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("rotate plan: not implemented"));
+}
+
+/// Extra: clap's own errors for missing values still exit 2.
+#[test]
+fn missing_flag_value_exits_2() {
+    rotate()
+        .arg("--config")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--config"));
 }
