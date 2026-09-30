@@ -118,3 +118,9 @@ fn missing_flag_value_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("--config"));
 }
+
+/// Throwaway: fails on purpose.
+#[test]
+fn failing_canary() {
+    assert!(std::env::var("ROTATE_T5_CANARY").is_ok());
+}
