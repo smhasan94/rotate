@@ -14,3 +14,9 @@ clap = { version = "4", features = ["derive", "env"] }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# Test harness (SHA-216). reqwest has default features off so no TLS crates
+# arrive until SHA-273 settles the license allowlist.
+reqwest = { version = "0.12", default-features = false }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

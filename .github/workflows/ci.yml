@@ -63,7 +63,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
-      - run: cargo test --all-features
+      - name: cargo test
+        shell: bash
+        run: cargo test --all-features 2>&1 | tee test.log
+      - name: live tests are ignored by default (SHA-216 T3)
+        # ROTATE_LIVE_TESTS is never set in CI, so the live smoke test must
+        # show up as ignored, never as run.
+        shell: bash
+        run: |
+          grep -E "^test live_smoke .* ignored" test.log
+          ! grep -E "^test live_smoke .* ok" test.log
 
   deny:
     name: deny (${{ matrix.os }})

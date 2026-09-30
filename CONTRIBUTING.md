@@ -1,0 +1,31 @@
+# Contributing
+
+This file is a stub. SHA-213 fills in the rest (branch naming, commits,
+pull requests). The testing section below is owned by SHA-216.
+
+## Writing tests
+
+Three kinds of test, and where each lives:
+
+- **Unit tests** sit in `src/` next to the code in a `#[cfg(test)] mod tests`.
+- **Integration tests** sit in `tests/`. They never touch the network except a
+  wiremock server started in the test. Include the shared helpers with
+  `mod common;` and start a server with `common::CallRecorder::start().await`.
+  Use `rec.calls().await` to inspect what was sent and
+  `rec.assert_no_mutations().await` to prove a dry run made no
+  state-changing call. Mark read-only POST routes (AWS query calls) with
+  `rec.mark_read_only(|req| ...)`. Use `common::TestDirs::new()` for a temp
+  working directory with `.rotate/`.
+- **Live tests** call real provider APIs. Name them `live_*`, mark them
+  `#[ignore]`, and start the body with `live_guard!();`. They run only with:
+
+  ```sh
+  ROTATE_LIVE_TESTS=1 cargo test --all-features -- --ignored live_
+  ```
+
+  Default CI never sets that variable and asserts the live tests show as
+  ignored.
+
+Never print a request body or a secret in a test: recorded calls show
+`body_len` in `Debug`, and assertion messages name calls by method and path.
+If a test must inspect a body, call `.body()` and assert on it.
