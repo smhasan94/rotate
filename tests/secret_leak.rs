@@ -3,46 +3,16 @@
 //!
 //! Stdout and stderr are exercised through an in-memory `fmt::Write`, which
 //! is the same `Display` and `Debug` path `println!` and `eprintln!` use.
-//! Tracing output is captured by a subscriber writing into a shared buffer.
+//! Tracing output is captured with `common::LogCapture`.
+
+mod common;
 
 use std::fmt::Write as _;
-use std::io;
 use std::panic;
-use std::sync::{Arc, Mutex};
 
 use rotate::secret::{Fingerprint, SecretPair, SecretValue};
-use tracing_subscriber::fmt::MakeWriter;
 
 const PLAINTEXT: &str = "hunter2-abc-canary-9f2c";
-
-/// Buffer shared between the test and the tracing subscriber.
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl Capture {
-    fn contents(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-    }
-}
-
-impl io::Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = Capture;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
 
 fn assert_hidden(label: &str, text: &str, fingerprint: &Fingerprint) {
     assert!(
@@ -77,12 +47,8 @@ fn secret_never_reaches_tracing_output() {
     let pair = SecretPair::new("AKIAIOSFODNN7EXAMPLE", value.clone());
     let fingerprint = value.fingerprint();
 
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(capture.clone())
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
+    let capture = common::LogCapture::default();
+    tracing::subscriber::with_default(capture.subscriber(), || {
         tracing::info!(
             secret = ?value,
             secret_display = %value,

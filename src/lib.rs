@@ -7,4 +7,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod calls;
+pub mod finding;
+pub mod provider;
 pub mod secret;

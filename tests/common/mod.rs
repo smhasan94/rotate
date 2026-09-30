@@ -13,7 +13,11 @@
 #![allow(dead_code, unused_imports, unused_macros)]
 
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use tracing_subscriber::fmt::MakeWriter;
 
 use tempfile::TempDir;
 use wiremock::matchers::any;
@@ -205,3 +209,49 @@ macro_rules! live_guard {
     };
 }
 pub(crate) use live_guard;
+
+/// Captures tracing output in memory so a test can assert what a subscriber
+/// would have written to stderr (SHA-217 T7, SHA-221 T7).
+///
+/// ```ignore
+/// let capture = common::LogCapture::default();
+/// let _guard = tracing::subscriber::set_default(capture.subscriber());
+/// tracing::info!(?value, "event");
+/// assert!(!capture.contents().contains(PLAINTEXT));
+/// ```
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Everything written so far.
+    pub fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A plain-text `fmt` subscriber writing into this capture.
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .finish()
+    }
+}
+
+impl io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
