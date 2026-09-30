@@ -12,6 +12,8 @@ in `CLAUDE.md`. Estimates are in points (1 = a few hours, 2 = most of a day,
 3 = a full day).
 
 Decisions the backlog is built on are in `docs/requirements.md` section 11.
+Implementation plans, one file per ticket, live in `docs/plans/` and are also
+posted as a comment titled "Implementation plan" on the Linear ticket.
 
 ## Epic 1: Repo scaffolding (SHA-186)
 
@@ -120,6 +122,7 @@ Not scheduled. Nice-to-haves and deferred decisions. No estimates.
 | SHA-204 | Later: mlock and core-dump protection for secret buffers |
 | SHA-206 | Later: notifications on completion or failure (Slack, email) |
 | SHA-208 | Later: Windows support |
+| SHA-273 | Later: license allowlist decision for MPL-2.0 and ring before adding reqwest (blocked by SHA-212, blocks SHA-221) |
 
 ## Totals
 
