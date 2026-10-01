@@ -1,0 +1,31 @@
+# Every field set; used by config::tests::full_fixture_sets_every_field.
+overlap_window: 1h30m
+audit_log: logs/rotate-audit.jsonl
+state_file: /var/lib/rotate/state.json
+consumers:
+  github_actions:
+    targets:
+      - acme/api
+      - org:acme
+    secret_names:
+      github: [GH_PAT, RELEASE_TOKEN]
+      aws: [CI_AWS_SECRET]
+    key_id_names:
+      aws: [CI_AWS_KEY_ID]
+  aws_secrets_manager:
+    secrets:
+      - prod/api
+      - arn:aws:secretsmanager:us-east-1:000000000000:secret:ci-AbCdEf
+    tag_filters:
+      - key: team
+        values: [payments]
+    json_keys: [AWS_SECRET_ACCESS_KEY]
+providers:
+  aws:
+    region: eu-west-1
+  github:
+    api_url: https://github.example.com/api/v3
+  npm:
+    registry: https://npm.example.com
+  openai:
+    admin_key_env: ROTATE_OPENAI_ADMIN

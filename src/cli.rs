@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use rotate::config::{Overlap, Overrides};
 
 /// Revoke and rotate leaked secrets safely, end to end.
 #[derive(Debug, Parser)]
@@ -34,6 +35,31 @@ pub struct GlobalArgs {
     /// Increase log verbosity. Repeat for more detail.
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Audit log path. Overrides ROTATE_AUDIT_LOG and rotate.yaml.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub audit_log: Option<PathBuf>,
+
+    /// Rotation state file path. Overrides ROTATE_STATE_FILE and rotate.yaml.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub state_file: Option<PathBuf>,
+
+    /// Time between updating consumers and revoking the old secret, such as
+    /// 30m or 1h30m. Overrides ROTATE_OVERLAP and rotate.yaml.
+    #[arg(long, global = true, value_name = "DURATION")]
+    pub overlap: Option<Overlap>,
+}
+
+impl GlobalArgs {
+    /// The command-line half of config resolution.
+    pub fn overrides(&self) -> Overrides {
+        Overrides {
+            config: self.config.clone(),
+            audit_log: self.audit_log.clone(),
+            state_file: self.state_file.clone(),
+            overlap_window: self.overlap,
+        }
+    }
 }
 
 /// The four workflow commands.
@@ -95,6 +121,31 @@ mod tests {
             cli.global.config.as_deref(),
             Some(std::path::Path::new("x.yaml"))
         );
+    }
+
+    #[test]
+    fn config_flags_become_overrides() {
+        let cli = Cli::parse_from([
+            "rotate",
+            "plan",
+            "--audit-log",
+            "a.jsonl",
+            "--state-file",
+            "s.json",
+            "--overlap",
+            "90m",
+        ]);
+        let overrides = cli.global.overrides();
+        assert_eq!(
+            overrides.audit_log.as_deref(),
+            Some(std::path::Path::new("a.jsonl"))
+        );
+        assert_eq!(
+            overrides.state_file.as_deref(),
+            Some(std::path::Path::new("s.json"))
+        );
+        assert_eq!(overrides.overlap_window.unwrap().to_string(), "1h30m");
+        assert!(Cli::try_parse_from(["rotate", "--overlap", "soon"]).is_err());
     }
 
     #[test]

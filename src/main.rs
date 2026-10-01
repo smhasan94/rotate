@@ -11,6 +11,8 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
+use rotate::config::Config;
+
 use crate::cli::{Cli, Command};
 use crate::exit::Exit;
 
@@ -19,7 +21,15 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => return handle_parse_error(err),
     };
-    run(cli.subcommand()).into()
+    // Config errors are usage errors: the operator fixes the file or flag.
+    let config = match Config::load(&cli.global.overrides()) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return Exit::Usage.into();
+        }
+    };
+    run(cli.subcommand(), &config).into()
 }
 
 /// Print a clap error without echoing tokens the user typed.
@@ -43,7 +53,7 @@ fn handle_parse_error(err: clap::Error) -> ExitCode {
     }
 }
 
-fn run(command: Command) -> Exit {
+fn run(command: Command, _config: &Config) -> Exit {
     // Every subcommand is a stub until its ticket lands (SHA-250 plan,
     // SHA-254 apply, SHA-259 rollback, SHA-263 status).
     eprintln!("rotate {}: not implemented", command.name());
