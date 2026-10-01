@@ -50,8 +50,8 @@ Not done yet:
   (a plain value, or a top-level JSON string field, plus the access key id
   field for an AWS pair), and writes a new version with `PutSecretValue`.
   It uses the standard AWS environment for credentials and makes no call
-  when that section is empty. Until the providers land, no secret reaches
-  it.
+  when that section is empty. Until the providers land and `rotate apply`
+  wires the loaded config into it (SHA-254), no secret reaches it.
 - `rotate apply`, `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).

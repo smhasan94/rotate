@@ -7,7 +7,10 @@
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
 //! enable it, and nothing in this file reads the variable without it.
 
-use rotate::config::Config;
+use std::sync::Arc;
+
+use rotate::config::{AwsConfig, ConsumersConfig};
+use rotate::consumer::aws_secrets_manager::SecretsManagerConsumer;
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -20,24 +23,23 @@ pub fn registry() -> ProviderRegistry {
     registry
 }
 
-/// Every consumer this build knows, configured from `config`. With
-/// `test-providers` the scenario's mocks are the only consumers, so CLI
-/// tests never reach a real service. The real consumers make no call until
-/// `find` runs (SHA-252).
-pub fn consumers(config: &Config) -> ConsumerRegistry {
+/// Every consumer this build knows, with default settings: no Secrets
+/// Manager names or tags, so that consumer makes no call. Callers with a
+/// loaded config use [`consumers_with`].
+pub fn consumers() -> ConsumerRegistry {
+    consumers_with(&ConsumersConfig::default(), &AwsConfig::default())
+}
+
+/// Every consumer this build knows, configured from `rotate.yaml`.
+/// Building the registry makes no network call and loads no credentials.
+pub fn consumers_with(config: &ConsumersConfig, aws: &AwsConfig) -> ConsumerRegistry {
     let mut registry = ConsumerRegistry::new();
+    registry.register(Arc::new(SecretsManagerConsumer::new(
+        config.aws_secrets_manager.clone(),
+        aws.region.clone(),
+    )));
     #[cfg(feature = "test-providers")]
-    {
-        let _ = config;
-        scenario::register_consumers(&mut registry);
-    }
-    #[cfg(not(feature = "test-providers"))]
-    registry.register(std::sync::Arc::new(
-        rotate::consumer::aws_secrets_manager::SecretsManagerConsumer::new(
-            config.consumers.aws_secrets_manager.clone(),
-            config.providers.aws.region.clone(),
-        ),
-    ));
+    scenario::register_consumers(&mut registry);
     registry
 }
 
