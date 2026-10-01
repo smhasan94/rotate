@@ -8,6 +8,7 @@
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
 //! enable it, and nothing in this file reads the variable without it.
 
+use rotate::apply::Prompt;
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -33,6 +34,15 @@ pub fn consumers() -> ConsumerRegistry {
     registry
 }
 
+/// The confirmation prompt a test scenario scripts, if any. Without
+/// `test-providers` always `None`: apply reads the terminal.
+pub fn prompt() -> Option<Box<dyn Prompt>> {
+    #[cfg(feature = "test-providers")]
+    return scenario::prompt();
+    #[cfg(not(feature = "test-providers"))]
+    None
+}
+
 /// Called once before exit. With `test-providers`, writes the shared call
 /// log to the scenario's `call_log` path; otherwise does nothing.
 pub fn finish() {
@@ -56,6 +66,12 @@ pub fn finish() {
 /// }
 /// ```
 ///
+/// For apply (SHA-254): `providers.<name>.fail` and `consumers[].fail` map a
+/// method name to an error text that every call to it returns; `prompt` is
+/// `{"answers": ["rot-..."]}`, `"panic"` (fails the test if apply asks) or
+/// `"no_tty"`; `consumer_state` is a path the binary writes on exit with
+/// what every mock consumer holds, `{"<name>": {"<ref>": "sha256:..."}}`.
+///
 /// Every mock shares one `CallLog`. [`write_call_log`] writes it as JSON
 /// lines (`target`, `method`, `mutating`, `fingerprint`), so a CLI test can
 /// prove a run made no state-changing call. The file holds fingerprints
@@ -64,15 +80,16 @@ pub fn finish() {
 mod scenario {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use serde::Deserialize;
 
+    use rotate::apply::{Prompt, PromptError, ScriptedPrompt};
     use rotate::calls::CallLog;
     use rotate::consumer::mock::MockConsumer;
     use rotate::consumer::{ConsumerError, ConsumerMatch, ConsumerRegistry, Holds};
     use rotate::provider::mock::MockProvider;
-    use rotate::provider::{ProviderRegistry, ReplacementMode, Validity};
+    use rotate::provider::{ProviderError, ProviderRegistry, ReplacementMode, Validity};
     use rotate::secret::Fingerprint;
 
     const ENV: &str = "ROTATE_TEST_SCENARIO";
@@ -85,6 +102,8 @@ mod scenario {
         #[serde(default)]
         consumers: Vec<ConsumerSetup>,
         call_log: Option<PathBuf>,
+        consumer_state: Option<PathBuf>,
+        prompt: Option<serde_json::Value>,
     }
 
     #[derive(Default, Deserialize)]
@@ -92,6 +111,8 @@ mod scenario {
     struct ProviderSetup {
         validity: Option<String>,
         mode: Option<String>,
+        #[serde(default)]
+        fail: BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -101,6 +122,8 @@ mod scenario {
         #[serde(default)]
         matches: Vec<MatchSetup>,
         fail_find: Option<String>,
+        #[serde(default)]
+        fail: BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -117,6 +140,7 @@ mod scenario {
     struct Loaded {
         scenario: Scenario,
         log: CallLog,
+        consumers: Mutex<Vec<Arc<MockConsumer>>>,
     }
 
     fn loaded() -> &'static Loaded {
@@ -134,6 +158,7 @@ mod scenario {
             Loaded {
                 scenario,
                 log: CallLog::new(),
+                consumers: Mutex::new(Vec::new()),
             }
         })
     }
@@ -163,6 +188,9 @@ mod scenario {
                     Some("manual") => mock.mode(ReplacementMode::Manual),
                     Some(other) => panic!("{ENV}: unknown mode {other:?}"),
                 };
+                for (method, error) in &setup.fail {
+                    mock.fail_always(method, ProviderError::Permanent(error.clone()));
+                }
             }
             registry.register(Arc::new(mock));
         }
@@ -200,12 +228,75 @@ mod scenario {
             if let Some(error) = &setup.fail_find {
                 mock.fail_always("find", ConsumerError::Permanent(error.clone()));
             }
-            registry.register(Arc::new(mock));
+            for (method, error) in &setup.fail {
+                mock.fail_always(method, ConsumerError::Permanent(error.clone()));
+            }
+            let mock = Arc::new(mock);
+            loaded
+                .consumers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Arc::clone(&mock));
+            registry.register(mock);
         }
+    }
+
+    /// Fails the test if apply asks for confirmation.
+    struct PanicPrompt;
+
+    impl Prompt for PanicPrompt {
+        fn read_line(&mut self) -> Result<String, PromptError> {
+            panic!("{ENV}: the scenario says apply must not prompt");
+        }
+    }
+
+    /// Stands in for a process with no controlling terminal.
+    struct NoTty;
+
+    impl Prompt for NoTty {
+        fn read_line(&mut self) -> Result<String, PromptError> {
+            Err(PromptError::NoTerminal)
+        }
+    }
+
+    pub fn prompt() -> Option<Box<dyn Prompt>> {
+        let setup = loaded().scenario.prompt.as_ref()?;
+        Some(match setup {
+            serde_json::Value::String(mode) if mode == "panic" => Box::new(PanicPrompt),
+            serde_json::Value::String(mode) if mode == "no_tty" => Box::new(NoTty),
+            serde_json::Value::Object(map) => {
+                let answers: Vec<String> = map
+                    .get("answers")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| panic!("{ENV}: prompt needs \"answers\""))
+                    .iter()
+                    .map(|a| a.as_str().unwrap_or_default().to_owned())
+                    .collect();
+                Box::new(ScriptedPrompt::new(answers))
+            }
+            other => panic!("{ENV}: unknown prompt {other}"),
+        })
     }
 
     pub fn write_call_log() {
         let loaded = loaded();
+        if let Some(path) = &loaded.scenario.consumer_state {
+            let mut held = serde_json::Map::new();
+            let consumers = loaded.consumers.lock().unwrap_or_else(|p| p.into_inner());
+            for (mock, setup) in consumers.iter().zip(&loaded.scenario.consumers) {
+                let refs: serde_json::Map<String, serde_json::Value> = setup
+                    .matches
+                    .iter()
+                    .filter_map(|m| {
+                        mock.current(&m.consumer_ref)
+                            .map(|fp| (m.consumer_ref.clone(), serde_json::json!(fp.to_string())))
+                    })
+                    .collect();
+                held.insert(setup.name.clone(), serde_json::Value::Object(refs));
+            }
+            std::fs::write(path, serde_json::Value::Object(held).to_string())
+                .unwrap_or_else(|err| panic!("{ENV}: cannot write the consumer state: {err}"));
+        }
         let Some(path) = &loaded.scenario.call_log else {
             return;
         };
