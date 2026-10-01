@@ -79,6 +79,16 @@ HTTP, TLS and the AWS SDK (decided in SHA-273, see
   pull a legacy `hyper` 0.14 / `rustls` 0.21 stack with open advisories;
   `deny.toml` bans it, so `cargo deny check` fails if it comes back.
 
+Sealed boxes for GitHub secrets (SHA-253): `crypto_box` with the `seal`
+feature (RustCrypto, Apache-2.0 OR MIT, pure Rust). It implements
+libsodium's `crypto_box_seal`; `src/github.rs` keeps a known-answer test
+with a ciphertext made by libsodium, so a change of crate or version that
+breaks interop fails `cargo test`.
+
+GitHub REST calls go through `rotate::github::GithubClient` (base URL,
+operator token from `ROTATE_GITHUB_TOKEN` then `GITHUB_TOKEN`, pagination,
+rate limits). Reuse it rather than building another reqwest client.
+
 ## Writing tests
 
 Three kinds of test, and where each lives:
