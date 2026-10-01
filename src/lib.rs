@@ -16,6 +16,7 @@ pub mod finding;
 pub mod fsutil;
 pub mod input;
 pub mod provider;
+pub mod redact;
 pub mod report;
 pub mod secret;
 pub mod state;

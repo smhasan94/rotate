@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => return handle_parse_error(err),
     };
+    install_logging(cli.global.verbose);
     // Config errors are usage errors: the operator fixes the file or flag.
     let config = match Config::load(&cli.global.overrides()) {
         Ok(config) => config,
@@ -35,6 +36,15 @@ fn main() -> ExitCode {
         }
     };
     run(cli.subcommand(), &config, cli.global.json).into()
+}
+
+/// Sends tracing events to stderr through the redaction layer (SHA-218), at
+/// the level the `-v` count selects. Installing can only fail if a
+/// subscriber is already set, which nothing in this binary does.
+fn install_logging(verbose: u8) {
+    let level = rotate::redact::level_for(verbose);
+    let _ =
+        tracing::subscriber::set_global_default(rotate::redact::subscriber(level, std::io::stderr));
 }
 
 /// Print a clap error without echoing tokens the user typed.

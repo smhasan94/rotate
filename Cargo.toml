@@ -16,6 +16,8 @@ test-providers = []
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
+# Provider token patterns for log redaction (SHA-218).
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_norway = "0.9"
@@ -26,15 +28,18 @@ thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
 zeroize = { version = "1", features = ["alloc", "derive"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+# Independent encoders for the redaction tests (SHA-218).
+base64 = "0.22"
 predicates = "3"
 # Test harness (SHA-216). reqwest has default features off so no TLS crates
 # arrive until SHA-273 settles the license allowlist.
 reqwest = { version = "0.12", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+urlencoding = "2"
 wiremock = "0.6"
