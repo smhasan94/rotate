@@ -36,6 +36,18 @@ What works now:
   `.rotate/state.json` with a short id (`rot-` and 8 hex characters) that
   stays the same on the next `plan` run. It exits 0 even when blockers
   exist, and 2 if another rotate process holds the state file.
+- `rotate apply` runs the same plan, prints it, and asks you to type each
+  rotation id (read from the terminal, never stdin, so `--stdin` still
+  works). `--confirm <rotation-id>` (repeatable) replaces the prompt for
+  scripts and CI, and `--all` confirms every rotation with one prompt where
+  you type `all`. A wrong or unknown id exits 2 having changed nothing.
+  For each confirmed rotation it creates the replacement, updates every
+  consumer, verifies the replacement belongs to the same owner, and only
+  then revokes the old secret. State is saved after every step and every
+  step is appended to `.rotate/audit.jsonl`. Any failure before the revoke
+  stops that rotation, marks it `failed`, never revokes, and exits 1; a
+  consumer that cannot be updated holds the revoke. With an overlap window
+  above 0 the revoke is recorded as pending and apply exits 3.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 
@@ -48,9 +60,10 @@ Not done yet:
   exists (matches by name in the `consumers.github_actions.targets` repos
   and orgs, writes sealed values with the operator token from
   `ROTATE_GITHUB_TOKEN` or `GITHUB_TOKEN`), but the CLI does not pass it the
-  loaded config until `rotate apply` lands, so a release build does not
-  search Actions secrets yet.
-- `rotate apply`, `rotate rollback` and `rotate status`. These are stubs.
+  loaded config yet, so a release build does not search Actions secrets.
+- `rotate apply`: `--force`, manual replacement mode (the rotation is
+  skipped), resuming an interrupted or pending rotation, and `--json`.
+- `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
 
@@ -95,8 +108,11 @@ rotate plan trufflehog-report.json
 # One secret from stdin. Use --provider to skip identification.
 pbpaste | rotate plan --stdin
 
-# Apply the plan (typed confirmation). Not implemented yet.
+# Apply the plan: type each rotation id when asked.
 rotate apply trufflehog-report.json
+
+# Non-interactive, for CI: confirm by id.
+rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
 ```
 
 ## Exit codes

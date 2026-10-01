@@ -19,6 +19,9 @@ test-commands = []
 
 [dependencies]
 async-trait = "0.1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sso", "credentials-process"] }
+aws-sdk-iam = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # GitHub Actions secret values and public keys are base64 (SHA-253).
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

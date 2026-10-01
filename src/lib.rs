@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod apply;
 pub mod assess;
 pub mod audit;
 pub mod calls;
