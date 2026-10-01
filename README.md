@@ -88,7 +88,7 @@ These hold for every change; a pull request that breaks one is not merged.
 
 ## Build from source
 
-Needs Rust stable (1.91 or newer).
+Needs Rust stable (1.94.1 or newer).
 
 ```sh
 git clone https://github.com/smhasan94/rotate.git
