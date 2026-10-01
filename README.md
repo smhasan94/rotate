@@ -50,23 +50,26 @@ What works now:
   above 0 the revoke is recorded as pending and apply exits 3.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
+- AWS access keys are identified and checked with STS, signed with the
+  leaked key itself.
+- `plan` and `apply` search two real consumers, using the targets in
+  `rotate.yaml`: GitHub Actions secrets, matched by name in the
+  `consumers.github_actions.targets` repos and orgs and written as sealed
+  values with the operator token from `ROTATE_GITHUB_TOKEN` or
+  `GITHUB_TOKEN`; and AWS Secrets Manager entries named or tagged under
+  `consumers.aws_secrets_manager`, matched by value (a plain value or a
+  top-level JSON string field) and written as a new version with the
+  standard AWS credentials. With those sections empty, neither makes a
+  call.
 
 Not done yet:
 
-- Three of the four real providers (GitHub, npm, OpenAI); a release build
-  reports those secrets as unsupported. The AWS IAM provider is complete:
-  validity with the leaked key's one `sts:GetCallerIdentity` call, and
-  scope, key creation, deactivation and reactivation with your own AWS
-  credentials (see [docs/permissions.md](docs/permissions.md)). Mock
+- Rotating GitHub, npm and OpenAI secrets: those providers do not exist
+  yet, so a release build reports them as unsupported. The AWS IAM provider
+  is complete: validity with the leaked key's one `sts:GetCallerIdentity`
+  call, and scope, key creation, deactivation and reactivation with your
+  own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
   providers exist only behind the `test-providers` cargo feature, for tests.
-- Passing the loaded config to the real consumers. Both are built in: the
-  GitHub Actions secrets consumer matches by name in the
-  `consumers.github_actions.targets` repos and orgs and writes sealed values
-  with the operator token from `ROTATE_GITHUB_TOKEN` or `GITHUB_TOKEN`; the
-  AWS Secrets Manager consumer reads the entries named or tagged under
-  `consumers.aws_secrets_manager`, matches by value (a plain value or a
-  top-level JSON string field) and writes a new version. The CLI does not
-  pass them `rotate.yaml` yet, so a release build searches neither.
 - `rotate apply`: `--force`, manual replacement mode (the rotation is
   skipped), resuming an interrupted or pending rotation, and `--json`.
 - `rotate rollback` and `rotate status`. These are stubs.

@@ -864,10 +864,12 @@ impl Provider for AwsProvider {
         loop {
             let failure = match self.caller(pair).await {
                 Ok(caller) if caller.arn == identity.0 => return Ok(()),
-                Ok(caller) => return Err(ProviderError::Permanent(format!(
+                Ok(caller) => {
+                    return Err(ProviderError::Permanent(format!(
                     "the replacement key belongs to {} but the leaked key belongs to {identity}",
                     caller.arn
-                ))),
+                )))
+                }
                 Err(f) => f,
             };
             let out_of_time = started.elapsed() + self.verify_interval > self.verify_budget;
