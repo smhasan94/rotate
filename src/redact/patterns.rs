@@ -31,7 +31,11 @@ fn aws_context() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)|(?i:secret_?access_?key|aws_?secret)",
+            // `(?i-u:...)`: ASCII case folding. Unicode case folding needs
+            // regex's `unicode-case` feature, which the release build does
+            // not enable; `cargo test` does through dev-dependencies, so only
+            // `ci/smoke.sh` would notice its absence.
+            r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)|(?i-u:secret_?access_?key|aws_?secret)",
         )
         .expect("aws context pattern compiles")
     })

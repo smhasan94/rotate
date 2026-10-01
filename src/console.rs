@@ -143,6 +143,17 @@ fn report_panic(w: &mut dyn Write, thread: &str, location: Option<&str>, payload
         let _ = w.write_all(b"rotate panicked while reporting a panic\n");
         return;
     }
+    if crate::redact::in_progress() {
+        // The redactor itself failed, so the payload cannot be redacted and
+        // is withheld. Calling it again could block on its own lazy state.
+        let _ = writeln!(
+            w,
+            "rotate panicked inside the redactor (thread '{thread}'); the message is withheld because it could not be redacted"
+        );
+        let _ = w.flush();
+        IN_HOOK.with(|flag| flag.set(false));
+        return;
+    }
     let mut text = Zeroizing::new(String::with_capacity(payload.len() + 64));
     let _ = write!(text, "thread '{thread}' panicked");
     if let Some(location) = location {
@@ -248,6 +259,35 @@ mod tests {
         report_panic(&mut buf, "main", None, &canary);
         IN_HOOK.with(|flag| flag.set(false));
         assert_eq!(buf, b"rotate panicked while reporting a panic\n");
+    }
+
+    #[test]
+    fn panic_inside_redactor_withholds_payload() {
+        let canary = ["console-redactor-panic-", "7e1f00d2"].concat();
+        let _secret = SecretValue::from(canary.as_str());
+        let mut buf = Vec::new();
+        {
+            let _busy = crate::redact::busy_for_test();
+            assert!(crate::redact::in_progress());
+            report_panic(&mut buf, "main", Some("src/x.rs:1:1"), &canary);
+        }
+        assert!(!crate::redact::in_progress());
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("panicked inside the redactor"), "{text}");
+        assert!(!text.contains(&canary), "payload must be withheld");
+        assert!(!IN_HOOK.with(Cell::get));
+    }
+
+    #[test]
+    fn redact_marks_and_clears_in_progress() {
+        assert!(!crate::redact::in_progress());
+        let _ = redact("plain text");
+        assert!(!crate::redact::in_progress());
+        let outer = crate::redact::busy_for_test();
+        let _ = redact("nested call keeps the outer mark");
+        assert!(crate::redact::in_progress());
+        drop(outer);
+        assert!(!crate::redact::in_progress());
     }
 
     fn parse_error(args: &[&str]) -> (i32, String, String) {

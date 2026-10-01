@@ -22,6 +22,7 @@ mod patterns;
 pub(crate) mod registry;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use zeroize::Zeroizing;
@@ -34,6 +35,7 @@ use registry::Entry;
 /// Returns `text` with every registered secret value and every
 /// provider-shaped token replaced by a marker. Borrows when nothing matched.
 pub fn redact(text: &str) -> Cow<'_, str> {
+    let _busy = Busy::enter();
     match matcher().replace(text) {
         Cow::Borrowed(t) => patterns::redact(t),
         Cow::Owned(s) => {
@@ -41,6 +43,40 @@ pub fn redact(text: &str) -> Cow<'_, str> {
             Cow::Owned(patterns::redact(&s).into_owned())
         }
     }
+}
+
+thread_local! {
+    static BUSY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as inside [`redact`] until dropped, so a panic raised
+/// by the redactor can be reported without calling back into it.
+pub(crate) struct Busy(bool);
+
+impl Busy {
+    fn enter() -> Self {
+        Self(BUSY.with(|busy| busy.replace(true)))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        let was = self.0;
+        BUSY.with(|busy| busy.set(was));
+    }
+}
+
+/// Marks this thread as redacting, for tests of the panic hook.
+#[cfg(test)]
+pub(crate) fn busy_for_test() -> Busy {
+    Busy::enter()
+}
+
+/// True while this thread is inside [`redact`]. The panic hook (SHA-246)
+/// checks it: redacting a panic raised by the redactor would re-enter a
+/// half-initialized pattern and block forever.
+pub fn in_progress() -> bool {
+    BUSY.with(Cell::get)
 }
 
 /// The current matcher, rebuilt when the registry has changed since the

@@ -70,6 +70,14 @@ jobs:
       - name: cargo test
         shell: bash
         run: cargo test --all-features 2>&1 | tee test.log
+      - name: smoke-test the binary as released
+        # `cargo test` enables every dependency feature that dev-dependencies
+        # ask for; a plain build does not. Run the binary built without
+        # dev-dependencies or features, as a release ships it.
+        shell: bash
+        run: |
+          cargo build --locked
+          ci/smoke.sh target/debug/rotate
       - name: live tests are ignored by default (SHA-216 T3)
         # ROTATE_LIVE_TESTS is never set in CI, so the live smoke test must
         # show up as ignored, never as run.
