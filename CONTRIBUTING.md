@@ -134,9 +134,36 @@ A provider is one implementation of `rotate::provider::Provider` (SHA-221).
   `replacement_ref`; those strings reach the plan output and the audit log.
 - Register it in the `ProviderRegistry` the CLI builds, and give it a short
   stable `name()` that the config and audit log use.
-- Test it against wiremock (see "Writing tests") and run the shared
-  conformance suite once SHA-249 lands. Until then, mirror the assertions in
-  `tests/provider_leak.rs` with a canary value.
+- Test it against wiremock (see "Writing tests") and pass the shared
+  conformance suite (SHA-249) from an integration test:
+
+  ```rust
+  use rotate::conformance::{provider_suite, MutationProbe, ProviderFixture};
+
+  #[tokio::test]
+  async fn conformance() {
+      provider_suite(|| async {
+          let server = common::CallRecorder::start().await;
+          // Mount answers: `live` is valid and owned by `identity`, a
+          // second revoke of it still succeeds, `unknown` gets the
+          // provider's real 401 or 404.
+          ProviderFixture {
+              provider: Arc::new(MyProvider::new(server.uri())),
+              live, identity, unknown,
+              probe: Box::new(RecorderProbe(server)),
+          }
+      })
+      .await
+      .assert_ok();
+  }
+  ```
+
+  The factory runs once per check, so every check gets a fresh plugin and
+  server. `RecorderProbe` is your few-line `MutationProbe` impl returning a
+  method-and-path label for each `RecordedCall` with `mutating` set. The
+  suite returns a `SuiteReport` naming each failed check; `assert_ok`
+  panics with it. `rotate::conformance::mock::provider_fixture` shows the
+  same wiring for `MockProvider`.
 
 `provider::mock::MockProvider` is the reference double: it records every
 call into a `CallLog` with the mutating flag, and tests inject failures with
@@ -162,9 +189,12 @@ a place where a credential is stored for use.
   see which part a match holds.
 - Never put a value in `consumer_ref`, a not-updatable reason or an error
   message; those strings reach the plan output and the audit log.
-- Register it in the `ConsumerRegistry` the CLI builds, and mirror
-  `tests/consumer_leak.rs` with a canary value until the conformance suite
-  (SHA-249) lands.
+- Register it in the `ConsumerRegistry` the CLI builds, and pass
+  `rotate::conformance::consumer_suite` from an integration test against
+  wiremock. Its `ConsumerFixture` holds the consumer, the `old` credential
+  the server stores, the `new` one the suite writes, the `SecretRef` for
+  `old` (with the name hints a by-name store needs) and a `MutationProbe`.
+  `rotate::conformance::mock::consumer_fixture` is the reference wiring.
 
 `consumer::mock::MockConsumer` is the reference double. It shares
 `CallLog` with `MockProvider`, keeps the fingerprint each consumer holds
