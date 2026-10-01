@@ -1,14 +1,16 @@
 //! The provider and consumer registries the CLI runs with.
 //!
-//! Real providers register in builds without `test-providers`: AWS
-//! (SHA-251). Constructing one makes no call and loads no credentials; that
-//! happens on first use. The `test-providers` feature instead registers
+//! Real plugins register in builds without `test-providers`: the AWS
+//! provider (SHA-251) and the GitHub Actions secrets consumer (SHA-253).
+//! Constructing one makes no call and loads no credentials; that happens on
+//! first use. The `test-providers` feature instead registers
 //! `MockProvider`s under the four real names so integration tests can drive
 //! the CLI end to end, and lets a test describe a scenario in a JSON file
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
 //! enable it, and nothing in this file reads the variable without it.
 
 use rotate::apply::Prompt;
+use rotate::config::{ConsumersConfig, GithubConfig};
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -25,12 +27,31 @@ pub fn registry() -> ProviderRegistry {
     registry
 }
 
-/// Every consumer this build knows.
+/// Every consumer this build knows, with default settings: no Actions
+/// targets, so the GitHub Actions consumer makes no call. Callers with a
+/// loaded config use [`consumers_with`].
 pub fn consumers() -> ConsumerRegistry {
+    consumers_with(&ConsumersConfig::default(), &GithubConfig::default())
+}
+
+/// Every consumer this build knows, configured from `rotate.yaml`.
+/// Building the registry makes no network call.
+///
+/// As with providers, real consumers and the scenario's mocks never share a
+/// registry: both use the real names, and the first registration of a name
+/// would win.
+pub fn consumers_with(config: &ConsumersConfig, github: &GithubConfig) -> ConsumerRegistry {
     #[allow(unused_mut)]
     let mut registry = ConsumerRegistry::new();
+    #[cfg(not(feature = "test-providers"))]
+    registry.register(std::sync::Arc::new(
+        rotate::consumer::github_actions::GithubActionsConsumer::from_config(config, github),
+    ));
     #[cfg(feature = "test-providers")]
-    scenario::register_consumers(&mut registry);
+    {
+        let _ = (config, github);
+        scenario::register_consumers(&mut registry);
+    }
     registry
 }
 

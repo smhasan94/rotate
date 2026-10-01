@@ -27,7 +27,10 @@ state_file: .rotate/state.json
 consumers:
   github_actions:
     # Repositories (owner/repo) and organizations (org:<name>) whose Actions
-    # secrets are checked. Default: none.
+    # secrets are checked. Default: none. Needs an operator token in
+    # ROTATE_GITHUB_TOKEN (or GITHUB_TOKEN) that can read and write Actions
+    # secrets (repo admin; admin:org for org secrets). Values cannot be read
+    # back, so secrets are matched by name.
     targets:
       - acme/api
       - org:acme
