@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 pub mod calls;
+pub mod consumer;
 pub mod finding;
 pub mod provider;
 pub mod secret;

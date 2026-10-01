@@ -79,3 +79,32 @@ A provider is one implementation of `rotate::provider::Provider` (SHA-221).
 `provider::mock::MockProvider` is the reference double: it records every
 call into a `CallLog` with the mutating flag, and tests inject failures with
 `fail_next` or `fail_always`.
+
+## Adding a consumer
+
+A consumer is one implementation of `rotate::consumer::Consumer` (SHA-222):
+a place where a credential is stored for use.
+
+- `find` is read-only. Match by value fingerprint where the service lets you
+  read the value back (`MatchMethod::ByValue`). Otherwise match by the names
+  in `SecretRef::names` (`ByName`, as for GitHub Actions secrets). Set
+  `holds` to the part of the credential the match stores: the secret, the
+  AWS key id, or both.
+- When a match cannot be updated automatically, return it with
+  `not_updatable(reason)` rather than leaving it out. The plan shows the
+  reason and apply refuses to revoke without `--force`. `update` on such a
+  match must return `ConsumerError::NotUpdatable`.
+- `update` writes the part of the new credential that the match holds, and
+  `restore` writes the old one back. These are the only mutating methods,
+  listed in `consumer::MUTATING`. Use `ConsumerMatch::value_fingerprint` to
+  see which part a match holds.
+- Never put a value in `consumer_ref`, a not-updatable reason or an error
+  message; those strings reach the plan output and the audit log.
+- Register it in the `ConsumerRegistry` the CLI builds, and mirror
+  `tests/consumer_leak.rs` with a canary value until the conformance suite
+  (SHA-249) lands.
+
+`consumer::mock::MockConsumer` is the reference double. It shares
+`CallLog` with `MockProvider`, keeps the fingerprint each consumer holds
+(`current`), and adds `fail_for(method, consumer_ref, error)` for failing
+one consumer out of several.
