@@ -17,6 +17,7 @@ pub mod consumer;
 pub mod error;
 pub mod finding;
 pub mod fsutil;
+pub mod github;
 pub mod input;
 pub mod plan;
 pub mod provider;

@@ -1,12 +1,16 @@
 //! The provider and consumer registries the CLI runs with.
 //!
-//! No real provider or consumer is built in yet (SHA-251, SHA-252, SHA-253,
-//! SHA-260 to SHA-262). The `test-providers` feature registers
+//! Real consumers: GitHub Actions secrets (SHA-253). Real providers and the
+//! Secrets Manager consumer follow (SHA-251, SHA-252, SHA-260 to SHA-262). The `test-providers` feature registers
 //! `MockProvider`s under the four real names so integration tests can drive
 //! the CLI end to end, and lets a test describe a scenario in a JSON file
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
 //! enable it, and nothing in this file reads the variable without it.
 
+use std::sync::Arc;
+
+use rotate::config::{ConsumersConfig, GithubConfig};
+use rotate::consumer::github_actions::GithubActionsConsumer;
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -19,10 +23,18 @@ pub fn registry() -> ProviderRegistry {
     registry
 }
 
-/// Every consumer this build knows.
+/// Every consumer this build knows, with default settings: no Actions
+/// targets, so the GitHub Actions consumer makes no call. Callers with a
+/// loaded config use [`consumers_with`].
 pub fn consumers() -> ConsumerRegistry {
-    #[allow(unused_mut)]
+    consumers_with(&ConsumersConfig::default(), &GithubConfig::default())
+}
+
+/// Every consumer this build knows, configured from `rotate.yaml`.
+/// Building the registry makes no network call.
+pub fn consumers_with(config: &ConsumersConfig, github: &GithubConfig) -> ConsumerRegistry {
     let mut registry = ConsumerRegistry::new();
+    registry.register(Arc::new(GithubActionsConsumer::from_config(config, github)));
     #[cfg(feature = "test-providers")]
     scenario::register_consumers(&mut registry);
     registry

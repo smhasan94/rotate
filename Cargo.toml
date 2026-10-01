@@ -19,9 +19,16 @@ test-commands = []
 
 [dependencies]
 async-trait = "0.1"
+# GitHub Actions secret values and public keys are base64 (SHA-253).
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+# libsodium-compatible sealed boxes for GitHub Actions secrets (SHA-253).
+# RustCrypto, pure Rust, Apache-2.0 OR MIT.
+crypto_box = { version = "0.9", features = ["seal"] }
 # Provider token patterns for log redaction (SHA-218).
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+# HTTP for providers and consumers; TLS policy in docs/plans/SHA-273.md.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_norway = "0.9"
@@ -37,15 +44,10 @@ zeroize = { version = "1", features = ["alloc", "derive"] }
 
 [dev-dependencies]
 assert_cmd = "2"
-# Independent encoders for the redaction tests (SHA-218).
-base64 = "0.22"
 # Validates `plan --json` against docs/plan-schema.json (SHA-250). Default
 # features off: no HTTP resolver.
 jsonschema = { version = "0.58", default-features = false }
 predicates = "3"
-# Test harness (SHA-216). reqwest has default features off so no TLS crates
-# arrive until SHA-273 settles the license allowlist.
-reqwest = { version = "0.12", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 urlencoding = "2"
