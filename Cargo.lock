@@ -2223,6 +2223,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-iam",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",

@@ -53,9 +53,12 @@ What works now:
 
 Not done yet:
 
-- The four real providers. Until they land, a release build reports every
-  secret as unsupported. Mock providers exist only behind the
-  `test-providers` cargo feature, for tests.
+- Three of the four real providers (GitHub, npm, OpenAI); a release build
+  reports those secrets as unsupported. The AWS IAM provider is complete:
+  validity with the leaked key's one `sts:GetCallerIdentity` call, and
+  scope, key creation, deactivation and reactivation with your own AWS
+  credentials (see [docs/permissions.md](docs/permissions.md)). Mock
+  providers exist only behind the `test-providers` cargo feature, for tests.
 - Passing the loaded config to the real consumers. Both are built in: the
   GitHub Actions secrets consumer matches by name in the
   `consumers.github_actions.targets` repos and orgs and writes sealed values
@@ -136,6 +139,8 @@ rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
   gitleaks fields rotate reads.
 - [docs/rotate.example.yaml](docs/rotate.example.yaml): every config option
   with its default.
+- [docs/permissions.md](docs/permissions.md): the operator permissions each
+  provider needs.
 - [CONTRIBUTING.md](CONTRIBUTING.md): checks, branches, commits and pull
   requests.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.

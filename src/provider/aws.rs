@@ -1,31 +1,41 @@
-//! AWS IAM access keys (SHA-251 read side; SHA-255 adds the write side).
+//! AWS IAM access keys (SHA-251 read side, SHA-255 write side).
 //!
-//! Read side: [`AwsProvider::check_valid`] and [`AwsProvider::describe_scope`]
-//! sign with the leaked key pair itself. Both are read-only calls in which
-//! the key answers questions about itself (`sts:GetCallerIdentity`, then the
-//! IAM reads on its own user), so `rotate plan` needs no operator AWS setup
-//! and never loads the default credential chain. See
-//! `docs/plans/SHA-251.md` for why.
+//! The leaked key signs exactly one call: the `sts:GetCallerIdentity` in
+//! [`AwsProvider::check_valid`]. Everything else runs with the operator's
+//! own AWS credentials (decision D3): [`AwsProvider::describe_scope`], the
+//! key creation, deactivation and reactivation. The operator configuration
+//! comes from `aws_config`'s default chain (environment, shared profile,
+//! SSO, credential process) and is loaded once, on the first call that
+//! needs it. [`AwsProvider::verify`] signs with the replacement key, which
+//! rotate itself created.
 //!
-//! Nothing happens at construction: the region is resolved and a client is
-//! built on the first call that needs one, never at startup.
+//! Nothing happens at construction: the region, the operator configuration
+//! and every client are resolved on first use, never at startup.
+//!
+//! Revoke deactivates the key (`UpdateAccessKey Status=Inactive`) and never
+//! deletes it, so [`AwsProvider::restore`] can reactivate it. IAM allows two
+//! access keys per user; when both are in use rotate refuses to create a
+//! replacement rather than delete anything on its own.
 //!
 //! Error text and scope lines are built by rotate from the operation name,
-//! a sanitised error code and the HTTP status. The service's own message is
-//! dropped, so an endpoint that echoes its input cannot put a value into
-//! plan output.
+//! a sanitised error code, key ids, user names and ARNs. The service's own
+//! message is dropped, so an endpoint that echoes its input cannot put a
+//! value into plan output.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use aws_config::environment::EnvironmentVariableRegionProvider;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::profile::ProfileFileRegionProvider;
-use aws_config::{BehaviorVersion, Region};
+use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_sdk_iam::types::StatusType;
 use aws_sdk_sts::config::http::HttpResponse;
 use aws_sdk_sts::config::retry::RetryConfig;
 use aws_sdk_sts::config::timeout::TimeoutConfig;
-use aws_sdk_sts::config::Credentials;
+use aws_sdk_sts::config::{Credentials, ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
 use tokio::sync::OnceCell;
 
@@ -34,13 +44,19 @@ use super::{
     RestoreOutcome, Revoked, Scope, Validity,
 };
 use crate::finding::Finding;
-use crate::secret::SecretPair;
+use crate::secret::{SecretPair, SecretValue};
 
 /// Name used in plans, config and the audit log.
 pub const NAME: &str = "aws";
 
 /// `Unknown` reason for an `ASIA` key.
 pub const TEMPORARY_CREDENTIAL: &str = "temporary credential: revoke by rotating the source";
+
+/// Error when the operator's AWS credentials cannot be loaded.
+pub const NO_OPERATOR_CREDENTIALS: &str =
+    "no AWS operator credentials: rotate reads the key's owner and changes keys with your own \
+     AWS credentials (environment, shared profile, SSO or credential process), never with the \
+     leaked key; configure them and run again";
 
 /// Region used when neither config, environment nor profile names one. IAM
 /// is global; the region only picks the STS endpoint.
@@ -63,22 +79,57 @@ const THROTTLE_CODES: &[&str] = &[
 /// Most pages read from one IAM list call.
 const MAX_PAGES: usize = 20;
 
+/// Access keys IAM allows per user.
+const KEY_SLOTS: usize = 2;
+
 /// Credential source name the SDK shows in its own `Debug` output.
-const CREDENTIAL_SOURCE: &str = "rotate-leaked-key";
+const CREDENTIAL_SOURCE: &str = "rotate-key-under-rotation";
+
+/// How long `verify` keeps trying a new key that IAM has not propagated yet.
+const VERIFY_BUDGET: Duration = Duration::from_secs(15);
+
+/// Pause between `verify` attempts.
+const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Separates the old and the new key id in a `restore_ref`. Key ids are
+/// uppercase letters and digits, so it cannot occur in one.
+const REF_SEPARATOR: char = ':';
 
 /// The AWS IAM access key provider.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AwsProvider {
     region: Option<String>,
     endpoint_url: Option<String>,
     resolved_region: OnceCell<Region>,
+    operator_credentials: Option<SharedCredentialsProvider>,
+    operator: OnceCell<Result<SdkConfig, String>>,
+    /// Old key id to the replacement this process created for it, so
+    /// `revoke` can hand `restore` both ids.
+    replacements: Mutex<HashMap<String, String>>,
+    verify_interval: Duration,
+    verify_budget: Duration,
+}
+
+impl Default for AwsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AwsProvider {
-    /// A provider that resolves its region on first use. Makes no call and
-    /// reads nothing.
+    /// A provider that resolves its region and operator credentials on
+    /// first use. Makes no call and reads nothing.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            region: None,
+            endpoint_url: None,
+            resolved_region: OnceCell::new(),
+            operator_credentials: None,
+            operator: OnceCell::new(),
+            replacements: Mutex::new(HashMap::new()),
+            verify_interval: VERIFY_INTERVAL,
+            verify_budget: VERIFY_BUDGET,
+        }
     }
 
     /// Uses `region` (`providers.aws.region`) instead of the environment.
@@ -91,6 +142,24 @@ impl AwsProvider {
     /// local server.
     pub fn with_endpoint_url(mut self, url: impl Into<String>) -> Self {
         self.endpoint_url = Some(url.into());
+        self
+    }
+
+    /// Uses `credentials` as the operator's credentials instead of the
+    /// default chain. For tests and embedders; never the leaked key.
+    pub fn with_operator_credentials(
+        mut self,
+        credentials: impl ProvideCredentials + 'static,
+    ) -> Self {
+        self.operator_credentials = Some(SharedCredentialsProvider::new(credentials));
+        self
+    }
+
+    /// How often and for how long `verify` retries a replacement key that
+    /// is not accepted yet. Defaults: every 2 s for up to 15 s.
+    pub fn with_verify_timing(mut self, interval: Duration, budget: Duration) -> Self {
+        self.verify_interval = interval;
+        self.verify_budget = budget;
         self
     }
 
@@ -111,6 +180,8 @@ impl AwsProvider {
             .clone()
     }
 
+    /// STS signed with `pair`: the leaked key in `check_valid`, the
+    /// replacement in `verify`.
     async fn sts(&self, pair: &SecretPair) -> Result<aws_sdk_sts::Client, ProviderError> {
         let mut config = aws_sdk_sts::Config::builder()
             .behavior_version(BehaviorVersion::latest())
@@ -124,17 +195,37 @@ impl AwsProvider {
         Ok(aws_sdk_sts::Client::from_conf(config.build()))
     }
 
-    async fn iam(&self, pair: &SecretPair) -> Result<aws_sdk_iam::Client, ProviderError> {
-        let mut config = aws_sdk_iam::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+    /// The operator's configuration, loaded on first use. SDK retries are
+    /// off: a retried `CreateAccessKey` after a lost response could mint a
+    /// second key.
+    async fn load_operator(&self) -> Result<SdkConfig, String> {
+        let mut loader = aws_config::defaults(BehaviorVersion::latest())
             .region(self.region().await)
-            .retry_config(aws_sdk_iam::config::retry::RetryConfig::disabled())
-            .timeout_config(timeouts())
-            .credentials_provider(static_credentials(pair)?);
+            .retry_config(RetryConfig::disabled())
+            .timeout_config(timeouts());
         if let Some(url) = &self.endpoint_url {
-            config = config.endpoint_url(url.clone());
+            loader = loader.endpoint_url(url.clone());
         }
-        Ok(aws_sdk_iam::Client::from_conf(config.build()))
+        if let Some(credentials) = &self.operator_credentials {
+            loader = loader.credentials_provider(credentials.clone());
+        }
+        let config = loader.load().await;
+        let Some(credentials) = config.credentials_provider() else {
+            return Err(NO_OPERATOR_CREDENTIALS.to_owned());
+        };
+        // The chain's own error can name files and profiles; it is dropped.
+        match credentials.provide_credentials().await {
+            Ok(_) => Ok(config),
+            Err(_) => Err(NO_OPERATOR_CREDENTIALS.to_owned()),
+        }
+    }
+
+    /// IAM with the operator's credentials.
+    async fn iam(&self) -> Result<aws_sdk_iam::Client, ProviderError> {
+        match self.operator.get_or_init(|| self.load_operator()).await {
+            Ok(config) => Ok(aws_sdk_iam::Client::new(config)),
+            Err(message) => Err(ProviderError::Permanent(message.clone())),
+        }
     }
 
     /// `sts:GetCallerIdentity` signed with `pair`: the ARN and account.
@@ -153,48 +244,89 @@ impl AwsProvider {
                 "sts:GetCallerIdentity returned no ARN".into(),
             )));
         }
-        Ok(Caller {
-            account: out.account().map(clean),
-            arn,
+        Ok(Caller { arn })
+    }
+
+    /// The IAM user owning `key_id` and when the key was last used, read
+    /// with the operator's credentials.
+    async fn owner(&self, iam: &aws_sdk_iam::Client, key_id: &str) -> Result<Owner, ProviderError> {
+        const OP: &str = "iam:GetAccessKeyLastUsed";
+        let out = iam
+            .get_access_key_last_used()
+            .access_key_id(key_id)
+            .send()
+            .await
+            .map_err(|e| classify(OP, &e).into_operator_error(OP))?;
+        let user = out.user_name().map(clean).unwrap_or_default();
+        if user.is_empty() {
+            return Err(ProviderError::Unsupported(
+                "the access key does not belong to an IAM user; rotate root user keys in the \
+                 AWS console"
+                    .into(),
+            ));
+        }
+        Ok(Owner {
+            user,
+            last_used: last_used_text(out.access_key_last_used()),
         })
     }
 
-    async fn user_lines(
+    /// The user's access keys. With `last_used`, each key's last use too
+    /// (an extra read per key, at most two).
+    async fn key_slots(
         &self,
-        pair: &SecretPair,
+        iam: &aws_sdk_iam::Client,
+        user: &str,
+        last_used: bool,
+    ) -> Result<Vec<Slot>, Failure> {
+        let mut slots = Vec::new();
+        let mut marker = None;
+        for _ in 0..MAX_PAGES {
+            let out = iam
+                .list_access_keys()
+                .user_name(user)
+                .set_marker(marker.take())
+                .send()
+                .await
+                .map_err(|e| classify("iam:ListAccessKeys", &e))?;
+            for key in out.access_key_metadata() {
+                let Some(id) = key.access_key_id().map(clean) else {
+                    continue;
+                };
+                let status = key.status().map_or("unknown", StatusType::as_str);
+                slots.push(Slot {
+                    id,
+                    status: clean(status),
+                    last_used: String::new(),
+                });
+            }
+            marker = next_marker(out.is_truncated(), out.marker());
+            if marker.is_none() {
+                break;
+            }
+        }
+        if last_used {
+            for slot in &mut slots {
+                slot.last_used = match iam
+                    .get_access_key_last_used()
+                    .access_key_id(&slot.id)
+                    .send()
+                    .await
+                {
+                    Ok(out) => last_used_text(out.access_key_last_used()),
+                    Err(_) => "unknown".to_owned(),
+                };
+            }
+        }
+        Ok(slots)
+    }
+
+    async fn policy_lines(
+        &self,
+        iam: &aws_sdk_iam::Client,
         user: &str,
         lines: &mut Vec<String>,
     ) -> Result<(), ProviderError> {
-        let iam = self.iam(pair).await?;
-
-        let last_used = iam
-            .get_access_key_last_used()
-            .access_key_id(pair.key_id.clone())
-            .send()
-            .await
-            .map_err(|e| classify("iam:GetAccessKeyLastUsed", &e));
-        match last_used {
-            Ok(out) => lines.push(match out.access_key_last_used() {
-                Some(used) if used.last_used_date().is_some() => {
-                    let date = used
-                        .last_used_date()
-                        .and_then(|d| {
-                            d.fmt(aws_sdk_iam::primitives::DateTimeFormat::DateTime)
-                                .ok()
-                        })
-                        .unwrap_or_default();
-                    format!(
-                        "last used: {} in {} at {}",
-                        clean(used.service_name()),
-                        clean(used.region()),
-                        date
-                    )
-                }
-                _ => "last used: never".to_owned(),
-            }),
-            Err(f) => lines.push(f.into_line("last used")?),
-        }
-
         let mut marker = None;
         for _ in 0..MAX_PAGES {
             let out = iam
@@ -267,17 +399,82 @@ impl AwsProvider {
         }
         Ok(())
     }
+
+    async fn set_status(
+        &self,
+        iam: &aws_sdk_iam::Client,
+        user: &str,
+        key_id: &str,
+        status: StatusType,
+    ) -> Result<(), ProviderError> {
+        const OP: &str = "iam:UpdateAccessKey";
+        iam.update_access_key()
+            .user_name(user)
+            .access_key_id(key_id)
+            .status(status)
+            .send()
+            .await
+            .map(drop)
+            .map_err(|e| classify(OP, &e).into_operator_error(OP))
+    }
+
+    /// `OLD:NEW` when this process created the replacement for `old`, else
+    /// `OLD`.
+    fn restore_ref_for(&self, old: &str) -> String {
+        let replacements = self
+            .replacements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match replacements.get(old) {
+            Some(new) => restore_ref(old, new),
+            None => old.to_owned(),
+        }
+    }
+}
+
+/// The `restore_ref` that makes [`AwsProvider::restore`] reactivate `old`
+/// and then deactivate `new`. Rollback builds it from the state record's
+/// `replacement_ref` when the revoke ran in another process.
+pub fn restore_ref(old: &str, new: &str) -> String {
+    format!("{old}{REF_SEPARATOR}{new}")
 }
 
 /// What `GetCallerIdentity` told us.
 struct Caller {
     arn: String,
-    account: Option<String>,
+}
+
+/// The owner of a key, from `GetAccessKeyLastUsed`.
+struct Owner {
+    user: String,
+    last_used: String,
+}
+
+/// One of a user's access keys.
+struct Slot {
+    id: String,
+    status: String,
+    last_used: String,
+}
+
+/// The refusal when both key slots are taken: both ids, their status and
+/// last use.
+fn two_keys(user: &str, slots: &[Slot]) -> String {
+    let keys: Vec<String> = slots
+        .iter()
+        .map(|s| format!("{} {}, last used {}", s.id, s.status, s.last_used))
+        .collect();
+    format!(
+        "IAM user {user} already has {} access keys ({}); IAM allows {KEY_SLOTS}, so rotate \
+         will not create a replacement. Delete the key that is not leaked, then run apply again",
+        slots.len(),
+        keys.join("; ")
+    )
 }
 
 /// A classified SDK failure.
 enum Failure {
-    /// The service rejected the key: `InvalidClientTokenId` or
+    /// The service rejected the signing key: `InvalidClientTokenId` or
     /// `SignatureDoesNotMatch`.
     InvalidKey,
     /// The key works but may not make this call.
@@ -287,6 +484,7 @@ enum Failure {
 }
 
 impl Failure {
+    /// For a call signed with the key under test (leaked or replacement).
     fn into_error(self, op: &str) -> ProviderError {
         match self {
             Failure::InvalidKey => {
@@ -297,14 +495,35 @@ impl Failure {
         }
     }
 
+    /// For a call signed with the operator's credentials.
+    fn into_operator_error(self, op: &str) -> ProviderError {
+        match self {
+            Failure::InvalidKey => ProviderError::Permanent(format!(
+                "{op}: the operator AWS credentials were not accepted"
+            )),
+            Failure::AccessDenied(code) => ProviderError::Permanent(format!(
+                "{op}: {code}: the operator AWS credentials may not make this call"
+            )),
+            Failure::Provider(e) => e,
+        }
+    }
+
     /// A scope line for a denied IAM read; other failures stay errors so
     /// assessment can retry or report them.
     fn into_line(self, what: &str) -> Result<String, ProviderError> {
         match self {
-            Failure::AccessDenied(code) => {
-                Ok(format!("{what}: not visible to the leaked key ({code})"))
-            }
-            other => Err(other.into_error(what)),
+            Failure::AccessDenied(code) => Ok(format!(
+                "{what}: not visible to the operator credentials ({code})"
+            )),
+            other => Err(other.into_operator_error(what)),
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self {
+            Failure::InvalidKey => true,
+            Failure::AccessDenied(_) => false,
+            Failure::Provider(e) => e.is_retryable(),
         }
     }
 }
@@ -316,7 +535,7 @@ fn timeouts() -> TimeoutConfig {
         .build()
 }
 
-/// The one place the secret leaves its `SecretValue`: the SDK copies it into
+/// The one place a secret leaves its `SecretValue`: the SDK copies it into
 /// a `Zeroizing<String>`, redacts it in `Debug` and only derives the SigV4
 /// signing key from it.
 fn static_credentials(pair: &SecretPair) -> Result<Credentials, ProviderError> {
@@ -367,6 +586,28 @@ fn classify<E: ProvideErrorMetadata>(op: &str, err: &SdkError<E, HttpResponse>) 
             Some(s) if s >= 500 => Failure::Provider(ProviderError::Transient(at)),
             _ => Failure::Provider(ProviderError::Permanent(at)),
         },
+    }
+}
+
+/// `<service> in <region> at <date>`, or `never`.
+fn last_used_text(used: Option<&aws_sdk_iam::types::AccessKeyLastUsed>) -> String {
+    match used {
+        Some(used) if used.last_used_date().is_some() => {
+            let date = used
+                .last_used_date()
+                .and_then(|d| {
+                    d.fmt(aws_sdk_iam::primitives::DateTimeFormat::DateTime)
+                        .ok()
+                })
+                .unwrap_or_default();
+            format!(
+                "{} in {} at {}",
+                clean(used.service_name()),
+                clean(used.region()),
+                date
+            )
+        }
+        _ => "never".to_owned(),
     }
 }
 
@@ -430,15 +671,40 @@ fn key_pair(credential: &Credential) -> Result<&SecretPair, ProviderError> {
     }
 }
 
-/// The user name from an IAM user ARN (`arn:aws:iam::<acct>:user/<path>/<name>`).
-fn user_name(arn: &str) -> Option<&str> {
-    let resource = arn.splitn(6, ':').nth(5)?;
-    let rest = resource.strip_prefix("user/")?;
-    rest.rsplit('/').next().filter(|n| !n.is_empty())
+/// A long-term (`AKIA`) key pair, the only kind rotate rotates. Anything
+/// else is `Unsupported` before any call.
+fn long_term_pair(credential: &Credential) -> Result<&SecretPair, ProviderError> {
+    let pair = key_pair(credential)?;
+    if is_temporary(&pair.key_id) {
+        return Err(ProviderError::Unsupported(TEMPORARY_CREDENTIAL.into()));
+    }
+    if !is_key_id(&pair.key_id) {
+        return Err(ProviderError::Unsupported(
+            "not an AWS access key id (AKIA followed by 16 letters or digits)".into(),
+        ));
+    }
+    Ok(pair)
 }
 
-fn write_side(method: &str) -> ProviderError {
-    ProviderError::Unsupported(format!("aws {method} is not implemented yet (SHA-255)"))
+/// `OLD` or `OLD:NEW`, both long-term key ids.
+fn parse_restore_ref(restore_ref: &str) -> Result<(&str, Option<&str>), ProviderError> {
+    let (old, new) = match restore_ref.split_once(REF_SEPARATOR) {
+        Some((old, new)) => (old, Some(new)),
+        None => (restore_ref, None),
+    };
+    let ok = |id: &str| is_key_id(id) && !is_temporary(id);
+    if ok(old) && new.is_none_or(ok) {
+        Ok((old, new))
+    } else {
+        Err(ProviderError::Permanent(
+            "not an AWS restore reference (OLD_KEY_ID or OLD_KEY_ID:NEW_KEY_ID)".into(),
+        ))
+    }
+}
+
+/// The account id from an ARN (`arn:aws:iam::<acct>:user/...`).
+fn account(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4).filter(|a| !a.is_empty())
 }
 
 #[async_trait]
@@ -473,6 +739,7 @@ impl Provider for AwsProvider {
         }
     }
 
+    /// The only call signed with the leaked key.
     async fn check_valid(&self, credential: &Credential) -> Result<Validity, ProviderError> {
         let pair = key_pair(credential)?;
         if is_temporary(&pair.key_id) {
@@ -490,54 +757,173 @@ impl Provider for AwsProvider {
         }
     }
 
+    /// Owner, policies, groups and key slots, read with the operator's
+    /// credentials. Two keys in use adds a `warning: ` line: apply will
+    /// refuse to create a replacement.
     async fn describe_scope(&self, credential: &Credential) -> Result<Scope, ProviderError> {
-        let pair = key_pair(credential)?;
-        if is_temporary(&pair.key_id) {
-            return Err(ProviderError::Unsupported(TEMPORARY_CREDENTIAL.into()));
-        }
-        let caller = self
-            .caller(pair)
+        let pair = long_term_pair(credential)?;
+        let iam = self.iam().await?;
+        let owner = self.owner(&iam, &pair.key_id).await?;
+
+        const OP: &str = "iam:GetUser";
+        let out = iam
+            .get_user()
+            .user_name(&owner.user)
+            .send()
             .await
-            .map_err(|f| f.into_error("sts:GetCallerIdentity"))?;
+            .map_err(|e| classify(OP, &e).into_operator_error(OP))?;
+        let arn = out.user().map(|u| clean(u.arn())).unwrap_or_default();
+        if arn.is_empty() {
+            return Err(ProviderError::Permanent(
+                "iam:GetUser returned no ARN".into(),
+            ));
+        }
+
         let mut lines = Vec::new();
-        if let Some(account) = &caller.account {
+        if let Some(account) = account(&arn) {
             lines.push(format!("account: {account}"));
         }
-        match user_name(&caller.arn) {
-            Some(user) => {
-                lines.push(format!("user: {user}"));
-                self.user_lines(pair, user, &mut lines).await?;
+        lines.push(format!("user: {}", owner.user));
+        lines.push(format!("last used: {}", owner.last_used));
+        self.policy_lines(&iam, &owner.user, &mut lines).await?;
+        match self.key_slots(&iam, &owner.user, true).await {
+            Ok(slots) => {
+                lines.push(format!("access keys: {} of {KEY_SLOTS} used", slots.len()));
+                if slots.len() >= KEY_SLOTS {
+                    lines.push(format!("warning: {}", two_keys(&owner.user, &slots)));
+                }
             }
-            None if caller.arn.ends_with(":root") => lines.push("principal: root user".into()),
-            None => lines.push("principal: not an IAM user".into()),
+            Err(f) => lines.push(f.into_line("access keys")?),
         }
         Ok(Scope {
-            identity: Identity(caller.arn),
+            identity: Identity(arn),
             lines,
         })
     }
 
+    /// `iam:CreateAccessKey` for the leaked key's user, after checking a
+    /// slot is free.
     async fn create_replacement(
         &self,
-        _credential: &Credential,
+        credential: &Credential,
     ) -> Result<Replacement, ProviderError> {
-        Err(write_side("create_replacement"))
+        let pair = long_term_pair(credential)?;
+        let iam = self.iam().await?;
+        let owner = self.owner(&iam, &pair.key_id).await?;
+        let slots = self
+            .key_slots(&iam, &owner.user, true)
+            .await
+            .map_err(|f| f.into_operator_error("iam:ListAccessKeys"))?;
+        if slots.len() >= KEY_SLOTS {
+            return Err(ProviderError::Permanent(two_keys(&owner.user, &slots)));
+        }
+
+        const OP: &str = "iam:CreateAccessKey";
+        let out = iam
+            .create_access_key()
+            .user_name(&owner.user)
+            .send()
+            .await
+            .map_err(|e| classify(OP, &e).into_operator_error(OP))?;
+        let Some(key) = out.access_key else {
+            return Err(ProviderError::Permanent(format!(
+                "{OP} returned no key; check user {} for a new key",
+                owner.user
+            )));
+        };
+        let new_id = clean(&key.access_key_id);
+        // Moved, not copied: the SDK's `String` becomes the zeroized buffer.
+        let secret = SecretValue::from(key.secret_access_key);
+        if !is_key_id(&new_id) || is_temporary(&new_id) || new_id == pair.key_id {
+            return Err(ProviderError::Permanent(format!(
+                "{OP} returned an unexpected key id; check user {} for a new key",
+                owner.user
+            )));
+        }
+        self.replacements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(pair.key_id.clone(), new_id.clone());
+        Ok(Replacement {
+            credential: Credential::KeyPair(SecretPair::new(new_id.clone(), secret)),
+            replacement_ref: new_id,
+        })
     }
 
+    /// `sts:GetCallerIdentity` signed with the replacement; its ARN must be
+    /// `identity`. A key IAM has not propagated yet is retried within the
+    /// verify budget; a different ARN fails at once.
     async fn verify(
         &self,
-        _credential: &Credential,
-        _identity: &Identity,
+        credential: &Credential,
+        identity: &Identity,
     ) -> Result<(), ProviderError> {
-        Err(write_side("verify"))
+        const OP: &str = "sts:GetCallerIdentity";
+        let pair = long_term_pair(credential)?;
+        let started = Instant::now();
+        loop {
+            let failure = match self.caller(pair).await {
+                Ok(caller) if caller.arn == identity.0 => return Ok(()),
+                Ok(caller) => return Err(ProviderError::Permanent(format!(
+                    "the replacement key belongs to {} but the leaked key belongs to {identity}",
+                    caller.arn
+                ))),
+                Err(f) => f,
+            };
+            let out_of_time = started.elapsed() + self.verify_interval > self.verify_budget;
+            if !failure.is_retryable() || out_of_time {
+                return Err(match failure {
+                    Failure::InvalidKey => ProviderError::Permanent(format!(
+                        "{OP}: the replacement key was not accepted within {} s",
+                        self.verify_budget.as_secs()
+                    )),
+                    other => other.into_error(OP),
+                });
+            }
+            tokio::time::sleep(self.verify_interval).await;
+        }
     }
 
-    async fn revoke(&self, _credential: &Credential) -> Result<Revoked, ProviderError> {
-        Err(write_side("revoke"))
+    /// `iam:UpdateAccessKey Status=Inactive` on the leaked key, never a
+    /// delete. Already inactive or already gone is `Ok`.
+    async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError> {
+        let pair = long_term_pair(credential)?;
+        let iam = self.iam().await?;
+        let owner = self.owner(&iam, &pair.key_id).await?;
+        let slots = self
+            .key_slots(&iam, &owner.user, false)
+            .await
+            .map_err(|f| f.into_operator_error("iam:ListAccessKeys"))?;
+        let Some(slot) = slots.iter().find(|s| s.id == pair.key_id) else {
+            return Ok(Revoked { restore_ref: None });
+        };
+        if slot.status != StatusType::Inactive.as_str() {
+            self.set_status(&iam, &owner.user, &pair.key_id, StatusType::Inactive)
+                .await?;
+        }
+        Ok(Revoked {
+            restore_ref: Some(self.restore_ref_for(&pair.key_id)),
+        })
     }
 
-    async fn restore(&self, _restore_ref: &str) -> Result<RestoreOutcome, ProviderError> {
-        Err(write_side("restore"))
+    /// Reactivates the old key, then deactivates the replacement when the
+    /// reference names one.
+    async fn restore(&self, restore_ref: &str) -> Result<RestoreOutcome, ProviderError> {
+        let (old, new) = parse_restore_ref(restore_ref)?;
+        let iam = self.iam().await?;
+        let owner = self.owner(&iam, old).await?;
+        self.set_status(&iam, &owner.user, old, StatusType::Active)
+            .await?;
+        if let Some(new) = new {
+            self.set_status(&iam, &owner.user, new, StatusType::Inactive)
+                .await
+                .map_err(|e| {
+                    ProviderError::Permanent(format!(
+                        "{old} is active again, but deactivating the replacement {new} failed: {e}"
+                    ))
+                })?;
+        }
+        Ok(RestoreOutcome::Restored)
     }
 }
 
@@ -619,23 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn user_name_from_arn() {
-        assert_eq!(
-            user_name("arn:aws:iam::000000000000:user/alice"),
-            Some("alice")
-        );
-        assert_eq!(
-            user_name("arn:aws:iam::000000000000:user/ci/deploy/bot"),
-            Some("bot")
-        );
-        assert_eq!(user_name("arn:aws:iam::000000000000:root"), None);
-        assert_eq!(
-            user_name("arn:aws:sts::000000000000:assumed-role/r/s"),
-            None
-        );
-    }
-
-    #[test]
     fn cleaning_limits_service_text() {
         assert_eq!(
             clean_code("Invalid<Client>TokenId\n"),
@@ -673,9 +1042,84 @@ mod tests {
     }
 
     #[test]
-    fn write_side_is_unsupported_until_sha_255() {
-        let e = write_side("revoke");
-        assert!(matches!(e, ProviderError::Unsupported(_)));
-        assert!(e.to_string().contains("SHA-255"));
+    fn restore_ref_round_trips_and_rejects_junk() {
+        let old = key_id("AKIA", "OLDKEY0");
+        let new = key_id("AKIA", "NEWKEY0");
+        assert_eq!(parse_restore_ref(&old).unwrap(), (old.as_str(), None));
+        let both = restore_ref(&old, &new);
+        assert_eq!(
+            parse_restore_ref(&both).unwrap(),
+            (old.as_str(), Some(new.as_str()))
+        );
+        for junk in [
+            "".to_owned(),
+            "AKIA123".to_owned(),
+            format!("{old}:"),
+            format!("{old}:{new}:{new}"),
+            key_id("ASIA", "TEMPKEY"),
+        ] {
+            assert!(parse_restore_ref(&junk).is_err(), "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn two_keys_text_lists_both() {
+        let slots = [
+            Slot {
+                id: key_id("AKIA", "SLOTONE"),
+                status: "Active".into(),
+                last_used: "s3 in eu-west-1 at 2026-09-01T10:00:00Z".into(),
+            },
+            Slot {
+                id: key_id("AKIA", "SLOTTWO"),
+                status: "Inactive".into(),
+                last_used: "never".into(),
+            },
+        ];
+        let text = two_keys("alice", &slots);
+        for want in [
+            &key_id("AKIA", "SLOTONE"),
+            &key_id("AKIA", "SLOTTWO"),
+            "Active",
+            "Inactive",
+            "2026-09-01T10:00:00Z",
+            "never",
+            "alice",
+        ] {
+            assert!(text.contains(want), "{want} missing: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_side_refuses_temporary_and_malformed_without_calls() {
+        let p = AwsProvider::new().with_endpoint_url("http://127.0.0.1:9");
+        for id in [key_id("ASIA", "UNITKEY"), "CONFORMANCECANARYKEY".to_owned()] {
+            let c = Credential::KeyPair(SecretPair::new(id, secret()));
+            assert!(matches!(
+                p.create_replacement(&c).await,
+                Err(ProviderError::Unsupported(_))
+            ));
+            assert!(matches!(
+                p.verify(&c, &Identity("arn".into())).await,
+                Err(ProviderError::Unsupported(_))
+            ));
+            assert!(matches!(
+                p.revoke(&c).await,
+                Err(ProviderError::Unsupported(_))
+            ));
+        }
+        assert!(matches!(
+            p.restore("not-a-key").await,
+            Err(ProviderError::Permanent(_))
+        ));
+    }
+
+    #[test]
+    fn account_from_arn() {
+        assert_eq!(
+            account("arn:aws:iam::000000000000:user/a"),
+            Some("000000000000")
+        );
+        assert_eq!(account("junk"), None);
     }
 }

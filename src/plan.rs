@@ -481,6 +481,12 @@ pub fn render_table(plan: &Plan) -> String {
         if let Some(err) = &r.scope_error {
             field(&mut out, "scope:", &format!("unavailable: {err}"));
         }
+        // Scope lines a provider marks as warnings (AWS: both key slots used).
+        for warning in r.scope.iter().flat_map(|s| &s.lines) {
+            if let Some(text) = warning.strip_prefix("warning: ") {
+                field(&mut out, "warning:", text);
+            }
+        }
         if r.step != Step::Planned {
             let state = format!(
                 "in progress at step {}; rotate apply resumes it",

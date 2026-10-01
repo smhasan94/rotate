@@ -48,6 +48,9 @@ zeroize = { version = "1", features = ["alloc", "derive"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+# A credentials provider that fails, for the "no operator credentials" test
+# (SHA-255). Already in the tree through aws-config.
+aws-credential-types = "1"
 # Validates `plan --json` against docs/plan-schema.json (SHA-250). Default
 # features off: no HTTP resolver.
 jsonschema = { version = "0.58", default-features = false }
