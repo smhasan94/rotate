@@ -9,6 +9,8 @@
 
 pub mod calls;
 pub mod config;
+pub mod consumer;
 pub mod finding;
 pub mod provider;
+pub mod report;
 pub mod secret;
