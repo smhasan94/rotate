@@ -106,3 +106,11 @@ jobs:
             exit 1
           fi
           echo "self-test ok: license gate rejects when MIT is disallowed"
+
+  docs:
+    # Text checks only, so Linux is enough (SHA-213 T1, T2).
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ci/check-docs.sh
