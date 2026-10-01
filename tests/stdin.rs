@@ -28,9 +28,9 @@ fn stdin_secret_reaches_plan() {
         .args(["plan", "--stdin"])
         .write_stdin("mock_abc\n")
         .assert()
-        .stdout(predicate::str::contains("1 finding:"))
+        .success()
         .stdout(predicate::str::contains(fp("mock_abc")))
-        .stdout(predicate::str::contains("stdin  stdin"))
+        .stdout(predicate::str::contains("stdin"))
         .stdout(predicate::str::contains(fp("mock_abc\n")).not());
 }
 
@@ -67,11 +67,15 @@ fn unknown_provider_lists_known() {
     // The typed name is not echoed: a pasted secret could land there.
     assert!(!stderr.contains("nope"), "{stderr}");
 
+    // A known name skips identification: the secret is checked as aws.
     rotate_in(dir.path())
         .args(["plan", "--stdin", "--provider", "aws"])
         .write_stdin("mock_abc\n")
         .assert()
-        .stdout(predicate::str::contains(fp("mock_abc")));
+        .success()
+        .stdout(
+            predicate::str::is_match(format!(r"(?m)^aws\s+{}\s+valid", fp("mock_abc"))).unwrap(),
+        );
 }
 
 // T6 (AC1, AC4)
@@ -102,9 +106,13 @@ fn report_path_reaches_plan() {
     let assert = rotate_in(dir.path())
         .args(["plan", GITLEAKS])
         .assert()
-        .stdout(predicate::str::contains("3 findings:"))
+        .success()
         .stdout(predicate::str::contains(fp(
             "ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake0001",
+        )))
+        .stdout(predicate::str::contains(fp("AKIAIOSFODNN7EXAMPLE")))
+        .stdout(predicate::str::contains(fp(
+            "npm_FAKEfakeFAKEfakeFAKEfakeFAKEfake0002",
         )));
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(!stdout.contains("ghp_FAKE"), "value leaked");

@@ -50,6 +50,10 @@ pub struct AssessOptions {
     pub attempts: u32,
     /// Backoff before the second attempt; doubled for each one after.
     pub base_delay: Duration,
+    /// Provider every finding is assigned to, skipping hints and patterns
+    /// (`--provider` with `--stdin`). Canary and key-id-only findings are
+    /// still not rotatable. Ignored when the name is not registered.
+    pub force_provider: Option<&'static str>,
 }
 
 impl Default for AssessOptions {
@@ -58,6 +62,7 @@ impl Default for AssessOptions {
             concurrency: 8,
             attempts: 3,
             base_delay: Duration::from_millis(500),
+            force_provider: None,
         }
     }
 }
@@ -129,7 +134,7 @@ pub async fn assess(
     let mut assessed: Vec<Assessed> = group(findings)
         .into_iter()
         .map(|group| {
-            let disposition = identify(&group, registry);
+            let disposition = identify(&group, registry, opts.force_provider);
             Assessed {
                 fingerprint: group.finding.fingerprint(),
                 credential: group.finding.credential(),
@@ -187,7 +192,7 @@ fn hint(detector: &str) -> Option<&'static str> {
         .map(|(_, provider)| *provider)
 }
 
-fn identify(group: &Group, registry: &ProviderRegistry) -> Disposition {
+fn identify(group: &Group, registry: &ProviderRegistry, forced: Option<&str>) -> Disposition {
     if group.canary {
         return Disposition::NotRotatable {
             reason: "canary token: any API call alerts whoever planted it, so it is not checked"
@@ -204,6 +209,13 @@ fn identify(group: &Group, registry: &ProviderRegistry) -> Disposition {
             reason: "gitleaks reports only the AWS access key id; use a TruffleHog report or \
                      `rotate plan --stdin` with KEY_ID:SECRET"
                 .into(),
+        };
+    }
+
+    if let Some(provider) = forced.and_then(|name| registry.get(name)) {
+        return Disposition::Supported {
+            provider: provider.name(),
+            confidence: Confidence::High,
         };
     }
 
@@ -366,17 +378,20 @@ fn provider_name(item: &Assessed) -> Option<&'static str> {
     }
 }
 
-/// Human-readable table, one row per distinct secret.
+/// Human-readable table, one row per distinct secret. Reasons (why a
+/// secret is unknown, unsupported or not rotatable) follow the table as
+/// notes so long text does not widen every row.
 pub fn render_table(assessed: &[Assessed]) -> String {
     let header = ["PROVIDER", "FINGERPRINT", "STATUS", "SOURCE", "IDENTITY"];
+    let mut notes: Vec<String> = Vec::new();
     let rows: Vec<[String; 5]> = assessed
         .iter()
         .map(|item| {
             let (word, reason) = status(item);
-            let status = match reason {
-                Some(reason) => format!("{word}: {reason}"),
-                None => word.to_owned(),
-            };
+            if let Some(reason) = reason {
+                notes.push(format!("  {}  {word}: {reason}", item.fingerprint));
+            }
+            let status = word.to_owned();
             let source = match item.sources.split_first() {
                 Some((first, [])) => first.to_string(),
                 Some((first, rest)) => format!("{first} (+{} more)", rest.len()),
@@ -417,6 +432,13 @@ pub fn render_table(assessed: &[Assessed]) -> String {
     line(header);
     for row in &rows {
         line([&row[0], &row[1], &row[2], &row[3], &row[4]]);
+    }
+    if !notes.is_empty() {
+        out.push_str("\nNotes:\n");
+        for note in notes {
+            out.push_str(&note);
+            out.push('\n');
+        }
     }
     out
 }
@@ -549,6 +571,45 @@ mod tests {
         assert_eq!(assessed[0].validity, None);
         assert_eq!(assessed[1].validity, Some(Validity::Valid));
         assert_eq!(calls_to(&log, "check_valid"), 1);
+        log.assert_no_mutations();
+    }
+
+    #[tokio::test]
+    async fn forced_provider_skips_identification() {
+        let log = CallLog::new();
+        let aws = Arc::new(MockProvider::new("aws").log(log.clone()));
+        let github = Arc::new(
+            MockProvider::new("github")
+                .identify_prefix("ghp_")
+                .log(log.clone()),
+        );
+        let reg = registry(vec![aws, github]);
+        let forced = AssessOptions {
+            force_provider: Some("aws"),
+            ..opts()
+        };
+        let assessed = assess(vec![finding("ghp_x", "stdin", "stdin")], &reg, &forced).await;
+        assert!(matches!(
+            assessed[0].disposition,
+            Disposition::Supported {
+                provider: "aws",
+                ..
+            }
+        ));
+        assert_eq!(assessed[0].validity, Some(Validity::Valid));
+
+        let unknown = AssessOptions {
+            force_provider: Some("nope"),
+            ..opts()
+        };
+        let assessed = assess(vec![finding("ghp_x", "stdin", "stdin")], &reg, &unknown).await;
+        assert!(matches!(
+            assessed[0].disposition,
+            Disposition::Supported {
+                provider: "github",
+                ..
+            }
+        ));
         log.assert_no_mutations();
     }
 
@@ -891,11 +952,26 @@ mod tests {
             finding("good_x", "Mock", "a.env"),
             finding("good_x", "Mock", "b.env"),
             finding("zzz", "Scanner", "c.env"),
+            finding("AKIAIOSFODNN7EXAMPLE", "aws-access-token", "d.env"),
         ];
         let assessed = assess(findings, &registry(vec![good]), &opts()).await;
         let table = render_table(&assessed);
         let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), 3, "{table}");
+        assert_eq!(lines.len(), 7, "{table}");
+        assert!(lines[3].contains("not rotatable"), "{table}");
+        assert!(
+            !lines[3].contains("gitleaks reports"),
+            "reason belongs in the notes"
+        );
+        assert_eq!(lines[5], "Notes:");
+        assert!(
+            lines[6].contains(assessed[2].fingerprint.as_str()),
+            "{table}"
+        );
+        assert!(
+            lines[6].contains("not rotatable: gitleaks reports only"),
+            "{table}"
+        );
         assert!(lines[0].starts_with("PROVIDER"));
         assert!(lines[1].starts_with("good"), "{table}");
         assert!(lines[1].contains("valid"));
