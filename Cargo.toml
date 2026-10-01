@@ -12,6 +12,10 @@ publish = false
 # Registers mock providers under the real names so CLI tests can run end
 # to end before the real providers exist. Never enabled for releases.
 test-providers = []
+# Adds the hidden `__test-console` subcommand that prints, fails or panics
+# with a secret read from stdin, so CLI tests can prove the console, error
+# and panic paths are redacted (SHA-246). Never enabled for releases.
+test-commands = []
 
 [dependencies]
 async-trait = "0.1"

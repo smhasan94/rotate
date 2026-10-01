@@ -1,20 +1,20 @@
 //! `rotate` entry point.
 //!
-//! This is the only file allowed to write directly to stdout or stderr until
-//! the redacted console (SHA-246) exists.
+//! Every byte this binary prints goes through `rotate::console::Console`,
+//! which redacts it (SHA-246). `clippy.toml` rejects `println!` and friends.
 
 mod cli;
 mod exit;
 mod providers;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
-use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
 use rotate::assess::{assess, render_json, render_table, AssessOptions};
-use rotate::config::Config;
+use rotate::config::{Config, ConfigError};
+use rotate::console::{self, Console};
 use rotate::finding::Finding;
 use rotate::report::{read_report, ReportError};
 
@@ -22,20 +22,61 @@ use crate::cli::{Cli, Command, InputArgs};
 use crate::exit::Exit;
 
 fn main() -> ExitCode {
+    console::install_panic_hook();
+    let mut console = Console::stdio();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) => return handle_parse_error(err),
+        Err(err) => {
+            let usage = Cli::command().render_usage();
+            let code = console.report_parse_error(&err, &usage);
+            return ExitCode::from(u8::try_from(code).unwrap_or(Exit::Usage as u8));
+        }
     };
     install_logging(cli.global.verbose);
     // Config errors are usage errors: the operator fixes the file or flag.
     let config = match Config::load(&cli.global.overrides()) {
         Ok(config) => config,
+        Err(ConfigError::Read { source, .. }) => {
+            // The path may be something the operator typed, such as a token
+            // pasted after --config, so it is not repeated.
+            let _ = writeln!(
+                console.err(),
+                "error: could not read the config file ({}). Secrets must be passed with --stdin, never as an argument.",
+                source.kind()
+            );
+            return Exit::Usage.into();
+        }
         Err(err) => {
-            eprintln!("error: {err}");
+            let _ = writeln!(console.err(), "error: {err}");
             return Exit::Usage.into();
         }
     };
-    run(cli.subcommand(), &config, cli.global.json).into()
+    // A secret read for the hidden test command lives until its error has
+    // been printed, as real inputs must: a value is redacted only while it
+    // is registered.
+    #[cfg(feature = "test-commands")]
+    let _held;
+    #[cfg(feature = "test-commands")]
+    let result = if let Command::TestConsole { mode } = cli.subcommand() {
+        match rotate::secret::SecretValue::from_reader(std::io::stdin().lock()) {
+            Ok(secret) => {
+                _held = secret;
+                test_console(&mut console, mode, &_held)
+            }
+            Err(err) => Err(err.into()),
+        }
+    } else {
+        run(&mut console, cli.subcommand(), &config, cli.global.json)
+    };
+    #[cfg(not(feature = "test-commands"))]
+    let result = run(&mut console, cli.subcommand(), &config, cli.global.json);
+    match result {
+        Ok(exit) => exit.into(),
+        Err(err) => {
+            let _ = writeln!(console.err(), "error: {err}");
+            Exit::RotationFailed.into()
+        }
+    }
 }
 
 /// Sends tracing events to stderr through the redaction layer (SHA-218), at
@@ -47,47 +88,32 @@ fn install_logging(verbose: u8) {
         tracing::subscriber::set_global_default(rotate::redact::subscriber(level, std::io::stderr));
 }
 
-/// Print a clap error without echoing tokens the user typed.
-///
-/// clap normally repeats an unrecognized argument in its message. An operator
-/// who pastes a secret as an argument instead of using `--stdin` would get it
-/// echoed to stderr, so those two error kinds get a fixed message instead.
-/// Every other kind (help, version, missing values) prints clap's own text.
-/// clap exits 0 for help and version and 2 for errors, which matches
-/// `Exit::Ok` and `Exit::Usage`; keep them in step if either changes.
-fn handle_parse_error(err: clap::Error) -> ExitCode {
-    match err.kind() {
-        ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument => {
-            let usage = Cli::command().render_usage();
-            eprintln!(
-                "error: unrecognized argument. Secrets must be passed with --stdin, never as an argument.\n\n{usage}\n\nFor more information, try '--help'."
-            );
-            Exit::Usage.into()
-        }
-        _ => err.exit(),
-    }
-}
-
-fn run(command: Command, _config: &Config, json: bool) -> Exit {
+/// Runs one subcommand. Errors are printed, redacted, by `main` with exit 1.
+fn run(
+    console: &mut Console,
+    command: Command,
+    _config: &Config,
+    json: bool,
+) -> Result<Exit, rotate::error::Error> {
     if let Some(input) = command.input() {
-        let findings = match read_input(input) {
+        let findings = match read_input(console, input) {
             Ok(findings) => findings,
-            Err(exit) => return exit,
+            Err(exit) => return Ok(exit),
         };
         if let Command::Plan(_) = command {
-            return plan(findings, input, json);
+            return Ok(plan(console, findings, input, json));
         }
     }
     // Still stubs until their tickets land (SHA-254 apply, SHA-259
     // rollback, SHA-263 status).
-    eprintln!("rotate {}: not implemented", command.name());
-    Exit::Usage
+    let _ = writeln!(console.err(), "rotate {}: not implemented", command.name());
+    Ok(Exit::Usage)
 }
 
 /// Assesses the findings and prints the table or JSON (SHA-248). The
 /// planner (SHA-250) adds consumers and the rotation steps to this output.
 /// Unsupported and unknown rows are information, not failures: exit 0.
-fn plan(findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
+fn plan(console: &mut Console, findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
     let registry = providers::registry();
     let opts = AssessOptions {
         concurrency: usize::from(input.concurrency),
@@ -104,23 +130,33 @@ fn plan(findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("error: could not start the async runtime: {err}");
+            let _ = writeln!(
+                console.err(),
+                "error: could not start the async runtime: {err}"
+            );
             return Exit::RotationFailed;
         }
     };
     let assessed = runtime.block_on(assess(findings, &registry, &opts));
-    if json {
-        println!("{}", render_json(&assessed));
+    let rendered = if json {
+        render_json(&assessed) + "\n"
     } else {
-        print!("{}", render_table(&assessed));
-    }
+        render_table(&assessed)
+    };
+    print_out(console, &rendered);
     Exit::Ok
+}
+
+/// The single stdout print site for command output (plan table or JSON):
+/// one redacted write of the whole rendering.
+fn print_out(console: &mut Console, text: &str) {
+    let _ = console.out().write_all(text.as_bytes());
 }
 
 /// Reads the findings named by `input` (SHA-247). Errors are printed here
 /// and never include what was read or a path the operator typed: a secret
 /// pasted where the report path goes must not be echoed back.
-fn read_input(input: &InputArgs) -> Result<Vec<Finding>, Exit> {
+fn read_input(console: &mut Console, input: &InputArgs) -> Result<Vec<Finding>, Exit> {
     if input.provider.is_some() {
         let registry = providers::registry();
         let known = registry.names();
@@ -134,7 +170,10 @@ fn read_input(input: &InputArgs) -> Result<Vec<Finding>, Exit> {
             } else {
                 known.join(", ")
             };
-            eprintln!("error: unknown provider; known providers: {known}");
+            let _ = writeln!(
+                console.err(),
+                "error: unknown provider; known providers: {known}"
+            );
             return Err(Exit::Usage);
         }
     }
@@ -142,38 +181,82 @@ fn read_input(input: &InputArgs) -> Result<Vec<Finding>, Exit> {
     if input.stdin {
         let stdin = std::io::stdin();
         // The hint is best effort; a closed stderr must not stop the read.
-        let _ = rotate::input::stdin_hint(stdin.is_terminal(), &mut std::io::stderr());
+        let _ = rotate::input::stdin_hint(stdin.is_terminal(), &mut console.err());
         return match rotate::input::read_secret(stdin.lock()) {
             Ok(finding) => Ok(vec![finding]),
             Err(err) => {
-                eprintln!("error: {err}");
+                let _ = writeln!(console.err(), "error: {err}");
                 Err(Exit::Usage)
             }
         };
     }
 
     let Some(path) = &input.report else {
-        eprintln!("error: no input: pass a report path or --stdin");
+        let _ = writeln!(
+            console.err(),
+            "error: no input: pass a report path or --stdin"
+        );
         return Err(Exit::Usage);
     };
     match read_report(path, input.format) {
         Ok(report) => {
             for warning in &report.warnings {
-                eprintln!("warning: {warning}");
+                let _ = writeln!(console.err(), "warning: {warning}");
             }
             Ok(report.findings)
         }
         Err(ReportError::Io { source, .. }) => {
             let usage = Cli::command().render_usage();
-            eprintln!(
+            let _ = writeln!(
+                console.err(),
                 "error: could not read the report file ({}). Secrets must be passed with --stdin, never as an argument.\n\n{usage}",
                 source.kind()
             );
             Err(Exit::Usage)
         }
         Err(err) => {
-            eprintln!("error: {err}");
+            let _ = writeln!(console.err(), "error: {err}");
             Err(Exit::Usage)
+        }
+    }
+}
+
+/// The hidden `__test-console` subcommand (`test-commands` feature only).
+/// `secret` was read from stdin, so it is registered with the redactor as
+/// real input is. It goes down the output path `mode` names, and is also
+/// logged at error level so tests can check the tracing path.
+#[cfg(feature = "test-commands")]
+fn test_console(
+    console: &mut Console,
+    mode: cli::TestConsoleMode,
+    secret: &rotate::secret::SecretValue,
+) -> Result<Exit, rotate::error::Error> {
+    use cli::TestConsoleMode;
+    use rotate::provider::ProviderError;
+
+    let value = secret
+        .expose_secret_str(str::to_owned)
+        .map_err(rotate::error::Error::new)?;
+    tracing::error!("test-console saw {value}");
+    match mode {
+        TestConsoleMode::Out => {
+            let _ = writeln!(console.out(), "value: {value}");
+            Ok(Exit::Ok)
+        }
+        TestConsoleMode::Error => {
+            Err(ProviderError::Permanent(format!("provider rejected {value}")).into())
+        }
+        TestConsoleMode::Panic => panic!("test-console panic with {value}"),
+        TestConsoleMode::Json => {
+            let doc = serde_json::json!({
+                "rotations": [{
+                    "fingerprint": secret.fingerprint().to_string(),
+                    "note": format!("upstream echoed {value}"),
+                    "values": [value.clone(), { "nested": value }],
+                }],
+            });
+            print_out(console, &(doc.to_string() + "\n"));
+            Ok(Exit::Ok)
         }
     }
 }

@@ -203,7 +203,10 @@ pub fn require_env(name: &str) -> Option<String> {
 macro_rules! live_guard {
     () => {
         if !$crate::common::live_enabled() {
-            eprintln!("skipped: ROTATE_LIVE_TESTS not set");
+            {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "skipped: ROTATE_LIVE_TESTS not set");
+            }
             return;
         }
     };

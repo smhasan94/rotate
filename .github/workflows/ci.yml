@@ -58,9 +58,13 @@ jobs:
     env:
       # SHA-194 AC1: the build itself must be warning-free.
       RUSTFLAGS: -D warnings
+      # SHA-246 T4: tests/lint.rs runs clippy and must not skip here.
+      ROTATE_REQUIRE_CLIPPY: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
       - name: cargo test
