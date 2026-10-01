@@ -8,8 +8,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -34,6 +35,18 @@ pub struct MockProvider {
     queued_failures: Mutex<HashMap<String, VecDeque<ProviderError>>>,
     standing_failures: Mutex<HashMap<String, ProviderError>>,
     replacements: AtomicU64,
+    latency: Option<Duration>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+/// Counts a read call as in flight until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MockProvider {
@@ -55,6 +68,9 @@ impl MockProvider {
             queued_failures: Mutex::new(HashMap::new()),
             standing_failures: Mutex::new(HashMap::new()),
             replacements: AtomicU64::new(0),
+            latency: None,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -99,6 +115,36 @@ impl MockProvider {
     pub fn log(mut self, log: CallLog) -> Self {
         self.log = log;
         self
+    }
+
+    /// Make `check_valid`, `describe_scope` and `verify` wait `latency`
+    /// before returning, so tests can observe concurrency.
+    pub fn latency(mut self, latency: Duration) -> Self {
+        self.latency = Some(latency);
+        self
+    }
+
+    /// Highest number of read calls that were in flight at the same time.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Marks a read call in flight for as long as the guard lives.
+    fn begin(&self) -> InFlight<'_> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        InFlight(&self.in_flight)
+    }
+
+    /// Records a read call, waits out the configured latency, then returns
+    /// the injected failure if any.
+    async fn read_call(&self, method: &str, fingerprint: Fingerprint) -> Result<(), ProviderError> {
+        let _in_flight = self.begin();
+        let result = self.enter(method, Some(fingerprint));
+        if let Some(latency) = self.latency {
+            tokio::time::sleep(latency).await;
+        }
+        result
     }
 
     /// The log this mock writes to.
@@ -187,12 +233,14 @@ impl Provider for MockProvider {
     }
 
     async fn check_valid(&self, credential: &Credential) -> Result<Validity, ProviderError> {
-        self.enter("check_valid", Some(credential.fingerprint()))?;
+        self.read_call("check_valid", credential.fingerprint())
+            .await?;
         Ok(self.validity.clone())
     }
 
     async fn describe_scope(&self, credential: &Credential) -> Result<Scope, ProviderError> {
-        self.enter("describe_scope", Some(credential.fingerprint()))?;
+        self.read_call("describe_scope", credential.fingerprint())
+            .await?;
         Ok(self.scope.clone())
     }
 
@@ -222,7 +270,7 @@ impl Provider for MockProvider {
         credential: &Credential,
         _identity: &Identity,
     ) -> Result<(), ProviderError> {
-        self.enter("verify", Some(credential.fingerprint()))
+        self.read_call("verify", credential.fingerprint()).await
     }
 
     async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError> {
