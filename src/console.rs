@@ -78,7 +78,9 @@ impl<O: Write, E: Write> Console<O, E> {
     /// usage line.
     pub fn report_parse_error(&mut self, err: &clap::Error, usage: &dyn fmt::Display) -> i32 {
         let text = Zeroizing::new(match err.kind() {
-            ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument | ErrorKind::TooManyValues => {
+            ErrorKind::InvalidSubcommand
+            | ErrorKind::UnknownArgument
+            | ErrorKind::TooManyValues => {
                 format!(
                     "error: unrecognized argument. {STDIN_HINT}\n\n{usage}\n\nFor more information, try '--help'.\n"
                 )
@@ -219,7 +221,12 @@ mod tests {
         let canary = ["console-panic-", "c0ffee42"].concat();
         let secret = SecretValue::from(canary.as_str());
         let mut buf = Vec::new();
-        report_panic(&mut buf, "main", Some("src/x.rs:1:2"), &format!("boom {canary}"));
+        report_panic(
+            &mut buf,
+            "main",
+            Some("src/x.rs:1:2"),
+            &format!("boom {canary}"),
+        );
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(
             text,

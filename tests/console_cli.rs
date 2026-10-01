@@ -173,7 +173,8 @@ mod hidden {
         let run = run(dir.path(), "panic", &canary);
         assert_eq!(run.code, Some(101));
         assert!(
-            run.stderr.contains("thread 'main' panicked at src/main.rs:"),
+            run.stderr
+                .contains("thread 'main' panicked at src/main.rs:"),
             "{}",
             run.stderr
         );
