@@ -116,6 +116,29 @@ pub enum Command {
     Rollback(InputArgs),
     /// Show in-progress rotations.
     Status,
+    /// Test only (`test-commands` feature): prints, fails or panics with
+    /// the secret read from stdin, to prove those paths are redacted.
+    #[cfg(feature = "test-commands")]
+    #[command(name = "__test-console", hide = true)]
+    TestConsole {
+        /// What to do with the secret.
+        #[arg(value_enum)]
+        mode: TestConsoleMode,
+    },
+}
+
+/// Modes of the hidden `__test-console` subcommand.
+#[cfg(feature = "test-commands")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TestConsoleMode {
+    /// Write the secret to stdout through the console.
+    Out,
+    /// Return a provider error holding the secret to `main`.
+    Error,
+    /// Panic with the secret in the message.
+    Panic,
+    /// Print a JSON document holding the secret through the plan print path.
+    Json,
 }
 
 impl Command {
@@ -126,6 +149,8 @@ impl Command {
             Command::Apply(_) => "apply",
             Command::Rollback(_) => "rollback",
             Command::Status => "status",
+            #[cfg(feature = "test-commands")]
+            Command::TestConsole { .. } => "__test-console",
         }
     }
 
@@ -134,6 +159,8 @@ impl Command {
         match self {
             Command::Plan(input) | Command::Apply(input) | Command::Rollback(input) => Some(input),
             Command::Status => None,
+            #[cfg(feature = "test-commands")]
+            Command::TestConsole { .. } => None,
         }
     }
 }

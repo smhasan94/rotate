@@ -7,6 +7,8 @@
 //! Token-shaped values are built at runtime so no literal in this file looks
 //! like a credential to a secret scanner.
 
+#![allow(clippy::disallowed_macros)]
+
 use std::process::Command;
 
 use rotate::redact::{level_for, subscriber};
