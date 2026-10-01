@@ -6,6 +6,7 @@
 //! The methods listed in [`MUTATING`] change state on the real service;
 //! everything else is read-only and safe for a dry run.
 
+pub mod aws;
 pub mod mock;
 
 use std::fmt;
