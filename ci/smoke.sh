@@ -24,7 +24,8 @@ run() {
   shift 3
   printf '%s' "$input" | "$bin" "$@" >"$name.out" 2>"$name.err" &
   local pid=$!
-  ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) &
+  # Detached from stdout/stderr so a leftover `sleep` cannot hold a pipe open.
+  ( sleep "$limit"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   local watchdog=$!
   local code=0
   wait "$pid" || code=$?

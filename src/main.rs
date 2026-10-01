@@ -128,10 +128,12 @@ fn run(
     Ok(Exit::Usage)
 }
 
-/// A single-threaded runtime for the provider and consumer calls.
+/// A single-threaded runtime for the provider and consumer calls. The real
+/// plugins' HTTP clients (AWS SDK, reqwest) need the IO driver as well as
+/// timers, so every driver is enabled.
 fn runtime(console: &mut Console) -> Result<tokio::runtime::Runtime, Exit> {
     tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
         .map_err(|err| {
             let _ = writeln!(
@@ -198,7 +200,11 @@ fn plan(
         Err(err) => return state_error(console, err),
     };
     let registry = providers::registry();
-    let consumers = providers::consumers();
+    let consumers = providers::consumers_with(
+        &config.consumers,
+        &config.providers.github,
+        &config.providers.aws,
+    );
     let runtime = match runtime(console) {
         Ok(runtime) => runtime,
         Err(exit) => return exit,
@@ -238,7 +244,11 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         Err(err) => return state_error(console, err),
     };
     let registry = providers::registry();
-    let consumers = providers::consumers();
+    let consumers = providers::consumers_with(
+        &config.consumers,
+        &config.providers.github,
+        &config.providers.aws,
+    );
     let runtime = match runtime(console) {
         Ok(runtime) => runtime,
         Err(exit) => return exit,
