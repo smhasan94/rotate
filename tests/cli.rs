@@ -18,6 +18,18 @@ fn assert_stub(name: &str) {
         )));
 }
 
+/// `plan`, `apply` and `rollback` need input before reaching their stub.
+fn assert_needs_input(args: &[&str]) {
+    rotate()
+        .args(args)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "no input: pass a report path or --stdin",
+        ));
+}
+
 /// T2 covers AC2.
 #[test]
 fn version_prints_crate_version() {
@@ -30,24 +42,20 @@ fn version_prints_crate_version() {
 
 /// T3 covers AC3.
 #[test]
-fn no_args_runs_plan_stub() {
-    rotate()
-        .assert()
-        .code(2)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("rotate plan: not implemented"));
+fn no_args_runs_plan() {
+    assert_needs_input(&[]);
 }
 
 /// T4 covers AC4.
 #[test]
-fn apply_stub_exits_2() {
-    assert_stub("apply");
+fn apply_without_input_exits_2() {
+    assert_needs_input(&["apply"]);
 }
 
 /// T4 covers AC4.
 #[test]
-fn rollback_stub_exits_2() {
-    assert_stub("rollback");
+fn rollback_without_input_exits_2() {
+    assert_needs_input(&["rollback"]);
 }
 
 /// T4 covers AC4.
@@ -102,11 +110,7 @@ fn help_exits_0() {
 /// Extra: global flags before the subcommand do not swallow it.
 #[test]
 fn global_flags_accepted_before_subcommand() {
-    rotate()
-        .args(["--json", "-v", "plan"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("rotate plan: not implemented"));
+    assert_needs_input(&["--json", "-v", "plan"]);
 }
 
 /// Extra: clap's own errors for missing values still exit 2.

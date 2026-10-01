@@ -5,15 +5,19 @@
 
 mod cli;
 mod exit;
+mod providers;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
 use rotate::config::Config;
+use rotate::finding::Finding;
+use rotate::report::{read_report, ReportError};
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, InputArgs};
 use crate::exit::Exit;
 
 fn main() -> ExitCode {
@@ -54,8 +58,94 @@ fn handle_parse_error(err: clap::Error) -> ExitCode {
 }
 
 fn run(command: Command, _config: &Config) -> Exit {
-    // Every subcommand is a stub until its ticket lands (SHA-250 plan,
-    // SHA-254 apply, SHA-259 rollback, SHA-263 status).
+    if let Some(input) = command.input() {
+        match read_input(input) {
+            Ok(findings) => print_findings(&findings),
+            Err(exit) => return exit,
+        }
+    }
+    // Every subcommand is a stub until its ticket lands (SHA-248 and
+    // SHA-250 plan, SHA-254 apply, SHA-259 rollback, SHA-263 status).
     eprintln!("rotate {}: not implemented", command.name());
     Exit::Usage
+}
+
+/// Reads the findings named by `input` (SHA-247). Errors are printed here
+/// and never include what was read or a path the operator typed: a secret
+/// pasted where the report path goes must not be echoed back.
+fn read_input(input: &InputArgs) -> Result<Vec<Finding>, Exit> {
+    if input.provider.is_some() {
+        let registry = providers::registry();
+        let known = registry.names();
+        if !input
+            .provider
+            .as_deref()
+            .is_some_and(|name| known.contains(&name))
+        {
+            let known = if known.is_empty() {
+                "none are built in yet".to_owned()
+            } else {
+                known.join(", ")
+            };
+            eprintln!("error: unknown provider; known providers: {known}");
+            return Err(Exit::Usage);
+        }
+    }
+
+    if input.stdin {
+        let stdin = std::io::stdin();
+        // The hint is best effort; a closed stderr must not stop the read.
+        let _ = rotate::input::stdin_hint(stdin.is_terminal(), &mut std::io::stderr());
+        return match rotate::input::read_secret(stdin.lock()) {
+            Ok(finding) => Ok(vec![finding]),
+            Err(err) => {
+                eprintln!("error: {err}");
+                Err(Exit::Usage)
+            }
+        };
+    }
+
+    let Some(path) = &input.report else {
+        eprintln!("error: no input: pass a report path or --stdin");
+        return Err(Exit::Usage);
+    };
+    match read_report(path, input.format) {
+        Ok(report) => {
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            Ok(report.findings)
+        }
+        Err(ReportError::Io { source, .. }) => {
+            let usage = Cli::command().render_usage();
+            eprintln!(
+                "error: could not read the report file ({}). Secrets must be passed with --stdin, never as an argument.\n\n{usage}",
+                source.kind()
+            );
+            Err(Exit::Usage)
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            Err(Exit::Usage)
+        }
+    }
+}
+
+/// Lists what was read, by fingerprint only, until the assessment table
+/// replaces it (SHA-248).
+fn print_findings(findings: &[Finding]) {
+    let noun = if findings.len() == 1 {
+        "finding"
+    } else {
+        "findings"
+    };
+    println!("{} {noun}:", findings.len());
+    for finding in findings {
+        println!(
+            "  {}  {}  {}",
+            finding.fingerprint(),
+            finding.detector,
+            finding.source
+        );
+    }
 }
