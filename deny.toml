@@ -1,6 +1,8 @@
 # cargo-deny configuration. CI runs `cargo deny check` on every PR.
-# License additions need a note in CONTRIBUTING; see SHA-273 for the
-# pending decision on MPL-2.0 and ring before reqwest is added.
+# License additions need a note in CONTRIBUTING. The TLS and AWS SDK policy
+# (SHA-273, docs/plans/SHA-273.md): reqwest uses rustls with the OS trust
+# store, and the AWS SDK crates use default-features = false with the
+# default-https-client feature. Neither needs a license beyond this list.
 
 [licenses]
 allow = [
@@ -18,6 +20,20 @@ yanked = "deny"
 
 [bans]
 multiple-versions = "warn"
+# The legacy HTTP and TLS stack that the AWS SDK pulls in with its default
+# features. It carried open advisories when SHA-273 was decided (h2 0.3 and
+# rustls-webpki 0.101). `crate@x.y` is a caret requirement, so each banned
+# series is listed; the current majors (hyper 1, h2 0.4, rustls 0.23,
+# rustls-webpki 0.103) are not affected.
+deny = [
+    { crate = "hyper@0.14", reason = "legacy HTTP stack; use hyper 1 (aws-sdk-*: default-features = false, default-https-client)" },
+    { crate = "h2@0.3", reason = "legacy HTTP/2 with open advisories; comes with hyper 0.14" },
+    { crate = "rustls@0.20", reason = "legacy TLS; use rustls 0.23" },
+    { crate = "rustls@0.21", reason = "legacy TLS; use rustls 0.23" },
+    { crate = "rustls@0.22", reason = "legacy TLS; use rustls 0.23" },
+    { crate = "rustls-webpki@0.100", reason = "legacy certificate verifier with open advisories" },
+    { crate = "rustls-webpki@0.101", reason = "legacy certificate verifier with open advisories" },
+]
 
 [sources]
 unknown-registry = "deny"
