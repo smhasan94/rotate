@@ -19,6 +19,9 @@ test-commands = []
 
 [dependencies]
 async-trait = "0.1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sso", "credentials-process"] }
+aws-sdk-iam = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 # Provider token patterns for log redaction (SHA-218).
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }

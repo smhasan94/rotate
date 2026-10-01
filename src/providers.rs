@@ -1,7 +1,8 @@
 //! The provider and consumer registries the CLI runs with.
 //!
-//! No real provider or consumer is built in yet (SHA-251, SHA-252, SHA-253,
-//! SHA-260 to SHA-262). The `test-providers` feature registers
+//! Real providers register in builds without `test-providers`: AWS
+//! (SHA-251). Constructing one makes no call and loads no credentials; that
+//! happens on first use. The `test-providers` feature instead registers
 //! `MockProvider`s under the four real names so integration tests can drive
 //! the CLI end to end, and lets a test describe a scenario in a JSON file
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
@@ -17,6 +18,10 @@ pub fn registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     #[cfg(feature = "test-providers")]
     scenario::register_providers(&mut registry);
+    #[cfg(not(feature = "test-providers"))]
+    registry.register(std::sync::Arc::new(
+        rotate::provider::aws::AwsProvider::new(),
+    ));
     registry
 }
 
