@@ -1,0 +1,75 @@
+# rotate.yaml: every field, with its default or an example value.
+#
+# rotate reads ./rotate.yaml, or the file named by --config or ROTATE_CONFIG.
+# The file is optional; without it every default below applies.
+#
+# Never put a credential in this file. Provider credentials are read from
+# the environment; this file only names where to look.
+#
+# Each of overlap_window, audit_log and state_file can be overridden, in
+# order of precedence: a flag (--overlap, --audit-log, --state-file), then an
+# environment variable (ROTATE_OVERLAP, ROTATE_AUDIT_LOG, ROTATE_STATE_FILE),
+# then this file. Relative paths are relative to the working directory.
+
+# How long the old secret stays valid after every consumer is updated,
+# before it is revoked. One or more <number><s|m|h|d> groups: 0s, 30m, 1h30m.
+# Default: 0s (revoke right after verification).
+overlap_window: 30m
+
+# Append-only audit log of every step. Default: .rotate/audit.jsonl
+audit_log: .rotate/audit.jsonl
+
+# In-progress rotation state used by resume, status and rollback.
+# Default: .rotate/state.json
+state_file: .rotate/state.json
+
+# Where leaked secrets are used.
+consumers:
+  github_actions:
+    # Repositories (owner/repo) and organizations (org:<name>) whose Actions
+    # secrets are checked. Default: none.
+    targets:
+      - acme/api
+      - org:acme
+    # Secret names to check in addition to each provider's convention:
+    #   aws:    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+    #   github: GITHUB_TOKEN, GH_TOKEN, GH_PAT
+    #   npm:    NPM_TOKEN
+    #   openai: OPENAI_API_KEY
+    # secret_names hold the token or the secret half of a key pair.
+    secret_names:
+      github: [RELEASE_TOKEN]
+      aws: [CI_AWS_SECRET_ACCESS_KEY]
+    # key_id_names hold the access key id half of an AWS key pair.
+    key_id_names:
+      aws: [CI_AWS_ACCESS_KEY_ID]
+
+  aws_secrets_manager:
+    # Secret names or ARNs whose values are compared with the leaked secret.
+    # Default: none.
+    secrets:
+      - prod/api
+    # Secrets selected by tag. An empty values list matches any value.
+    tag_filters:
+      - key: team
+        values: [payments]
+    # For JSON secrets, the keys to compare and update. Omit to compare
+    # every top-level string value.
+    json_keys: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
+
+providers:
+  aws:
+    # Region for IAM, STS and Secrets Manager. Omit to use the AWS
+    # environment (AWS_REGION and so on).
+    region: us-east-1
+  github:
+    # REST API base URL; change it for GitHub Enterprise Server.
+    # Default: https://api.github.com
+    api_url: https://api.github.com
+  npm:
+    # Default: https://registry.npmjs.org
+    registry: https://registry.npmjs.org
+  openai:
+    # Name of the environment variable that holds the OpenAI Admin API key.
+    # Default: OPENAI_ADMIN_KEY
+    admin_key_env: OPENAI_ADMIN_KEY
