@@ -1,7 +1,69 @@
 # Contributing
 
-This file is a stub. SHA-213 fills in the rest (branch naming, commits,
-pull requests). The testing section below is owned by SHA-216.
+Thanks for helping. rotate handles live credentials, so the safety rules in
+[README.md](README.md#safety-guarantees) apply to every change. To report a
+vulnerability, follow [SECURITY.md](SECURITY.md) instead of opening an issue.
+
+## Setup
+
+Rust stable, edition 2021. `rust-toolchain.toml` pins the channel. Install
+the extra tools once:
+
+```sh
+rustup component add rustfmt clippy
+cargo install cargo-deny --locked
+```
+
+## Checks
+
+Run all four before opening a pull request. CI runs the same commands on
+Linux and macOS, and all of them must pass before merge.
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo deny check
+```
+
+CI also runs `ci/check-docs.sh`, which checks that the block above matches
+`CLAUDE.md` and that the README and SECURITY.md keep their key sections.
+
+## Work items
+
+Every change starts from a ticket in the Linear project "rotate". Bigger
+tickets get a short implementation plan in `docs/plans/SHA-<n>.md` before
+the code.
+
+## Branches
+
+Trunk-based on `main`. Name a branch after its ticket: the lowercase Linear
+identifier, a hyphen, and a short slug of the title, for example
+`sha-42-zeroized-secret-type`.
+
+## Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
+`fix:`, `docs:`, `test:`, `ci:`, `refactor:`, `chore:`, with an optional
+scope, such as `feat(config): ...`. Put the ticket id in the subject or body.
+
+## Pull requests
+
+All code changes go through a pull request; nothing else is pushed to
+`main`. The one exception is `docs/plans/` and `docs/backlog.md`, which may
+be committed directly.
+
+The pull request template asks for the Linear link, any changes to the
+ticket, and a table mapping each T-case to its test. A ticket is done when
+every T-case passes in CI, the four checks pass, docs are updated, and the
+pull request is reviewed and merged.
+
+## Dependencies
+
+Keep the dependency set small. `deny.toml` allows only licenses compatible
+with Apache-2.0 and rejects known advisories. If a new crate needs a license
+that is not on the allowlist, say why in the pull request and add a note
+here.
 
 ## Writing tests
 

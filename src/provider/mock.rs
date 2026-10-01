@@ -16,8 +16,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -48,10 +49,22 @@ pub struct MockProvider {
     call_counts: Mutex<HashMap<String, usize>>,
     mutates_in: HashSet<String>,
     leaks_in: HashSet<String>,
+    latency: Option<Duration>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Counts a read call as in flight until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MockProvider {
@@ -79,6 +92,9 @@ impl MockProvider {
             call_counts: Mutex::new(HashMap::new()),
             mutates_in: HashSet::new(),
             leaks_in: HashSet::new(),
+            latency: None,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -154,6 +170,36 @@ impl MockProvider {
     /// True when the mock currently treats `fingerprint` as revoked.
     pub fn is_revoked(&self, fingerprint: &Fingerprint) -> bool {
         lock(&self.revoked).contains(fingerprint)
+    }
+
+    /// Make `check_valid`, `describe_scope` and `verify` wait `latency`
+    /// before returning, so tests can observe concurrency.
+    pub fn latency(mut self, latency: Duration) -> Self {
+        self.latency = Some(latency);
+        self
+    }
+
+    /// Highest number of read calls that were in flight at the same time.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Marks a read call in flight for as long as the guard lives.
+    fn begin(&self) -> InFlight<'_> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        InFlight(&self.in_flight)
+    }
+
+    /// Records a read call, waits out the configured latency, then returns
+    /// the injected failure if any.
+    async fn read_call(&self, method: &str, credential: &Credential) -> Result<(), ProviderError> {
+        let _in_flight = self.begin();
+        let result = self.enter_with(method, credential);
+        if let Some(latency) = self.latency {
+            tokio::time::sleep(latency).await;
+        }
+        result
     }
 
     /// The log this mock writes to.
@@ -282,7 +328,7 @@ impl Provider for MockProvider {
     }
 
     async fn check_valid(&self, credential: &Credential) -> Result<Validity, ProviderError> {
-        self.enter_with("check_valid", credential)?;
+        self.read_call("check_valid", credential).await?;
         if self.is_revoked(&credential.fingerprint()) {
             return Ok(Validity::Invalid);
         }
@@ -290,7 +336,7 @@ impl Provider for MockProvider {
     }
 
     async fn describe_scope(&self, credential: &Credential) -> Result<Scope, ProviderError> {
-        self.enter_with("describe_scope", credential)?;
+        self.read_call("describe_scope", credential).await?;
         Ok(self.scope.clone())
     }
 
@@ -320,7 +366,7 @@ impl Provider for MockProvider {
         credential: &Credential,
         identity: &Identity,
     ) -> Result<(), ProviderError> {
-        self.enter_with("verify", credential)?;
+        self.read_call("verify", credential).await?;
         if *identity != self.scope.identity {
             return Err(ProviderError::Permanent(format!(
                 "credential belongs to {}, not {identity}",
