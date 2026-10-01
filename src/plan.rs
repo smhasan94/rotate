@@ -458,10 +458,21 @@ fn field(out: &mut String, label: &str, value: &str) {
 
 /// Human-readable plan: one block per rotation, then the skipped secrets.
 pub fn render_table(plan: &Plan) -> String {
+    render_with_header(plan, "Plan", "Dry run: nothing was changed.")
+}
+
+/// [`render_table`] as `rotate apply` prints it before asking for
+/// confirmation: the header says what is about to happen instead of
+/// calling it a dry run (SHA-256).
+pub fn render_apply_table(plan: &Plan) -> String {
+    render_with_header(plan, "Plan to apply", "Nothing has been changed yet.")
+}
+
+fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Plan: {} to rotate, {} skipped. Dry run: nothing was changed.",
+        "{title}: {} to rotate, {} skipped. {note}",
         plan.rotations.len(),
         plan.skipped.len()
     );
