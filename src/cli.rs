@@ -65,7 +65,7 @@ impl GlobalArgs {
 
 /// Where the leaked secrets come from (SHA-247): a scanner report, or a
 /// single secret on stdin. Secrets are never accepted as arguments.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InputArgs {
     /// TruffleHog (JSON lines) or gitleaks (JSON) report to read.
     #[arg(value_name = "REPORT", conflicts_with = "stdin")]
@@ -83,6 +83,26 @@ pub struct InputArgs {
     /// Provider of the stdin secret, skipping identification.
     #[arg(long, value_name = "NAME", requires = "stdin")]
     pub provider: Option<String>,
+
+    /// Most provider checks in flight at once (SHA-248).
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_CONCURRENCY,
+          value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub concurrency: u16,
+}
+
+/// Default for `--concurrency`.
+pub const DEFAULT_CONCURRENCY: u16 = 8;
+
+impl Default for InputArgs {
+    fn default() -> Self {
+        Self {
+            report: None,
+            format: None,
+            stdin: false,
+            provider: None,
+            concurrency: DEFAULT_CONCURRENCY,
+        }
+    }
 }
 
 /// The four workflow commands.
@@ -209,6 +229,8 @@ mod tests {
             vec!["rotate", "plan", "--provider", "aws"],
             vec!["rotate", "plan", "--format", "gitleaks"],
             vec!["rotate", "plan", "r.json", "--format", "csv"],
+            vec!["rotate", "plan", "r.json", "--concurrency", "0"],
+            vec!["rotate", "plan", "r.json", "--concurrency", "65"],
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?} accepted");
         }
