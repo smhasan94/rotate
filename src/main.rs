@@ -12,15 +12,19 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 
+use rotate::apply::{self, Confirmation, Executor, RunStatus, TtyPrompt};
 use rotate::assess::{assess, AssessOptions};
+use rotate::audit::AuditLog;
 use rotate::config::{Config, ConfigError};
 use rotate::console::{self, Console};
+use rotate::consumer::ConsumerRegistry;
 use rotate::finding::Finding;
 use rotate::plan;
+use rotate::provider::ProviderRegistry;
 use rotate::report::{read_report, ReportError};
 use rotate::state::{StateError, StateStore};
 
-use crate::cli::{Cli, Command, InputArgs};
+use crate::cli::{ApplyArgs, Cli, Command, InputArgs};
 use crate::exit::Exit;
 
 fn main() -> ExitCode {
@@ -100,19 +104,80 @@ fn run(
     config: &Config,
     json: bool,
 ) -> Result<Exit, rotate::error::Error> {
+    if let (Command::Apply(_), true) = (&command, json) {
+        let _ = writeln!(
+            console.err(),
+            "error: rotate apply does not support --json yet"
+        );
+        return Ok(Exit::Usage);
+    }
     if let Some(input) = command.input() {
         let findings = match read_input(console, input) {
             Ok(findings) => findings,
             Err(exit) => return Ok(exit),
         };
-        if let Command::Plan(_) = command {
-            return Ok(plan(console, findings, input, config, json));
+        match &command {
+            Command::Plan(_) => return Ok(plan(console, findings, input, config, json)),
+            Command::Apply(args) => return Ok(apply(console, findings, args, config)),
+            _ => {}
         }
     }
-    // Still stubs until their tickets land (SHA-254 apply, SHA-259
-    // rollback, SHA-263 status).
+    // Still stubs until their tickets land (SHA-259 rollback, SHA-263
+    // status).
     let _ = writeln!(console.err(), "rotate {}: not implemented", command.name());
     Ok(Exit::Usage)
+}
+
+/// A single-threaded runtime for the provider and consumer calls.
+fn runtime(console: &mut Console) -> Result<tokio::runtime::Runtime, Exit> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|err| {
+            let _ = writeln!(
+                console.err(),
+                "error: could not start the async runtime: {err}"
+            );
+            Exit::RotationFailed
+        })
+}
+
+/// Assesses `findings`, builds the plan and gives every rotation its id in
+/// `store`. Only read-only remote calls are made (SHA-250).
+fn build_plan(
+    console: &mut Console,
+    runtime: &tokio::runtime::Runtime,
+    findings: Vec<Finding>,
+    input: &InputArgs,
+    config: &Config,
+    registries: (&ProviderRegistry, &ConsumerRegistry),
+    store: &mut StateStore,
+) -> Result<plan::Plan, Exit> {
+    let (registry, consumers) = registries;
+    let opts = AssessOptions {
+        concurrency: usize::from(input.concurrency),
+        force_provider: input
+            .provider
+            .as_deref()
+            .and_then(|name| registry.get(name))
+            .map(|provider| provider.name()),
+        ..AssessOptions::default()
+    };
+    let mut plan = runtime.block_on(async {
+        let assessed = assess(findings, registry, &opts).await;
+        plan::build(
+            assessed,
+            registry,
+            consumers,
+            config.overlap_window,
+            &config.consumers,
+        )
+        .await
+    });
+    if let Err(err) = plan::assign_ids(&mut plan, store) {
+        return Err(state_error(console, err));
+    }
+    Ok(plan)
 }
 
 /// Builds the plan (SHA-250) and prints the table or JSON: assessment
@@ -134,42 +199,22 @@ fn plan(
     };
     let registry = providers::registry();
     let consumers = providers::consumers();
-    let opts = AssessOptions {
-        concurrency: usize::from(input.concurrency),
-        force_provider: input
-            .provider
-            .as_deref()
-            .and_then(|name| registry.get(name))
-            .map(|provider| provider.name()),
-        ..AssessOptions::default()
-    };
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-    {
+    let runtime = match runtime(console) {
         Ok(runtime) => runtime,
-        Err(err) => {
-            let _ = writeln!(
-                console.err(),
-                "error: could not start the async runtime: {err}"
-            );
-            return Exit::RotationFailed;
-        }
+        Err(exit) => return exit,
     };
-    let mut plan = runtime.block_on(async {
-        let assessed = assess(findings, &registry, &opts).await;
-        plan::build(
-            assessed,
-            &registry,
-            &consumers,
-            config.overlap_window,
-            &config.consumers,
-        )
-        .await
-    });
-    if let Err(err) = plan::assign_ids(&mut plan, &mut store) {
-        return state_error(console, err);
-    }
+    let plan = match build_plan(
+        console,
+        &runtime,
+        findings,
+        input,
+        config,
+        (&registry, &consumers),
+        &mut store,
+    ) {
+        Ok(plan) => plan,
+        Err(exit) => return exit,
+    };
     drop(store);
     let rendered = if json {
         plan::render_json(&plan) + "\n"
@@ -178,6 +223,123 @@ fn plan(
     };
     print_out(console, &rendered);
     Exit::Ok
+}
+
+/// `rotate apply` (SHA-254): re-plans from the same input, prints the plan,
+/// asks for confirmation (or takes `--confirm`), then runs each confirmed
+/// rotation through the executor: create, update consumers, verify, revoke.
+/// The state lock is held for the whole run. Nothing state-changing happens
+/// before every confirmation is in and the audit log is open. The plan, and
+/// with it every credential, lives until the summary is printed, so the
+/// values stay registered with the redactor for every message.
+fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config: &Config) -> Exit {
+    let mut store = match StateStore::open(&config.state_file) {
+        Ok(store) => store,
+        Err(err) => return state_error(console, err),
+    };
+    let registry = providers::registry();
+    let consumers = providers::consumers();
+    let runtime = match runtime(console) {
+        Ok(runtime) => runtime,
+        Err(exit) => return exit,
+    };
+    let plan = match build_plan(
+        console,
+        &runtime,
+        findings,
+        &args.input,
+        config,
+        (&registry, &consumers),
+        &mut store,
+    ) {
+        Ok(plan) => plan,
+        Err(exit) => return exit,
+    };
+    print_out(console, &plan::render_table(&plan));
+    if plan.rotations.is_empty() {
+        let _ = writeln!(console.err(), "Nothing to apply.");
+        return Exit::Ok;
+    }
+
+    let all_ids = apply::rotation_ids(&plan);
+    let mut askable = Vec::new();
+    for rotation in &plan.rotations {
+        match apply::eligibility(rotation) {
+            Ok(()) => askable.push(rotation.rotation_id.as_str()),
+            Err(why) => {
+                let _ = writeln!(
+                    console.err(),
+                    "note: rotation {} will be skipped: {why}",
+                    rotation.rotation_id
+                );
+            }
+        }
+    }
+    let request = if !args.confirm.is_empty() {
+        Confirmation::Ids(args.confirm.clone())
+    } else if args.all {
+        Confirmation::All
+    } else {
+        Confirmation::Interactive
+    };
+    let mut prompt = providers::prompt().unwrap_or_else(|| Box::new(TtyPrompt::new()));
+    let confirmed = {
+        let mut err = console.err();
+        let result = apply::confirm(&all_ids, &askable, &request, prompt.as_mut(), &mut err);
+        drop(err);
+        match result {
+            Ok(confirmed) => confirmed,
+            Err(err) => {
+                let _ = writeln!(console.err(), "error: {err}");
+                return Exit::Usage;
+            }
+        }
+    };
+    // With --confirm only the named rotations count; otherwise every
+    // rotation in the plan does, including those skipped as unsupported.
+    let requested: Vec<&plan::PlannedRotation> = plan
+        .rotations
+        .iter()
+        .filter(|r| match request {
+            Confirmation::Ids(_) => confirmed.contains(&r.rotation_id),
+            _ => confirmed.contains(&r.rotation_id) || apply::eligibility(r).is_err(),
+        })
+        .collect();
+
+    let mut outcomes = Vec::new();
+    if requested.iter().any(|r| apply::eligibility(r).is_ok()) {
+        let mut audit = match AuditLog::open(&config.audit_log) {
+            Ok(audit) => audit,
+            Err(err) => {
+                let _ = writeln!(console.err(), "error: {err}");
+                return if err.is_usage() {
+                    Exit::Usage
+                } else {
+                    Exit::RotationFailed
+                };
+            }
+        };
+        let mut executor = Executor::new(&registry, &consumers, &mut store, &mut audit);
+        runtime.block_on(async {
+            for rotation in &requested {
+                outcomes.push(executor.run(rotation).await);
+            }
+        });
+    } else {
+        outcomes.extend(requested.iter().filter_map(|r| {
+            apply::eligibility(r)
+                .err()
+                .map(|why| apply::Outcome::skipped(r, why))
+        }));
+    }
+    drop(store);
+    print_out(console, &format!("\n{}", apply::render_summary(&outcomes)));
+    match apply::run_status(&outcomes) {
+        RunStatus::Done => Exit::Ok,
+        RunStatus::Failed => Exit::RotationFailed,
+        RunStatus::Pending => Exit::Pending,
+        RunStatus::Unsupported => Exit::Usage,
+    }
 }
 
 /// Reports a state-store error: exit 2 for a held lock or an unusable file
