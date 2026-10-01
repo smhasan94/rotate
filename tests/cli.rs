@@ -18,7 +18,7 @@ fn assert_stub(name: &str) {
         )));
 }
 
-/// `plan`, `apply` and `rollback` need input before reaching their stub.
+/// `plan`, `apply` and `rollback` need input before doing anything.
 fn assert_needs_input(args: &[&str]) {
     rotate()
         .args(args)

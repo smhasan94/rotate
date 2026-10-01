@@ -36,6 +36,18 @@ What works now:
   `.rotate/state.json` with a short id (`rot-` and 8 hex characters) that
   stays the same on the next `plan` run. It exits 0 even when blockers
   exist, and 2 if another rotate process holds the state file.
+- `rotate apply` runs the same plan, prints it, and asks you to type each
+  rotation id (read from the terminal, never stdin, so `--stdin` still
+  works). `--confirm <rotation-id>` (repeatable) replaces the prompt for
+  scripts and CI, and `--all` confirms every rotation with one prompt where
+  you type `all`. A wrong or unknown id exits 2 having changed nothing.
+  For each confirmed rotation it creates the replacement, updates every
+  consumer, verifies the replacement belongs to the same owner, and only
+  then revokes the old secret. State is saved after every step and every
+  step is appended to `.rotate/audit.jsonl`. Any failure before the revoke
+  stops that rotation, marks it `failed`, never revokes, and exits 1; a
+  consumer that cannot be updated holds the revoke. With an overlap window
+  above 0 the revoke is recorded as pending and apply exits 3.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 
@@ -44,15 +56,17 @@ Not done yet:
 - The four real providers. Until they land, a release build reports every
   secret as unsupported. Mock providers exist only behind the
   `test-providers` cargo feature, for tests.
-- The GitHub Actions secrets consumer. The AWS Secrets Manager consumer is
-  built in: it reads the entries named or tagged under
-  `consumers.aws_secrets_manager` with `GetSecretValue`, matches by value
-  (a plain value, or a top-level JSON string field, plus the access key id
-  field for an AWS pair), and writes a new version with `PutSecretValue`.
-  It uses the standard AWS environment for credentials and makes no call
-  when that section is empty. Until the providers land and `rotate apply`
-  wires the loaded config into it (SHA-254), no secret reaches it.
-- `rotate apply`, `rotate rollback` and `rotate status`. These are stubs.
+- Passing the loaded config to the real consumers. Both are built in: the
+  GitHub Actions secrets consumer matches by name in the
+  `consumers.github_actions.targets` repos and orgs and writes sealed values
+  with the operator token from `ROTATE_GITHUB_TOKEN` or `GITHUB_TOKEN`; the
+  AWS Secrets Manager consumer reads the entries named or tagged under
+  `consumers.aws_secrets_manager`, matches by value (a plain value or a
+  top-level JSON string field) and writes a new version. The CLI does not
+  pass them `rotate.yaml` yet, so a release build searches neither.
+- `rotate apply`: `--force`, manual replacement mode (the rotation is
+  skipped), resuming an interrupted or pending rotation, and `--json`.
+- `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
 
@@ -97,8 +111,11 @@ rotate plan trufflehog-report.json
 # One secret from stdin. Use --provider to skip identification.
 pbpaste | rotate plan --stdin
 
-# Apply the plan (typed confirmation). Not implemented yet.
+# Apply the plan: type each rotation id when asked.
 rotate apply trufflehog-report.json
+
+# Non-interactive, for CI: confirm by id.
+rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
 ```
 
 ## Exit codes

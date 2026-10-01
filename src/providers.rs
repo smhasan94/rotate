@@ -1,16 +1,17 @@
 //! The provider and consumer registries the CLI runs with.
 //!
-//! No real provider or consumer is built in yet (SHA-251, SHA-252, SHA-253,
-//! SHA-260 to SHA-262). The `test-providers` feature registers
+//! Real plugins register in builds without `test-providers`: the AWS
+//! provider (SHA-251), the AWS Secrets Manager consumer (SHA-252) and the
+//! GitHub Actions secrets consumer (SHA-253).
+//! Constructing one makes no call and loads no credentials; that happens on
+//! first use. The `test-providers` feature instead registers
 //! `MockProvider`s under the four real names so integration tests can drive
 //! the CLI end to end, and lets a test describe a scenario in a JSON file
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
 //! enable it, and nothing in this file reads the variable without it.
 
-use std::sync::Arc;
-
-use rotate::config::{AwsConfig, ConsumersConfig};
-use rotate::consumer::aws_secrets_manager::SecretsManagerConsumer;
+use rotate::apply::Prompt;
+use rotate::config::{AwsConfig, ConsumersConfig, GithubConfig};
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -20,27 +21,64 @@ pub fn registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     #[cfg(feature = "test-providers")]
     scenario::register_providers(&mut registry);
+    #[cfg(not(feature = "test-providers"))]
+    registry.register(std::sync::Arc::new(
+        rotate::provider::aws::AwsProvider::new(),
+    ));
     registry
 }
 
-/// Every consumer this build knows, with default settings: no Secrets
-/// Manager names or tags, so that consumer makes no call. Callers with a
-/// loaded config use [`consumers_with`].
+/// Every consumer this build knows, with default settings: no Actions
+/// targets and no Secrets Manager names or tags, so neither real consumer
+/// makes a call. Callers with a loaded config use [`consumers_with`].
 pub fn consumers() -> ConsumerRegistry {
-    consumers_with(&ConsumersConfig::default(), &AwsConfig::default())
+    consumers_with(
+        &ConsumersConfig::default(),
+        &GithubConfig::default(),
+        &AwsConfig::default(),
+    )
 }
 
 /// Every consumer this build knows, configured from `rotate.yaml`.
 /// Building the registry makes no network call and loads no credentials.
-pub fn consumers_with(config: &ConsumersConfig, aws: &AwsConfig) -> ConsumerRegistry {
+///
+/// As with providers, real consumers and the scenario's mocks never share a
+/// registry: both use the real names, and the first registration of a name
+/// would win.
+pub fn consumers_with(
+    config: &ConsumersConfig,
+    github: &GithubConfig,
+    aws: &AwsConfig,
+) -> ConsumerRegistry {
+    #[allow(unused_mut)]
     let mut registry = ConsumerRegistry::new();
-    registry.register(Arc::new(SecretsManagerConsumer::new(
-        config.aws_secrets_manager.clone(),
-        aws.region.clone(),
-    )));
+    #[cfg(not(feature = "test-providers"))]
+    {
+        registry.register(std::sync::Arc::new(
+            rotate::consumer::github_actions::GithubActionsConsumer::from_config(config, github),
+        ));
+        registry.register(std::sync::Arc::new(
+            rotate::consumer::aws_secrets_manager::SecretsManagerConsumer::new(
+                config.aws_secrets_manager.clone(),
+                aws.region.clone(),
+            ),
+        ));
+    }
     #[cfg(feature = "test-providers")]
-    scenario::register_consumers(&mut registry);
+    {
+        let _ = (config, github, aws);
+        scenario::register_consumers(&mut registry);
+    }
     registry
+}
+
+/// The confirmation prompt a test scenario scripts, if any. Without
+/// `test-providers` always `None`: apply reads the terminal.
+pub fn prompt() -> Option<Box<dyn Prompt>> {
+    #[cfg(feature = "test-providers")]
+    return scenario::prompt();
+    #[cfg(not(feature = "test-providers"))]
+    None
 }
 
 /// Called once before exit. With `test-providers`, writes the shared call
@@ -66,6 +104,12 @@ pub fn finish() {
 /// }
 /// ```
 ///
+/// For apply (SHA-254): `providers.<name>.fail` and `consumers[].fail` map a
+/// method name to an error text that every call to it returns; `prompt` is
+/// `{"answers": ["rot-..."]}`, `"panic"` (fails the test if apply asks) or
+/// `"no_tty"`; `consumer_state` is a path the binary writes on exit with
+/// what every mock consumer holds, `{"<name>": {"<ref>": "sha256:..."}}`.
+///
 /// Every mock shares one `CallLog`. [`write_call_log`] writes it as JSON
 /// lines (`target`, `method`, `mutating`, `fingerprint`), so a CLI test can
 /// prove a run made no state-changing call. The file holds fingerprints
@@ -74,15 +118,16 @@ pub fn finish() {
 mod scenario {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use serde::Deserialize;
 
+    use rotate::apply::{Prompt, PromptError, ScriptedPrompt};
     use rotate::calls::CallLog;
     use rotate::consumer::mock::MockConsumer;
     use rotate::consumer::{ConsumerError, ConsumerMatch, ConsumerRegistry, Holds};
     use rotate::provider::mock::MockProvider;
-    use rotate::provider::{ProviderRegistry, ReplacementMode, Validity};
+    use rotate::provider::{ProviderError, ProviderRegistry, ReplacementMode, Validity};
     use rotate::secret::Fingerprint;
 
     const ENV: &str = "ROTATE_TEST_SCENARIO";
@@ -95,6 +140,8 @@ mod scenario {
         #[serde(default)]
         consumers: Vec<ConsumerSetup>,
         call_log: Option<PathBuf>,
+        consumer_state: Option<PathBuf>,
+        prompt: Option<serde_json::Value>,
     }
 
     #[derive(Default, Deserialize)]
@@ -102,6 +149,8 @@ mod scenario {
     struct ProviderSetup {
         validity: Option<String>,
         mode: Option<String>,
+        #[serde(default)]
+        fail: BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -111,6 +160,8 @@ mod scenario {
         #[serde(default)]
         matches: Vec<MatchSetup>,
         fail_find: Option<String>,
+        #[serde(default)]
+        fail: BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -127,6 +178,7 @@ mod scenario {
     struct Loaded {
         scenario: Scenario,
         log: CallLog,
+        consumers: Mutex<Vec<Arc<MockConsumer>>>,
     }
 
     fn loaded() -> &'static Loaded {
@@ -144,6 +196,7 @@ mod scenario {
             Loaded {
                 scenario,
                 log: CallLog::new(),
+                consumers: Mutex::new(Vec::new()),
             }
         })
     }
@@ -173,6 +226,9 @@ mod scenario {
                     Some("manual") => mock.mode(ReplacementMode::Manual),
                     Some(other) => panic!("{ENV}: unknown mode {other:?}"),
                 };
+                for (method, error) in &setup.fail {
+                    mock.fail_always(method, ProviderError::Permanent(error.clone()));
+                }
             }
             registry.register(Arc::new(mock));
         }
@@ -210,12 +266,75 @@ mod scenario {
             if let Some(error) = &setup.fail_find {
                 mock.fail_always("find", ConsumerError::Permanent(error.clone()));
             }
-            registry.register(Arc::new(mock));
+            for (method, error) in &setup.fail {
+                mock.fail_always(method, ConsumerError::Permanent(error.clone()));
+            }
+            let mock = Arc::new(mock);
+            loaded
+                .consumers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Arc::clone(&mock));
+            registry.register(mock);
         }
+    }
+
+    /// Fails the test if apply asks for confirmation.
+    struct PanicPrompt;
+
+    impl Prompt for PanicPrompt {
+        fn read_line(&mut self) -> Result<String, PromptError> {
+            panic!("{ENV}: the scenario says apply must not prompt");
+        }
+    }
+
+    /// Stands in for a process with no controlling terminal.
+    struct NoTty;
+
+    impl Prompt for NoTty {
+        fn read_line(&mut self) -> Result<String, PromptError> {
+            Err(PromptError::NoTerminal)
+        }
+    }
+
+    pub fn prompt() -> Option<Box<dyn Prompt>> {
+        let setup = loaded().scenario.prompt.as_ref()?;
+        Some(match setup {
+            serde_json::Value::String(mode) if mode == "panic" => Box::new(PanicPrompt),
+            serde_json::Value::String(mode) if mode == "no_tty" => Box::new(NoTty),
+            serde_json::Value::Object(map) => {
+                let answers: Vec<String> = map
+                    .get("answers")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| panic!("{ENV}: prompt needs \"answers\""))
+                    .iter()
+                    .map(|a| a.as_str().unwrap_or_default().to_owned())
+                    .collect();
+                Box::new(ScriptedPrompt::new(answers))
+            }
+            other => panic!("{ENV}: unknown prompt {other}"),
+        })
     }
 
     pub fn write_call_log() {
         let loaded = loaded();
+        if let Some(path) = &loaded.scenario.consumer_state {
+            let mut held = serde_json::Map::new();
+            let consumers = loaded.consumers.lock().unwrap_or_else(|p| p.into_inner());
+            for (mock, setup) in consumers.iter().zip(&loaded.scenario.consumers) {
+                let refs: serde_json::Map<String, serde_json::Value> = setup
+                    .matches
+                    .iter()
+                    .filter_map(|m| {
+                        mock.current(&m.consumer_ref)
+                            .map(|fp| (m.consumer_ref.clone(), serde_json::json!(fp.to_string())))
+                    })
+                    .collect();
+                held.insert(setup.name.clone(), serde_json::Value::Object(refs));
+            }
+            std::fs::write(path, serde_json::Value::Object(held).to_string())
+                .unwrap_or_else(|err| panic!("{ENV}: cannot write the consumer state: {err}"));
+        }
         let Some(path) = &loaded.scenario.call_log else {
             return;
         };

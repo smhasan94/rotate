@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod apply;
 pub mod assess;
 pub mod audit;
 pub mod calls;
@@ -17,6 +18,7 @@ pub mod consumer;
 pub mod error;
 pub mod finding;
 pub mod fsutil;
+pub mod github;
 pub mod input;
 pub mod plan;
 pub mod provider;

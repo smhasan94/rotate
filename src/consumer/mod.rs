@@ -6,6 +6,7 @@
 //! in [`MUTATING`] write to the real service.
 
 pub mod aws_secrets_manager;
+pub mod github_actions;
 pub mod mock;
 
 use std::fmt;
