@@ -13,10 +13,12 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
-use rotate::assess::{assess, render_json, render_table, AssessOptions};
+use rotate::assess::{assess, AssessOptions};
 use rotate::config::Config;
 use rotate::finding::Finding;
+use rotate::plan;
 use rotate::report::{read_report, ReportError};
+use rotate::state::{StateError, StateStore};
 
 use crate::cli::{Cli, Command, InputArgs};
 use crate::exit::Exit;
@@ -35,7 +37,9 @@ fn main() -> ExitCode {
             return Exit::Usage.into();
         }
     };
-    run(cli.subcommand(), &config, cli.global.json).into()
+    let exit = run(cli.subcommand(), &config, cli.global.json);
+    providers::finish();
+    exit.into()
 }
 
 /// Sends tracing events to stderr through the redaction layer (SHA-218), at
@@ -68,14 +72,14 @@ fn handle_parse_error(err: clap::Error) -> ExitCode {
     }
 }
 
-fn run(command: Command, _config: &Config, json: bool) -> Exit {
+fn run(command: Command, config: &Config, json: bool) -> Exit {
     if let Some(input) = command.input() {
         let findings = match read_input(input) {
             Ok(findings) => findings,
             Err(exit) => return exit,
         };
         if let Command::Plan(_) = command {
-            return plan(findings, input, json);
+            return plan(findings, input, config, json);
         }
     }
     // Still stubs until their tickets land (SHA-254 apply, SHA-259
@@ -84,11 +88,27 @@ fn run(command: Command, _config: &Config, json: bool) -> Exit {
     Exit::Usage
 }
 
-/// Assesses the findings and prints the table or JSON (SHA-248). The
-/// planner (SHA-250) adds consumers and the rotation steps to this output.
-/// Unsupported and unknown rows are information, not failures: exit 0.
-fn plan(findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
+/// Builds the plan (SHA-250) and prints the table or JSON: assessment
+/// (SHA-248), then `find` on every consumer, then a `planned` record per new
+/// rotation in the state file. No state-changing remote call is made.
+/// Blockers and skipped rows are information, not failures: exit 0. A held
+/// or unusable state file exits 2 before any provider call; a plain I/O
+/// error writing it exits 1.
+fn plan(findings: Vec<Finding>, input: &InputArgs, config: &Config, json: bool) -> Exit {
+    let state_error = |err: StateError| {
+        eprintln!("error: {err}");
+        if err.is_usage() {
+            Exit::Usage
+        } else {
+            Exit::RotationFailed
+        }
+    };
+    let mut store = match StateStore::open(&config.state_file) {
+        Ok(store) => store,
+        Err(err) => return state_error(err),
+    };
     let registry = providers::registry();
+    let consumers = providers::consumers();
     let opts = AssessOptions {
         concurrency: usize::from(input.concurrency),
         force_provider: input
@@ -108,11 +128,25 @@ fn plan(findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
             return Exit::RotationFailed;
         }
     };
-    let assessed = runtime.block_on(assess(findings, &registry, &opts));
+    let mut plan = runtime.block_on(async {
+        let assessed = assess(findings, &registry, &opts).await;
+        plan::build(
+            assessed,
+            &registry,
+            &consumers,
+            config.overlap_window,
+            &config.consumers,
+        )
+        .await
+    });
+    if let Err(err) = plan::assign_ids(&mut plan, &mut store) {
+        return state_error(err);
+    }
+    drop(store);
     if json {
-        println!("{}", render_json(&assessed));
+        println!("{}", plan::render_json(&plan));
     } else {
-        print!("{}", render_table(&assessed));
+        print!("{}", plan::render_table(&plan));
     }
     Exit::Ok
 }

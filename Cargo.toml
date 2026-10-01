@@ -35,6 +35,9 @@ zeroize = { version = "1", features = ["alloc", "derive"] }
 assert_cmd = "2"
 # Independent encoders for the redaction tests (SHA-218).
 base64 = "0.22"
+# Validates `plan --json` against docs/plan-schema.json (SHA-250). Default
+# features off: no HTTP resolver.
+jsonschema = { version = "0.58", default-features = false }
 predicates = "3"
 # Test harness (SHA-216). reqwest has default features off so no TLS crates
 # arrive until SHA-273 settles the license allowlist.
