@@ -61,3 +61,24 @@ is copied straight into a `SecretValue`. One known gap: a JSON string with
 escape sequences is decoded through serde_json's own scratch buffer, which
 is not wiped. The token formats of the four MVP providers contain no
 characters that the scanners escape.
+
+## After parsing
+
+`rotate plan` assesses the findings (SHA-248):
+
+- Findings with the same secret are merged into one row, listing every
+  place it was found. When one of them carries an AWS access key id (a
+  TruffleHog `AWS` finding), that one is used, so a gitleaks
+  `generic-api-key` finding for the same secret becomes an AWS rotation.
+- The provider comes from the scanner's detector or rule name first, then
+  from the shape of the value. When the two disagree, the detector wins and
+  a warning names both.
+- Each supported secret is checked with a read-only call, at most
+  `--concurrency` (default 8) at a time, with up to three attempts on rate
+  limits and server errors. A check that keeps failing shows as `unknown`
+  with the reason; it does not stop the run.
+- Gitleaks AWS key-id-only findings and canary keys are `not rotatable` and
+  are never sent to the provider.
+
+Every row is shown, with reasons listed under the table. `--json` prints
+the same data as an array.
