@@ -9,6 +9,7 @@
 
 pub mod calls;
 pub mod config;
+pub mod conformance;
 pub mod consumer;
 pub mod finding;
 pub mod input;

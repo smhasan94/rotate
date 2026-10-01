@@ -7,8 +7,15 @@
 //! [`fail_always`](MockConsumer::fail_always), or per consumer with
 //! [`fail_for`](MockConsumer::fail_for). Every method records a [`Call`]
 //! before doing anything else, so a failed call is still counted.
+//!
+//! `find` follows what each consumer holds now: after `update` a match is
+//! found for the new credential and no longer for the old one, as a store
+//! read back by value would behave. The knobs
+//! [`restore_is_noop`](MockConsumer::restore_is_noop) and
+//! [`leak_secret_in_errors`](MockConsumer::leak_secret_in_errors) make it
+//! misbehave on purpose so the conformance suite (SHA-249) can be tested.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -25,11 +32,14 @@ pub struct MockConsumer {
     name: &'static str,
     matches: Vec<(Fingerprint, ConsumerMatch)>,
     current: Mutex<BTreeMap<String, Fingerprint>>,
+    holding: Mutex<BTreeMap<String, Fingerprint>>,
     log: CallLog,
     queued_failures: Mutex<HashMap<String, VecDeque<ConsumerError>>>,
     standing_failures: Mutex<HashMap<String, ConsumerError>>,
     ref_failures: Mutex<HashMap<(String, String), ConsumerError>>,
     updates: AtomicU64,
+    restore_is_noop: bool,
+    leaks_in: HashSet<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -43,20 +53,39 @@ impl MockConsumer {
             name,
             matches: Vec::new(),
             current: Mutex::new(BTreeMap::new()),
+            holding: Mutex::new(BTreeMap::new()),
             log: CallLog::new(),
             queued_failures: Mutex::new(HashMap::new()),
             standing_failures: Mutex::new(HashMap::new()),
             ref_failures: Mutex::new(HashMap::new()),
             updates: AtomicU64::new(0),
+            restore_is_noop: false,
+            leaks_in: HashSet::new(),
         }
     }
 
     /// `find` returns `target` for a secret with `fingerprint`. The
-    /// consumer starts out holding `fingerprint`. Repeatable; matches come
-    /// back in the order they were added.
+    /// consumer starts out holding `fingerprint`; `update` and `restore`
+    /// change what it is found for. Repeatable; matches come back in the
+    /// order they were added.
     pub fn matching(mut self, fingerprint: Fingerprint, target: ConsumerMatch) -> Self {
         lock(&self.current).insert(target.consumer_ref.clone(), fingerprint.clone());
+        lock(&self.holding).insert(target.consumer_ref.clone(), fingerprint.clone());
         self.matches.push((fingerprint, target));
+        self
+    }
+
+    /// Misbehave: `restore` records the call and returns `Ok` but leaves
+    /// the new value in place.
+    pub fn restore_is_noop(mut self) -> Self {
+        self.restore_is_noop = true;
+        self
+    }
+
+    /// Misbehave: every call to `method` (`update` or `restore`) fails with
+    /// an error whose text contains the secret it was given.
+    pub fn leak_secret_in_errors(mut self, method: &str) -> Self {
+        self.leaks_in.insert(method.to_owned());
         self
     }
 
@@ -126,6 +155,17 @@ impl MockConsumer {
         }
     }
 
+    /// Returns the deliberate leak for `method` when configured.
+    fn leak(&self, method: &str, credential: &Credential) -> Result<(), ConsumerError> {
+        if !self.leaks_in.contains(method) {
+            return Ok(());
+        }
+        let text = credential
+            .secret()
+            .expose_secret(|bytes| String::from_utf8_lossy(bytes).into_owned());
+        Err(ConsumerError::Permanent(format!("rejected value {text}")))
+    }
+
     /// Stores the part of `credential` that `target` holds.
     fn store(&self, target: &ConsumerMatch, credential: &Credential) -> Result<(), ConsumerError> {
         if let Err(blocked) = &target.updatable {
@@ -133,6 +173,7 @@ impl MockConsumer {
         }
         let fingerprint = target.value_fingerprint(credential)?;
         lock(&self.current).insert(target.consumer_ref.clone(), fingerprint);
+        lock(&self.holding).insert(target.consumer_ref.clone(), credential.fingerprint());
         Ok(())
     }
 }
@@ -155,11 +196,15 @@ impl Consumer for MockConsumer {
 
     async fn find(&self, secret: &SecretRef) -> Result<Vec<ConsumerMatch>, ConsumerError> {
         self.enter("find", secret.fingerprint.clone(), None)?;
+        let holding = lock(&self.holding);
+        let mut seen = HashSet::new();
         Ok(self
             .matches
             .iter()
-            .filter(|(fp, _)| *fp == secret.fingerprint)
-            .map(|(_, target)| target.clone())
+            .map(|(_, target)| target)
+            .filter(|target| holding.get(&target.consumer_ref) == Some(&secret.fingerprint))
+            .filter(|target| seen.insert(target.consumer_ref.clone()))
+            .cloned()
             .collect())
     }
 
@@ -169,6 +214,7 @@ impl Consumer for MockConsumer {
         new: &Credential,
     ) -> Result<UpdateReceipt, ConsumerError> {
         self.enter("update", new.fingerprint(), Some(&target.consumer_ref))?;
+        self.leak("update", new)?;
         self.store(target, new)?;
         let n = self.updates.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(UpdateReceipt {
@@ -179,6 +225,10 @@ impl Consumer for MockConsumer {
 
     async fn restore(&self, target: &ConsumerMatch, old: &Credential) -> Result<(), ConsumerError> {
         self.enter("restore", old.fingerprint(), Some(&target.consumer_ref))?;
+        self.leak("restore", old)?;
+        if self.restore_is_noop {
+            return Ok(());
+        }
         self.store(target, old)
     }
 }
@@ -388,6 +438,53 @@ mod tests {
             .collect();
         assert_eq!(targets, [("mock".to_owned(), "update".to_owned())]);
         assert_eq!(log.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn find_follows_current_value() {
+        let old = token("mock_old");
+        let new = token("mock_new");
+        let mock = two_matches(&old);
+        let old_ref = SecretRef::new("mock", &old);
+        let new_ref = SecretRef::new("mock", &new);
+        let found = mock.find(&old_ref).await.unwrap();
+        assert!(mock.find(&new_ref).await.unwrap().is_empty());
+
+        mock.update(&found[1], &new).await.unwrap();
+        let refs = |m: Vec<ConsumerMatch>| -> Vec<String> {
+            m.into_iter().map(|m| m.consumer_ref).collect()
+        };
+        assert_eq!(
+            refs(mock.find(&old_ref).await.unwrap()),
+            ["mock:repo-a:TOKEN"]
+        );
+        assert_eq!(refs(mock.find(&new_ref).await.unwrap()), ["mock:prod/app"]);
+
+        mock.restore(&found[1], &old).await.unwrap();
+        assert_eq!(mock.find(&old_ref).await.unwrap().len(), 2);
+        assert!(mock.find(&new_ref).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn misbehaviour_knobs() {
+        let old = token("mock_old");
+        let mock = two_matches(&old)
+            .restore_is_noop()
+            .leak_secret_in_errors("update");
+        let found = mock.find(&SecretRef::new("mock", &old)).await.unwrap();
+        let err = mock
+            .update(&found[0], &token("mock_leaky_value"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock_leaky_value"));
+
+        let quiet = two_matches(&old).restore_is_noop();
+        quiet.update(&found[0], &token("mock_new")).await.unwrap();
+        quiet.restore(&found[0], &old).await.unwrap();
+        assert_eq!(
+            quiet.current("mock:repo-a:TOKEN"),
+            Some(token("mock_new").fingerprint())
+        );
     }
 
     #[test]
