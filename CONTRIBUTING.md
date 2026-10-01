@@ -1,7 +1,69 @@
 # Contributing
 
-This file is a stub. SHA-213 fills in the rest (branch naming, commits,
-pull requests). The testing section below is owned by SHA-216.
+Thanks for helping. rotate handles live credentials, so the safety rules in
+[README.md](README.md#safety-guarantees) apply to every change. To report a
+vulnerability, follow [SECURITY.md](SECURITY.md) instead of opening an issue.
+
+## Setup
+
+Rust stable, edition 2021. `rust-toolchain.toml` pins the channel. Install
+the extra tools once:
+
+```sh
+rustup component add rustfmt clippy
+cargo install cargo-deny --locked
+```
+
+## Checks
+
+Run all four before opening a pull request. CI runs the same commands on
+Linux and macOS, and all of them must pass before merge.
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo deny check
+```
+
+CI also runs `ci/check-docs.sh`, which checks that the block above matches
+`CLAUDE.md` and that the README and SECURITY.md keep their key sections.
+
+## Work items
+
+Every change starts from a ticket in the Linear project "rotate". Bigger
+tickets get a short implementation plan in `docs/plans/SHA-<n>.md` before
+the code.
+
+## Branches
+
+Trunk-based on `main`. Name a branch after its ticket: the lowercase Linear
+identifier, a hyphen, and a short slug of the title, for example
+`sha-42-zeroized-secret-type`.
+
+## Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`,
+`fix:`, `docs:`, `test:`, `ci:`, `refactor:`, `chore:`, with an optional
+scope, such as `feat(config): ...`. Put the ticket id in the subject or body.
+
+## Pull requests
+
+All code changes go through a pull request; nothing else is pushed to
+`main`. The one exception is `docs/plans/` and `docs/backlog.md`, which may
+be committed directly.
+
+The pull request template asks for the Linear link, any changes to the
+ticket, and a table mapping each T-case to its test. A ticket is done when
+every T-case passes in CI, the four checks pass, docs are updated, and the
+pull request is reviewed and merged.
+
+## Dependencies
+
+Keep the dependency set small. `deny.toml` allows only licenses compatible
+with Apache-2.0 and rejects known advisories. If a new crate needs a license
+that is not on the allowlist, say why in the pull request and add a note
+here.
 
 ## Writing tests
 
@@ -72,9 +134,36 @@ A provider is one implementation of `rotate::provider::Provider` (SHA-221).
   `replacement_ref`; those strings reach the plan output and the audit log.
 - Register it in the `ProviderRegistry` the CLI builds, and give it a short
   stable `name()` that the config and audit log use.
-- Test it against wiremock (see "Writing tests") and run the shared
-  conformance suite once SHA-249 lands. Until then, mirror the assertions in
-  `tests/provider_leak.rs` with a canary value.
+- Test it against wiremock (see "Writing tests") and pass the shared
+  conformance suite (SHA-249) from an integration test:
+
+  ```rust
+  use rotate::conformance::{provider_suite, MutationProbe, ProviderFixture};
+
+  #[tokio::test]
+  async fn conformance() {
+      provider_suite(|| async {
+          let server = common::CallRecorder::start().await;
+          // Mount answers: `live` is valid and owned by `identity`, a
+          // second revoke of it still succeeds, `unknown` gets the
+          // provider's real 401 or 404.
+          ProviderFixture {
+              provider: Arc::new(MyProvider::new(server.uri())),
+              live, identity, unknown,
+              probe: Box::new(RecorderProbe(server)),
+          }
+      })
+      .await
+      .assert_ok();
+  }
+  ```
+
+  The factory runs once per check, so every check gets a fresh plugin and
+  server. `RecorderProbe` is your few-line `MutationProbe` impl returning a
+  method-and-path label for each `RecordedCall` with `mutating` set. The
+  suite returns a `SuiteReport` naming each failed check; `assert_ok`
+  panics with it. `rotate::conformance::mock::provider_fixture` shows the
+  same wiring for `MockProvider`.
 
 `provider::mock::MockProvider` is the reference double: it records every
 call into a `CallLog` with the mutating flag, and tests inject failures with
@@ -100,9 +189,12 @@ a place where a credential is stored for use.
   see which part a match holds.
 - Never put a value in `consumer_ref`, a not-updatable reason or an error
   message; those strings reach the plan output and the audit log.
-- Register it in the `ConsumerRegistry` the CLI builds, and mirror
-  `tests/consumer_leak.rs` with a canary value until the conformance suite
-  (SHA-249) lands.
+- Register it in the `ConsumerRegistry` the CLI builds, and pass
+  `rotate::conformance::consumer_suite` from an integration test against
+  wiremock. Its `ConsumerFixture` holds the consumer, the `old` credential
+  the server stores, the `new` one the suite writes, the `SecretRef` for
+  `old` (with the name hints a by-name store needs) and a `MutationProbe`.
+  `rotate::conformance::mock::consumer_fixture` is the reference wiring.
 
 `consumer::mock::MockConsumer` is the reference double. It shares
 `CallLog` with `MockProvider`, keeps the fingerprint each consumer holds

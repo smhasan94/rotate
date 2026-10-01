@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
+use rotate::assess::{assess, render_json, render_table, AssessOptions};
 use rotate::config::Config;
 use rotate::finding::Finding;
 use rotate::report::{read_report, ReportError};
@@ -34,7 +35,7 @@ fn main() -> ExitCode {
             return Exit::Usage.into();
         }
     };
-    run(cli.subcommand(), &config).into()
+    run(cli.subcommand(), &config, cli.global.json).into()
 }
 
 /// Sends tracing events to stderr through the redaction layer (SHA-218), at
@@ -67,17 +68,53 @@ fn handle_parse_error(err: clap::Error) -> ExitCode {
     }
 }
 
-fn run(command: Command, _config: &Config) -> Exit {
+fn run(command: Command, _config: &Config, json: bool) -> Exit {
     if let Some(input) = command.input() {
-        match read_input(input) {
-            Ok(findings) => print_findings(&findings),
+        let findings = match read_input(input) {
+            Ok(findings) => findings,
             Err(exit) => return exit,
+        };
+        if let Command::Plan(_) = command {
+            return plan(findings, input, json);
         }
     }
-    // Every subcommand is a stub until its ticket lands (SHA-248 and
-    // SHA-250 plan, SHA-254 apply, SHA-259 rollback, SHA-263 status).
+    // Still stubs until their tickets land (SHA-254 apply, SHA-259
+    // rollback, SHA-263 status).
     eprintln!("rotate {}: not implemented", command.name());
     Exit::Usage
+}
+
+/// Assesses the findings and prints the table or JSON (SHA-248). The
+/// planner (SHA-250) adds consumers and the rotation steps to this output.
+/// Unsupported and unknown rows are information, not failures: exit 0.
+fn plan(findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
+    let registry = providers::registry();
+    let opts = AssessOptions {
+        concurrency: usize::from(input.concurrency),
+        force_provider: input
+            .provider
+            .as_deref()
+            .and_then(|name| registry.get(name))
+            .map(|provider| provider.name()),
+        ..AssessOptions::default()
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: could not start the async runtime: {err}");
+            return Exit::RotationFailed;
+        }
+    };
+    let assessed = runtime.block_on(assess(findings, &registry, &opts));
+    if json {
+        println!("{}", render_json(&assessed));
+    } else {
+        print!("{}", render_table(&assessed));
+    }
+    Exit::Ok
 }
 
 /// Reads the findings named by `input` (SHA-247). Errors are printed here
@@ -138,24 +175,5 @@ fn read_input(input: &InputArgs) -> Result<Vec<Finding>, Exit> {
             eprintln!("error: {err}");
             Err(Exit::Usage)
         }
-    }
-}
-
-/// Lists what was read, by fingerprint only, until the assessment table
-/// replaces it (SHA-248).
-fn print_findings(findings: &[Finding]) {
-    let noun = if findings.len() == 1 {
-        "finding"
-    } else {
-        "findings"
-    };
-    println!("{} {noun}:", findings.len());
-    for finding in findings {
-        println!(
-            "  {}  {}  {}",
-            finding.fingerprint(),
-            finding.detector,
-            finding.source
-        );
     }
 }

@@ -5,11 +5,20 @@
 //! with [`fail_next`](MockProvider::fail_next) (a queue, consumed in order)
 //! or [`fail_always`](MockProvider::fail_always). Every method records a
 //! [`Call`] before doing anything else, so a failed call is still counted.
+//!
+//! The mock remembers which fingerprints it has revoked: `check_valid`
+//! reports them `Invalid` until `restore` brings them back. `verify` accepts
+//! only the identity in its [`Scope`]. The knobs
+//! [`fail_after`](MockProvider::fail_after),
+//! [`mutates_in`](MockProvider::mutates_in) and
+//! [`leak_secret_in_errors`](MockProvider::leak_secret_in_errors) make it
+//! misbehave on purpose so the conformance suite (SHA-249) can be tested.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -34,6 +43,28 @@ pub struct MockProvider {
     queued_failures: Mutex<HashMap<String, VecDeque<ProviderError>>>,
     standing_failures: Mutex<HashMap<String, ProviderError>>,
     replacements: AtomicU64,
+    revoked: Mutex<HashSet<Fingerprint>>,
+    restore_refs: Mutex<HashMap<String, Fingerprint>>,
+    late_failures: Mutex<HashMap<String, (usize, ProviderError)>>,
+    call_counts: Mutex<HashMap<String, usize>>,
+    mutates_in: HashSet<String>,
+    leaks_in: HashSet<String>,
+    latency: Option<Duration>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Counts a read call as in flight until dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MockProvider {
@@ -55,6 +86,15 @@ impl MockProvider {
             queued_failures: Mutex::new(HashMap::new()),
             standing_failures: Mutex::new(HashMap::new()),
             replacements: AtomicU64::new(0),
+            revoked: Mutex::new(HashSet::new()),
+            restore_refs: Mutex::new(HashMap::new()),
+            late_failures: Mutex::new(HashMap::new()),
+            call_counts: Mutex::new(HashMap::new()),
+            mutates_in: HashSet::new(),
+            leaks_in: HashSet::new(),
+            latency: None,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -101,6 +141,67 @@ impl MockProvider {
         self
     }
 
+    /// Treat `fingerprint` as already revoked: `check_valid` reports it
+    /// `Invalid`. Use it for a credential the provider does not know.
+    pub fn revoked(self, fingerprint: Fingerprint) -> Self {
+        lock(&self.revoked).insert(fingerprint);
+        self
+    }
+
+    /// Misbehave: every call to `method` also records a mutating `revoke`
+    /// call, as a plugin that changes state inside a read would.
+    pub fn mutates_in(mut self, method: &str) -> Self {
+        self.mutates_in.insert(method.to_owned());
+        self
+    }
+
+    /// Misbehave: every call to `method` fails with an error whose text
+    /// contains the secret it was given.
+    pub fn leak_secret_in_errors(mut self, method: &str) -> Self {
+        self.leaks_in.insert(method.to_owned());
+        self
+    }
+
+    /// The identity `describe_scope` reports and `verify` accepts.
+    pub fn identity(&self) -> Identity {
+        self.scope.identity.clone()
+    }
+
+    /// True when the mock currently treats `fingerprint` as revoked.
+    pub fn is_revoked(&self, fingerprint: &Fingerprint) -> bool {
+        lock(&self.revoked).contains(fingerprint)
+    }
+
+    /// Make `check_valid`, `describe_scope` and `verify` wait `latency`
+    /// before returning, so tests can observe concurrency.
+    pub fn latency(mut self, latency: Duration) -> Self {
+        self.latency = Some(latency);
+        self
+    }
+
+    /// Highest number of read calls that were in flight at the same time.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Marks a read call in flight for as long as the guard lives.
+    fn begin(&self) -> InFlight<'_> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        InFlight(&self.in_flight)
+    }
+
+    /// Records a read call, waits out the configured latency, then returns
+    /// the injected failure if any.
+    async fn read_call(&self, method: &str, credential: &Credential) -> Result<(), ProviderError> {
+        let _in_flight = self.begin();
+        let result = self.enter_with(method, credential);
+        if let Some(latency) = self.latency {
+            tokio::time::sleep(latency).await;
+        }
+        result
+    }
+
     /// The log this mock writes to.
     pub fn call_log(&self) -> CallLog {
         self.log.clone()
@@ -126,6 +227,12 @@ impl MockProvider {
             .insert(method.to_owned(), error);
     }
 
+    /// Let the first `ok_calls` calls to `method` through, then fail every
+    /// later one with `error`. Queued and standing failures still apply.
+    pub fn fail_after(&self, method: &str, ok_calls: usize, error: ProviderError) {
+        lock(&self.late_failures).insert(method.to_owned(), (ok_calls, error));
+    }
+
     /// Records the call, then returns the injected failure for `method` if
     /// there is one.
     fn enter(&self, method: &str, fingerprint: Option<Fingerprint>) -> Result<(), ProviderError> {
@@ -133,8 +240,27 @@ impl MockProvider {
             target: self.name.to_owned(),
             method: method.to_owned(),
             mutating: is_mutating(method),
-            fingerprint,
+            fingerprint: fingerprint.clone(),
         });
+        if self.mutates_in.contains(method) {
+            self.log.record(Call {
+                target: self.name.to_owned(),
+                method: "revoke".to_owned(),
+                mutating: true,
+                fingerprint,
+            });
+        }
+        let count = {
+            let mut counts = lock(&self.call_counts);
+            let count = counts.entry(method.to_owned()).or_default();
+            *count += 1;
+            *count
+        };
+        if let Some((ok_calls, error)) = lock(&self.late_failures).get(method) {
+            if count > *ok_calls {
+                return Err(error.clone());
+            }
+        }
         let queued = self
             .queued_failures
             .lock()
@@ -154,6 +280,21 @@ impl MockProvider {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Records the call for a method that takes a credential, then returns
+    /// the injected failure, or the deliberate leak when configured.
+    fn enter_with(&self, method: &str, credential: &Credential) -> Result<(), ProviderError> {
+        self.enter(method, Some(credential.fingerprint()))?;
+        if self.leaks_in.contains(method) {
+            let text = credential
+                .secret()
+                .expose_secret(|bytes| String::from_utf8_lossy(bytes).into_owned());
+            return Err(ProviderError::Permanent(format!(
+                "rejected credential {text}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -187,12 +328,15 @@ impl Provider for MockProvider {
     }
 
     async fn check_valid(&self, credential: &Credential) -> Result<Validity, ProviderError> {
-        self.enter("check_valid", Some(credential.fingerprint()))?;
+        self.read_call("check_valid", credential).await?;
+        if self.is_revoked(&credential.fingerprint()) {
+            return Ok(Validity::Invalid);
+        }
         Ok(self.validity.clone())
     }
 
     async fn describe_scope(&self, credential: &Credential) -> Result<Scope, ProviderError> {
-        self.enter("describe_scope", Some(credential.fingerprint()))?;
+        self.read_call("describe_scope", credential).await?;
         Ok(self.scope.clone())
     }
 
@@ -200,7 +344,7 @@ impl Provider for MockProvider {
         &self,
         credential: &Credential,
     ) -> Result<Replacement, ProviderError> {
-        self.enter("create_replacement", Some(credential.fingerprint()))?;
+        self.enter_with("create_replacement", credential)?;
         let n = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
         let prefix = self.identify_prefix.as_deref().unwrap_or_default();
         let value = SecretValue::from(format!("{prefix}{}-replacement-{n}", self.name));
@@ -220,24 +364,38 @@ impl Provider for MockProvider {
     async fn verify(
         &self,
         credential: &Credential,
-        _identity: &Identity,
+        identity: &Identity,
     ) -> Result<(), ProviderError> {
-        self.enter("verify", Some(credential.fingerprint()))
+        self.read_call("verify", credential).await?;
+        if *identity != self.scope.identity {
+            return Err(ProviderError::Permanent(format!(
+                "credential belongs to {}, not {identity}",
+                self.scope.identity
+            )));
+        }
+        Ok(())
     }
 
     async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError> {
-        self.enter("revoke", Some(credential.fingerprint()))?;
+        self.enter_with("revoke", credential)?;
         let restore_ref = match credential.key_id() {
             Some(key_id) => key_id.to_owned(),
             None => format!("{}-{}", self.name, credential.fingerprint()),
         };
+        lock(&self.revoked).insert(credential.fingerprint());
+        lock(&self.restore_refs).insert(restore_ref.clone(), credential.fingerprint());
         Ok(Revoked {
             restore_ref: Some(restore_ref),
         })
     }
 
-    async fn restore(&self, _restore_ref: &str) -> Result<RestoreOutcome, ProviderError> {
+    async fn restore(&self, restore_ref: &str) -> Result<RestoreOutcome, ProviderError> {
         self.enter("restore", None)?;
+        if self.restore_outcome == RestoreOutcome::Restored {
+            if let Some(fingerprint) = lock(&self.restore_refs).get(restore_ref) {
+                lock(&self.revoked).remove(fingerprint);
+            }
+        }
         Ok(self.restore_outcome)
     }
 }
@@ -403,6 +561,52 @@ mod tests {
             RestoreOutcome::Unsupported
         );
         assert_eq!(mock.call_log().mutating().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mock_revoked_set_and_identity() {
+        let cred = token("mock_abc");
+        let unknown = token("mock_unknown");
+        let mock = MockProvider::new("mock").revoked(unknown.fingerprint());
+        assert_eq!(mock.check_valid(&unknown).await.unwrap(), Validity::Invalid);
+        assert_eq!(mock.check_valid(&cred).await.unwrap(), Validity::Valid);
+
+        let revoked = mock.revoke(&cred).await.unwrap();
+        assert_eq!(mock.check_valid(&cred).await.unwrap(), Validity::Invalid);
+        mock.restore(revoked.restore_ref.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mock.check_valid(&cred).await.unwrap(), Validity::Valid);
+
+        mock.verify(&cred, &Identity("mock-user".into()))
+            .await
+            .unwrap();
+        let err = mock
+            .verify(&cred, &Identity("someone-else".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn misbehaviour_knobs() {
+        let cred = token("mock_knob_value");
+        let mock = MockProvider::new("mock")
+            .mutates_in("check_valid")
+            .leak_secret_in_errors("describe_scope");
+        mock.fail_after("revoke", 1, ProviderError::Permanent("gone".into()));
+
+        mock.check_valid(&cred).await.unwrap();
+        assert_eq!(mock.call_log().mutating().len(), 1);
+
+        let err = mock.describe_scope(&cred).await.unwrap_err();
+        assert!(err.to_string().contains("mock_knob_value"));
+
+        mock.revoke(&cred).await.unwrap();
+        assert_eq!(
+            mock.revoke(&cred).await.unwrap_err(),
+            ProviderError::Permanent("gone".into())
+        );
     }
 
     #[tokio::test]
