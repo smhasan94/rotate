@@ -18,6 +18,7 @@ pub mod error;
 pub mod finding;
 pub mod fsutil;
 pub mod input;
+pub mod plan;
 pub mod provider;
 pub mod redact;
 pub mod report;

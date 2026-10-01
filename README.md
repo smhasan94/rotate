@@ -23,8 +23,19 @@ What works now:
 - `rotate plan` reads a TruffleHog (`--json`) or gitleaks (`-f json`) report,
   or one secret with `--stdin`. It dedupes the findings by fingerprint,
   identifies the provider, checks validity with bounded concurrency
-  (`--concurrency N`, default 8), and prints a table or, with `--json`, a
-  JSON array. It makes no changes.
+  (`--concurrency N`, default 8), and asks every consumer where each valid
+  secret is used. For each secret it prints the plan: the replacement to
+  create (or "manual" when you will paste it), the consumers to update and
+  any that cannot be, the revoke action, the overlap window, and blockers
+  that would make `rotate apply` refuse to revoke without `--force`. Invalid,
+  unsupported and unknown secrets are listed as skipped with the reason.
+  `--json` prints the same plan as one document described by
+  [docs/plan-schema.json](docs/plan-schema.json).
+- `rotate plan` is a dry run: it makes no state-changing API call. Its one
+  write is local: each new rotation is recorded at step `planned` in
+  `.rotate/state.json` with a short id (`rot-` and 8 hex characters) that
+  stays the same on the next `plan` run. It exits 0 even when blockers
+  exist, and 2 if another rotate process holds the state file.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 
@@ -33,8 +44,9 @@ Not done yet:
 - The four real providers. Until they land, a release build reports every
   secret as unsupported. Mock providers exist only behind the
   `test-providers` cargo feature, for tests.
-- Consumer updates, `rotate apply`, `rotate rollback` and `rotate status`.
-  These are stubs.
+- Real consumers (GitHub Actions secrets, AWS Secrets Manager), so a
+  release build finds no consumers yet.
+- `rotate apply`, `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
 

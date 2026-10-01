@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/smhasan94/rotate/blob/main/docs/plan-schema.json",
+  "title": "rotate plan --json",
+  "description": "The dry-run plan printed by `rotate plan --json` (SHA-250). Holds fingerprints, references and reasons only, never a secret value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "overlap_window", "rotations", "skipped"],
+  "properties": {
+    "version": { "const": 1 },
+    "overlap_window": { "$ref": "#/$defs/duration" },
+    "rotations": { "type": "array", "items": { "$ref": "#/$defs/rotation" } },
+    "skipped": { "type": "array", "items": { "$ref": "#/$defs/skipped" } }
+  },
+  "$defs": {
+    "fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{16}$" },
+    "duration": { "type": "string", "pattern": "^([0-9]+[dhms])+$" },
+    "sources": { "type": "array", "items": { "type": "string" } },
+    "rotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rotation_id", "provider", "fingerprint", "validity", "state", "scope",
+        "scope_error", "replacement", "consumers", "lookup_errors",
+        "revoke_action", "overlap_window", "blockers", "sources"
+      ],
+      "properties": {
+        "rotation_id": { "type": "string", "pattern": "^rot-[0-9a-f]{8}$" },
+        "provider": { "type": "string" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "validity": { "const": "valid" },
+        "state": {
+          "enum": [
+            "planned", "created", "consumers_updated", "verified",
+            "pending_revoke", "failed"
+          ]
+        },
+        "scope": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["identity", "lines"],
+              "properties": {
+                "identity": { "type": "string" },
+                "lines": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          ]
+        },
+        "scope_error": { "type": ["string", "null"] },
+        "replacement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "action"],
+          "properties": {
+            "mode": { "enum": ["automatic", "manual"] },
+            "action": { "type": "string" }
+          }
+        },
+        "consumers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["consumer", "consumer_ref", "match_method", "holds", "updatable", "reason"],
+            "properties": {
+              "consumer": { "type": "string" },
+              "consumer_ref": { "type": "string" },
+              "match_method": { "enum": ["by_value", "by_name"] },
+              "holds": { "enum": ["secret", "key_id", "key_pair"] },
+              "updatable": { "type": "boolean" },
+              "reason": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "lookup_errors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["consumer", "error"],
+            "properties": {
+              "consumer": { "type": "string" },
+              "error": { "type": "string" }
+            }
+          }
+        },
+        "revoke_action": { "type": "string" },
+        "overlap_window": { "$ref": "#/$defs/duration" },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "sources": { "$ref": "#/$defs/sources" }
+      }
+    },
+    "skipped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "fingerprint", "reason", "detail", "sources"],
+      "properties": {
+        "provider": { "type": ["string", "null"] },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "reason": { "enum": ["invalid", "unsupported", "not rotatable", "unknown", "unchecked"] },
+        "detail": { "type": ["string", "null"] },
+        "sources": { "$ref": "#/$defs/sources" }
+      }
+    }
+  }
+}

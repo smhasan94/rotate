@@ -1,5 +1,6 @@
-//! SHA-248 CLI half: `rotate plan` prints the assessment table or JSON and
-//! exits 0, including when rows are unsupported, and never prints a value.
+//! SHA-248 CLI half: `rotate plan` prints the assessment of every secret
+//! (as a rotation or a skipped row since SHA-250) and exits 0, including when
+//! rows are unsupported, and never prints a value.
 //!
 //! The mock providers come from the `test-providers` feature (CI runs
 //! `--all-features`); without it every row is unsupported, which these tests
@@ -56,7 +57,7 @@ fn report_rows_show_status_per_secret() {
     assert!(
         stdout
             .lines()
-            .any(|l| l.starts_with("github") && l.contains(&github) && l.contains("valid")),
+            .any(|l| l.starts_with("Rotation ") && l.contains("github") && l.contains(&github)),
         "{stdout}"
     );
     // The gitleaks AWS finding is only a key id: not rotatable, reason in
@@ -66,27 +67,19 @@ fn report_rows_show_status_per_secret() {
 }
 
 #[test]
-fn json_output_is_an_array_with_stable_fields() {
+fn json_output_lists_every_secret_once() {
     let dir = tempfile::tempdir().unwrap();
     let output = rotate_in(dir.path())
         .args(["--json", "plan", TRUFFLEHOG])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
-    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let rows = rows.as_array().expect("a JSON array");
-    assert_eq!(rows.len(), 3);
-    for row in rows {
-        for key in [
-            "provider",
-            "fingerprint",
-            "status",
-            "reason",
-            "detectors",
-            "sources",
-            "scope",
-            "scope_error",
-        ] {
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rotations = plan["rotations"].as_array().expect("rotations array");
+    let skipped = plan["skipped"].as_array().expect("skipped array");
+    assert_eq!(rotations.len() + skipped.len(), 3);
+    for row in rotations.iter().chain(skipped) {
+        for key in ["provider", "fingerprint", "sources"] {
             assert!(row.get(key).is_some(), "{key} missing in {row}");
         }
     }

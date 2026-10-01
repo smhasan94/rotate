@@ -74,7 +74,11 @@ fn unknown_provider_lists_known() {
         .assert()
         .success()
         .stdout(
-            predicate::str::is_match(format!(r"(?m)^aws\s+{}\s+valid", fp("mock_abc"))).unwrap(),
+            predicate::str::is_match(format!(
+                r"(?m)^Rotation rot-[0-9a-f]{{8}}  aws  {}$",
+                fp("mock_abc")
+            ))
+            .unwrap(),
         );
 }
 
