@@ -8,10 +8,13 @@
 #![warn(missing_docs)]
 
 pub mod assess;
+pub mod audit;
 pub mod calls;
 pub mod config;
 pub mod conformance;
+pub mod console;
 pub mod consumer;
+pub mod error;
 pub mod finding;
 pub mod fsutil;
 pub mod input;

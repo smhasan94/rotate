@@ -1,2 +1,9 @@
-# Lint configuration. `disallowed-macros` for println!/eprintln! outside the
-# console module is added in SHA-246 once the redacted console exists.
+# SHA-246: all output goes through rotate::console so it is redacted (NFR2).
+# Test files that print opt out with #![allow(clippy::disallowed_macros)].
+disallowed-macros = [
+  { path = "std::print", reason = "write through rotate::console::Console::out() so output is redacted" },
+  { path = "std::println", reason = "write through rotate::console::Console::out() so output is redacted" },
+  { path = "std::eprint", reason = "write through rotate::console::Console::err() so output is redacted" },
+  { path = "std::eprintln", reason = "write through rotate::console::Console::err() so output is redacted" },
+  { path = "std::dbg", reason = "dbg! prints unredacted Debug output to stderr" },
+]

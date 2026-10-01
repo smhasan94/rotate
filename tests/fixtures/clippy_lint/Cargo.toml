@@ -1,0 +1,10 @@
+# SHA-246 T4 fixture: tests/lint.rs runs clippy on this crate with the
+# repository's clippy.toml and expects the disallowed-macros lint to fire
+# on src/lib.rs and not on src/console.rs. Not part of the rotate build.
+[package]
+name = "clippy-lint-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]

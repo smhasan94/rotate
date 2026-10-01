@@ -95,6 +95,16 @@ pbpaste | rotate plan --stdin
 rotate apply trufflehog-report.json
 ```
 
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Everything requested was done. |
+| 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. |
+| 2 | Bad arguments, bad configuration, or a subcommand that is not implemented yet. |
+| 3 | Work is pending, for example a revoke waiting for its overlap window (`rotate status`). |
+| 101 | rotate panicked. This is a bug; the message is redacted like all other output. |
+
 ## Documentation
 
 - [docs/requirements.md](docs/requirements.md): requirements, threat model
