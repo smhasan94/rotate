@@ -1,5 +1,5 @@
 //! The common finding model: one leaked secret at one source location
-//! (SHA-221; the parsers that produce findings arrive with SHA-223).
+//! (SHA-221). The parsers in [`crate::report`] produce findings (SHA-223).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -10,6 +10,10 @@ use crate::secret::{Fingerprint, SecretPair, SecretValue};
 /// Key in [`Finding::extra`] under which report parsers store an AWS access
 /// key id. Its presence turns the finding's credential into a key pair.
 pub const ACCESS_KEY_ID: &str = "access_key_id";
+
+/// Key in [`Finding::extra`] set to `"true"` when the scanner recognised the
+/// secret as a canary token, which alerts its owner on any API call.
+pub const IS_CANARY: &str = "is_canary";
 
 /// Where a finding was seen. Every field is optional except the file
 /// because scanners differ in what they report.

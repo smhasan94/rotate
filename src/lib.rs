@@ -10,4 +10,5 @@
 pub mod calls;
 pub mod finding;
 pub mod provider;
+pub mod report;
 pub mod secret;
