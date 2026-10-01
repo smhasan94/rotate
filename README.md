@@ -48,6 +48,16 @@ What works now:
   stops that rotation, marks it `failed`, never revokes, and exits 1; a
   consumer that cannot be updated holds the revoke. With an overlap window
   above 0 the revoke is recorded as pending and apply exits 3.
+- Manual replacement mode, for providers whose API cannot mint a
+  replacement (GitHub and npm tokens). Apply prints what to create, then
+  asks you to paste the new secret with terminal echo turned off. It is
+  accepted only once the provider confirms it belongs to the same account
+  as the leaked one; a wrong paste is asked for again, up to three times,
+  and then the rotation fails before any consumer is touched. For scripts,
+  `--replacement-from-env <VAR>` or `--replacement-file <PATH>` (a file
+  readable by its owner only, `chmod 600`) supply the value instead, for
+  one rotation and one attempt. The value is never printed or stored; the
+  state file records `replacement_ref: manual` and its fingerprint.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 
@@ -64,8 +74,8 @@ Not done yet:
   `consumers.aws_secrets_manager`, matches by value (a plain value or a
   top-level JSON string field) and writes a new version. The CLI does not
   pass them `rotate.yaml` yet, so a release build searches neither.
-- `rotate apply`: `--force`, manual replacement mode (the rotation is
-  skipped), resuming an interrupted or pending rotation, and `--json`.
+- `rotate apply`: `--force`, resuming an interrupted or pending rotation,
+  and `--json`.
 - `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
@@ -116,6 +126,9 @@ rotate apply trufflehog-report.json
 
 # Non-interactive, for CI: confirm by id.
 rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
+
+# Manual replacement (GitHub, npm) without a terminal: supply the new token.
+NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env NEW_TOKEN
 ```
 
 ## Exit codes

@@ -33,6 +33,9 @@ crypto_box = { version = "0.9", features = ["seal"] }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 # HTTP for providers and consumers; TLS policy in docs/plans/SHA-273.md.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+# Hidden terminal input for a pasted replacement (SHA-257): safe termios
+# calls, no `unsafe` in rotate. Already in the tree through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_norway = "0.9"
@@ -52,6 +55,8 @@ assert_cmd = "2"
 # features off: no HTTP resolver.
 jsonschema = { version = "0.58", default-features = false }
 predicates = "3"
+# A pseudo-terminal for the no-echo test (SHA-257).
+rustix = { version = "1", default-features = false, features = ["std", "termios", "pty", "fs"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 urlencoding = "2"

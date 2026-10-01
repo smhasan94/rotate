@@ -12,7 +12,9 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 
-use rotate::apply::{self, Confirmation, Executor, RunStatus, TtyPrompt};
+use rotate::apply::{
+    self, Confirmation, Executor, QuestionWriter, ReplacementSource, RunStatus, TtyPrompt,
+};
 use rotate::assess::{assess, AssessOptions};
 use rotate::audit::AuditLog;
 use rotate::config::{Config, ConfigError};
@@ -20,8 +22,9 @@ use rotate::console::{self, Console};
 use rotate::consumer::ConsumerRegistry;
 use rotate::finding::Finding;
 use rotate::plan;
-use rotate::provider::ProviderRegistry;
+use rotate::provider::{ProviderRegistry, ReplacementMode};
 use rotate::report::{read_report, ReportError};
+use rotate::secret::SecretValue;
 use rotate::state::{StateError, StateStore};
 
 use crate::cli::{ApplyArgs, Cli, Command, InputArgs};
@@ -232,7 +235,18 @@ fn plan(
 /// before every confirmation is in and the audit log is open. The plan, and
 /// with it every credential, lives until the summary is printed, so the
 /// values stay registered with the redactor for every message.
+///
+/// A replacement supplied with `--replacement-from-env` or
+/// `--replacement-file` (SHA-257) is read first, before the state file or
+/// any provider call, so a refusal exits 2 having touched nothing.
 fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config: &Config) -> Exit {
+    let mut supplied = match supplied_replacement(args) {
+        Ok(supplied) => supplied,
+        Err(err) => {
+            let _ = writeln!(console.err(), "error: {err}");
+            return Exit::Usage;
+        }
+    };
     let mut store = match StateStore::open(&config.state_file) {
         Ok(store) => store,
         Err(err) => return state_error(console, err),
@@ -284,7 +298,8 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     };
     let mut prompt = providers::prompt().unwrap_or_else(|| Box::new(TtyPrompt::new()));
     let confirmed = {
-        let mut err = console.err();
+        // Each question is written before its answer is read.
+        let mut err = QuestionWriter::new(&mut *console);
         let result = apply::confirm(&all_ids, &askable, &request, prompt.as_mut(), &mut err);
         drop(err);
         match result {
@@ -306,6 +321,28 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         })
         .collect();
 
+    // A supplied replacement is one value: it can serve one manual rotation.
+    let manual = requested
+        .iter()
+        .filter(|r| r.replacement_mode == ReplacementMode::Manual && apply::eligibility(r).is_ok())
+        .count();
+    if supplied.is_some() {
+        if manual > 1 {
+            let _ = writeln!(
+                console.err(),
+                "error: --replacement-from-env and --replacement-file supply one replacement, but {manual} manual rotations are confirmed; confirm one at a time with --confirm <rotation-id>. Nothing was changed."
+            );
+            return Exit::Usage;
+        }
+        if manual == 0 {
+            let _ = writeln!(
+                console.err(),
+                "note: no confirmed rotation is in manual replacement mode; the supplied replacement is not used"
+            );
+            supplied = None;
+        }
+    }
+
     let mut outcomes = Vec::new();
     if requested.iter().any(|r| apply::eligibility(r).is_ok()) {
         let mut audit = match AuditLog::open(&config.audit_log) {
@@ -319,7 +356,12 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
                 };
             }
         };
-        let mut executor = Executor::new(&registry, &consumers, &mut store, &mut audit);
+        let source = match supplied.take() {
+            Some(value) => ReplacementSource::Supplied(Some(value)),
+            None => ReplacementSource::Prompt(prompt),
+        };
+        let mut executor = Executor::new(&registry, &consumers, &mut store, &mut audit)
+            .with_manual(source, &mut *console);
         runtime.block_on(async {
             for rotation in &requested {
                 outcomes.push(executor.run(rotation).await);
@@ -340,6 +382,21 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         RunStatus::Pending => Exit::Pending,
         RunStatus::Unsupported => Exit::Usage,
     }
+}
+
+/// The replacement named by `--replacement-from-env` or
+/// `--replacement-file`, if either was given. Errors name neither the
+/// variable nor the path.
+fn supplied_replacement(
+    args: &ApplyArgs,
+) -> Result<Option<SecretValue>, rotate::input::ReplacementInputError> {
+    if let Some(name) = &args.replacement_from_env {
+        return rotate::input::replacement_from_env(name).map(Some);
+    }
+    if let Some(path) = &args.replacement_file {
+        return rotate::input::replacement_from_file(path).map(Some);
+    }
+    Ok(None)
 }
 
 /// Reports a state-store error: exit 2 for a held lock or an unusable file

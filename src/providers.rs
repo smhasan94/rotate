@@ -110,6 +110,12 @@ pub fn finish() {
 /// `"no_tty"`; `consumer_state` is a path the binary writes on exit with
 /// what every mock consumer holds, `{"<name>": {"<ref>": "sha256:..."}}`.
 ///
+/// For manual mode (SHA-257): prompt answers are also the pasted secrets,
+/// in order after any confirmation answers; `prompt` may instead be
+/// `{"tty": "<device>"}` to read a pseudo-terminal with the real hidden
+/// prompt; `providers.<name>.foreign` lists fingerprints that `verify`
+/// reports as belonging to another identity.
+///
 /// Every mock shares one `CallLog`. [`write_call_log`] writes it as JSON
 /// lines (`target`, `method`, `mutating`, `fingerprint`), so a CLI test can
 /// prove a run made no state-changing call. The file holds fingerprints
@@ -122,13 +128,13 @@ mod scenario {
 
     use serde::Deserialize;
 
-    use rotate::apply::{Prompt, PromptError, ScriptedPrompt};
+    use rotate::apply::{Prompt, PromptError, ScriptedPrompt, Terminal, TtyPrompt};
     use rotate::calls::CallLog;
     use rotate::consumer::mock::MockConsumer;
     use rotate::consumer::{ConsumerError, ConsumerMatch, ConsumerRegistry, Holds};
     use rotate::provider::mock::MockProvider;
-    use rotate::provider::{ProviderError, ProviderRegistry, ReplacementMode, Validity};
-    use rotate::secret::Fingerprint;
+    use rotate::provider::{Identity, ProviderError, ProviderRegistry, ReplacementMode, Validity};
+    use rotate::secret::{Fingerprint, SecretValue};
 
     const ENV: &str = "ROTATE_TEST_SCENARIO";
 
@@ -151,6 +157,8 @@ mod scenario {
         mode: Option<String>,
         #[serde(default)]
         fail: BTreeMap<String, String>,
+        #[serde(default)]
+        foreign: Vec<Fingerprint>,
     }
 
     #[derive(Deserialize)]
@@ -226,6 +234,9 @@ mod scenario {
                     Some("manual") => mock.mode(ReplacementMode::Manual),
                     Some(other) => panic!("{ENV}: unknown mode {other:?}"),
                 };
+                for fingerprint in &setup.foreign {
+                    mock = mock.owner(fingerprint.clone(), Identity("someone-else".into()));
+                }
                 for (method, error) in &setup.fail {
                     mock.fail_always(method, ProviderError::Permanent(error.clone()));
                 }
@@ -286,6 +297,14 @@ mod scenario {
         fn read_line(&mut self) -> Result<String, PromptError> {
             panic!("{ENV}: the scenario says apply must not prompt");
         }
+
+        fn read_secret(
+            &mut self,
+            _question: &str,
+            _term: &mut dyn Terminal,
+        ) -> Result<SecretValue, PromptError> {
+            panic!("{ENV}: the scenario says apply must not prompt for a secret");
+        }
     }
 
     /// Stands in for a process with no controlling terminal.
@@ -295,6 +314,14 @@ mod scenario {
         fn read_line(&mut self) -> Result<String, PromptError> {
             Err(PromptError::NoTerminal)
         }
+
+        fn read_secret(
+            &mut self,
+            _question: &str,
+            _term: &mut dyn Terminal,
+        ) -> Result<SecretValue, PromptError> {
+            Err(PromptError::NoTerminalForSecret)
+        }
     }
 
     pub fn prompt() -> Option<Box<dyn Prompt>> {
@@ -302,6 +329,13 @@ mod scenario {
         Some(match setup {
             serde_json::Value::String(mode) if mode == "panic" => Box::new(PanicPrompt),
             serde_json::Value::String(mode) if mode == "no_tty" => Box::new(NoTty),
+            serde_json::Value::Object(map) if map.contains_key("tty") => {
+                let path = map
+                    .get("tty")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{ENV}: prompt \"tty\" needs a path"));
+                Box::new(TtyPrompt::with_path(path))
+            }
             serde_json::Value::Object(map) => {
                 let answers: Vec<String> = map
                     .get("answers")

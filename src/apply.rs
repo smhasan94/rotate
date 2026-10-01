@@ -12,6 +12,13 @@
 //! hold the replacement, and defers it while the overlap window is open
 //! (decision D2).
 //!
+//! A provider in manual replacement mode (decision D1, SHA-257) cannot mint
+//! the replacement: the create step prints the provider's instructions,
+//! reads the new secret from a hidden [`Prompt`] (or the value supplied
+//! with `--replacement-from-env` or `--replacement-file`), and accepts it
+//! only once `verify` confirms it belongs to the leaked secret's owner. No
+//! consumer is touched before that.
+//!
 //! The replacement credential is a local of [`Executor::run`]: it is held in
 //! zeroized memory, registered with the redactor while alive, and dropped
 //! when the rotation ends. Nothing returned from here holds a value.
@@ -25,26 +32,112 @@
 use std::collections::VecDeque;
 use std::fmt::{self, Write as _};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::audit::RedactedText;
 use crate::audit::{AuditError, AuditEvent, AuditLog, AuditStep, Outcome as AuditOutcome};
+use crate::console::Console;
 use crate::consumer::ConsumerRegistry;
+use crate::input::{self, ReplacementInputError, REPLACEMENT_MAX};
 use crate::plan::{Plan, PlannedRotation};
-use crate::provider::{ProviderRegistry, ReplacementMode};
-use crate::secret::Fingerprint;
+use crate::provider::{Credential, Provider, ProviderRegistry, Replacement, ReplacementMode};
+use crate::secret::{Fingerprint, SecretValue};
 use crate::state::{ConsumerState, ConsumerStatus, Rotation, StateError, StateStore, Step};
 
 /// What the operator typed to confirm every rotation with `--all`.
 pub const CONFIRM_ALL: &str = "all";
 
-/// Reads one line of confirmation from the operator.
+/// How many pastes a manual replacement gets before the rotation fails.
+pub const MANUAL_ATTEMPTS: usize = 3;
+
+/// The `replacement_ref` recorded for a pasted replacement: rotate has no
+/// provider-side handle on a credential the operator created.
+pub const MANUAL_REF: &str = "manual";
+
+/// Where apply writes while it runs: one redacted message per call, written
+/// at once, so a question is on screen before rotate waits for the answer.
+pub trait Terminal {
+    /// Writes one message to stdout.
+    fn stdout(&mut self, text: &str);
+    /// Writes one message to stderr.
+    fn stderr(&mut self, text: &str);
+}
+
+impl<O: Write, E: Write> Terminal for Console<O, E> {
+    fn stdout(&mut self, text: &str) {
+        let _ = self.out().write_all(text.as_bytes());
+    }
+
+    fn stderr(&mut self, text: &str) {
+        let _ = self.err().write_all(text.as_bytes());
+    }
+}
+
+/// A [`Write`] over [`Terminal::stderr`] that sends what it holds on every
+/// `flush` and on drop, for [`confirm`]: the question shows before the
+/// read. Callers flush only after whole messages.
+pub struct QuestionWriter<'a> {
+    term: &'a mut dyn Terminal,
+    buf: Zeroizing<Vec<u8>>,
+}
+
+impl<'a> QuestionWriter<'a> {
+    /// A writer to `term`'s stderr.
+    pub fn new(term: &'a mut dyn Terminal) -> Self {
+        Self {
+            term,
+            buf: Zeroizing::new(Vec::new()),
+        }
+    }
+}
+
+impl fmt::Debug for QuestionWriter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuestionWriter").finish_non_exhaustive()
+    }
+}
+
+impl Write for QuestionWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            let text = Zeroizing::new(String::from_utf8_lossy(&self.buf).into_owned());
+            self.term.stderr(&text);
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QuestionWriter<'_> {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+/// Reads answers from the operator.
 pub trait Prompt {
     /// Reads one answer. The question has already been printed.
     fn read_line(&mut self) -> Result<String, PromptError>;
+
+    /// Writes `question` to `term` and reads one secret without echoing it
+    /// (SHA-257). The value goes straight into a [`SecretValue`]; the
+    /// trailing newline is not part of it.
+    fn read_secret(
+        &mut self,
+        question: &str,
+        term: &mut dyn Terminal,
+    ) -> Result<SecretValue, PromptError>;
 }
 
 /// Why no answer could be read.
@@ -53,38 +146,133 @@ pub enum PromptError {
     /// There is no terminal to read from.
     #[error("no terminal to confirm on; pass --confirm <rotation-id>")]
     NoTerminal,
+    /// There is no terminal to paste a replacement on.
+    #[error(
+        "no terminal to paste the replacement on; pass --replacement-from-env <VAR> or --replacement-file <PATH>"
+    )]
+    NoTerminalForSecret,
     /// Reading the terminal failed.
-    #[error("could not read the confirmation from the terminal ({0})")]
+    #[error("could not read from the terminal ({0})")]
     Io(io::ErrorKind),
+    /// Terminal echo could not be turned off, so nothing was read.
+    #[error("could not turn off terminal echo ({0}); nothing was read")]
+    Echo(io::ErrorKind),
 }
 
 /// Reads answers from `/dev/tty`, never stdin, so a secret piped to
 /// `--stdin` and the confirmation do not share a stream.
 #[derive(Debug, Default)]
 pub struct TtyPrompt {
+    path: Option<PathBuf>,
     tty: Option<BufReader<File>>,
 }
 
 impl TtyPrompt {
-    /// A prompt that opens the terminal on first use.
+    /// A prompt that opens `/dev/tty` on first use.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A prompt that opens the terminal device at `path` instead, for the
+    /// pseudo-terminal test.
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Some(path.into()),
+            tty: None,
+        }
+    }
+
+    fn open(&mut self) -> Option<&mut BufReader<File>> {
+        if self.tty.is_none() {
+            let path = self
+                .path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/dev/tty"));
+            let file = File::options().read(true).write(true).open(path).ok()?;
+            self.tty = Some(BufReader::new(file));
+        }
+        self.tty.as_mut()
+    }
+}
+
+/// Terminal echo off until dropped, then the saved mode back. `ECHONL`
+/// stays on so Enter still moves the cursor to a new line.
+struct EchoOff<'f> {
+    tty: &'f File,
+    saved: rustix::termios::Termios,
+}
+
+impl<'f> EchoOff<'f> {
+    fn new(tty: &'f File) -> Result<Self, PromptError> {
+        use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+
+        let echo = |e: rustix::io::Errno| PromptError::Echo(io::Error::from(e).kind());
+        let saved = tcgetattr(tty).map_err(echo)?;
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(LocalModes::ECHO);
+        quiet.local_modes.insert(LocalModes::ECHONL);
+        // Flush drops anything typed before echo went off.
+        tcsetattr(tty, OptionalActions::Flush, &quiet).map_err(echo)?;
+        Ok(Self { tty, saved })
+    }
+}
+
+impl Drop for EchoOff<'_> {
+    fn drop(&mut self) {
+        let _ = rustix::termios::tcsetattr(
+            self.tty,
+            rustix::termios::OptionalActions::Now,
+            &self.saved,
+        );
     }
 }
 
 impl Prompt for TtyPrompt {
     fn read_line(&mut self) -> Result<String, PromptError> {
-        if self.tty.is_none() {
-            let file = File::open("/dev/tty").map_err(|_| PromptError::NoTerminal)?;
-            self.tty = Some(BufReader::new(file));
-        }
-        let Some(tty) = self.tty.as_mut() else {
+        let Some(tty) = self.open() else {
             return Err(PromptError::NoTerminal);
         };
         let mut line = String::new();
         tty.read_line(&mut line)
             .map_err(|err| PromptError::Io(err.kind()))?;
         Ok(line)
+    }
+
+    fn read_secret(
+        &mut self,
+        question: &str,
+        term: &mut dyn Terminal,
+    ) -> Result<SecretValue, PromptError> {
+        let Some(tty) = self.open() else {
+            return Err(PromptError::NoTerminalForSecret);
+        };
+        // Input typed ahead of an earlier answer was echoed; drop it.
+        let ahead = tty.buffer().len();
+        tty.consume(ahead);
+        let file: &File = tty.get_ref();
+        let _echo_off = EchoOff::new(file)?;
+        term.stderr(question);
+        // Byte by byte into a buffer that never reallocates: no copy of the
+        // value is left behind. Longer lines are read to the end and
+        // refused by `normalize_replacement`.
+        let mut buf = Zeroizing::new(Vec::with_capacity(REPLACEMENT_MAX + 1));
+        let mut byte = [0u8; 1];
+        let result = loop {
+            match (&*file).read(&mut byte) {
+                Ok(0) => break Ok(()),
+                Ok(_) if byte[0] == b'\n' => break Ok(()),
+                Ok(_) => {
+                    if buf.len() <= REPLACEMENT_MAX {
+                        buf.push(byte[0]);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => break Err(PromptError::Io(err.kind())),
+            }
+        };
+        byte.zeroize();
+        result?;
+        Ok(SecretValue::new(std::mem::take(&mut *buf)))
     }
 }
 
@@ -119,6 +307,45 @@ impl Prompt for ScriptedPrompt {
         self.asked += 1;
         Ok(self.answers.pop_front().unwrap_or_default())
     }
+
+    fn read_secret(
+        &mut self,
+        question: &str,
+        term: &mut dyn Terminal,
+    ) -> Result<SecretValue, PromptError> {
+        term.stderr(question);
+        self.asked += 1;
+        Ok(SecretValue::from(
+            self.answers.pop_front().unwrap_or_default(),
+        ))
+    }
+}
+
+/// Where a manual replacement comes from.
+pub enum ReplacementSource {
+    /// Ask on the terminal with hidden input, up to [`MANUAL_ATTEMPTS`]
+    /// times.
+    Prompt(Box<dyn Prompt>),
+    /// Read before the run from `--replacement-from-env` or
+    /// `--replacement-file`: one attempt, for one rotation.
+    Supplied(Option<SecretValue>),
+}
+
+impl fmt::Debug for ReplacementSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplacementSource::Prompt(_) => f.write_str("Prompt"),
+            ReplacementSource::Supplied(value) => {
+                f.debug_tuple("Supplied").field(&value.is_some()).finish()
+            }
+        }
+    }
+}
+
+/// The manual-mode input and output of an [`Executor`].
+struct Manual<'a> {
+    source: ReplacementSource,
+    term: &'a mut dyn Terminal,
 }
 
 /// How the operator confirms.
@@ -221,8 +448,6 @@ pub fn confirm(
 /// Why apply cannot run a rotation yet. Nothing is called for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {
-    /// The provider needs the operator to paste the replacement (SHA-257).
-    Manual,
     /// An earlier apply left it at this step; resuming is SHA-258.
     InProgress(Step),
     /// The owner identity is unknown, so the replacement cannot be verified.
@@ -232,7 +457,6 @@ pub enum Ineligible {
 impl fmt::Display for Ineligible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Ineligible::Manual => f.write_str("manual replacement is not supported yet"),
             Ineligible::InProgress(step) => write!(
                 f,
                 "already at step {}; resuming is not supported yet",
@@ -247,9 +471,6 @@ impl fmt::Display for Ineligible {
 
 /// Whether apply can run `rotation` now.
 pub fn eligibility(rotation: &PlannedRotation) -> Result<(), Ineligible> {
-    if rotation.replacement_mode == ReplacementMode::Manual {
-        return Err(Ineligible::Manual);
-    }
     if rotation.step != Step::Planned {
         return Err(Ineligible::InProgress(rotation.step));
     }
@@ -403,6 +624,7 @@ pub struct Executor<'a> {
     store: &'a mut StateStore,
     audit: &'a mut AuditLog,
     clock: fn() -> OffsetDateTime,
+    manual: Option<Manual<'a>>,
 }
 
 impl fmt::Debug for Executor<'_> {
@@ -418,6 +640,7 @@ impl fmt::Debug for Executor<'_> {
 struct Progress {
     record: Rotation,
     provider: &'static str,
+    mode: ReplacementMode,
 }
 
 impl<'a> Executor<'a> {
@@ -434,7 +657,16 @@ impl<'a> Executor<'a> {
             store,
             audit,
             clock: OffsetDateTime::now_utc,
+            manual: None,
         }
+    }
+
+    /// Where manual-mode rotations get their replacement, and where their
+    /// instructions (stdout) and questions (stderr) go. Without it a
+    /// manual rotation fails at create and nothing is changed.
+    pub fn with_manual(mut self, source: ReplacementSource, term: &'a mut dyn Terminal) -> Self {
+        self.manual = Some(Manual { source, term });
+        self
     }
 
     /// Uses `clock` for the overlap window instead of the system clock.
@@ -464,6 +696,7 @@ impl<'a> Executor<'a> {
                     )
                 }),
             provider: rotation.provider,
+            mode: rotation.replacement_mode,
         };
         let result = self.steps(rotation, &mut progress).await;
         Outcome {
@@ -489,10 +722,26 @@ impl<'a> Executor<'a> {
             );
         };
 
-        // Create. The replacement lives in this frame only.
-        let replacement = match provider.create_replacement(&rotation.credential).await {
-            Ok(replacement) => replacement,
-            Err(err) => return self.fail(progress, AuditStep::Create, &err.to_string(), None),
+        // Create, or in manual mode take the operator's verified paste. The
+        // replacement lives in this frame only.
+        let replacement = match rotation.replacement_mode {
+            ReplacementMode::Automatic => {
+                match provider.create_replacement(&rotation.credential).await {
+                    Ok(replacement) => replacement,
+                    Err(err) => {
+                        return self.fail(progress, AuditStep::Create, &err.to_string(), None)
+                    }
+                }
+            }
+            ReplacementMode::Manual => {
+                match manual_replacement(self.manual.as_mut(), rotation, provider.as_ref()).await {
+                    Ok(credential) => Replacement {
+                        credential,
+                        replacement_ref: MANUAL_REF.to_owned(),
+                    },
+                    Err(error) => return self.fail(progress, AuditStep::Create, &error, None),
+                }
+            }
         };
         progress.record.step = Step::Created;
         progress.record.replacement_ref = Some(replacement.replacement_ref.clone());
@@ -675,6 +924,9 @@ impl<'a> Executor<'a> {
         if let Some(consumer) = consumer {
             event = event.with_consumer(consumer);
         }
+        if step == AuditStep::Create {
+            event = event.with_mode(progress.mode);
+        }
         if let Some(error) = error {
             event = event.with_error(error);
         }
@@ -707,6 +959,88 @@ impl<'a> Executor<'a> {
             error: RedactedText::new(error),
         }
     }
+}
+
+/// Obtains a manual replacement: prints the provider's instructions, then
+/// reads and checks pastes until one is the leaked secret's owner's, at
+/// most [`MANUAL_ATTEMPTS`] times (once for a supplied value). Read-only:
+/// the only provider call is `verify`. The error is the reason to record.
+async fn manual_replacement(
+    manual: Option<&mut Manual<'_>>,
+    rotation: &PlannedRotation,
+    provider: &dyn Provider,
+) -> Result<Credential, String> {
+    let Some(manual) = manual else {
+        return Err(PromptError::NoTerminalForSecret.to_string());
+    };
+    let Some(scope) = &rotation.scope else {
+        return Err(Ineligible::NoScope.to_string());
+    };
+    let id = &rotation.rotation_id;
+    manual.term.stdout(&format!(
+        "\nRotation {id}: {} cannot create the replacement itself.\n{}\n",
+        provider.name(),
+        provider.manual_instructions(scope)
+    ));
+    let attempts = match manual.source {
+        ReplacementSource::Prompt(_) => MANUAL_ATTEMPTS,
+        ReplacementSource::Supplied(_) => 1,
+    };
+    let question =
+        format!("Paste the new secret for rotation {id} (input is hidden), then press Enter: ");
+    let mut last = String::new();
+    for attempt in 1..=attempts {
+        let value = match &mut manual.source {
+            ReplacementSource::Prompt(prompt) => prompt
+                .read_secret(&question, &mut *manual.term)
+                .map_err(|err| err.to_string())?,
+            ReplacementSource::Supplied(value) => value.take().ok_or_else(|| {
+                "the supplied replacement was already used by another rotation".to_owned()
+            })?,
+        };
+        last = match check_paste(value, rotation, provider, &scope.identity).await {
+            Ok(credential) => return Ok(credential),
+            Err(reason) => reason,
+        };
+        if attempt < attempts {
+            manual.term.stderr(&format!(
+                "The pasted secret was rejected: {last}. Try again (attempt {} of {attempts}).\n",
+                attempt + 1
+            ));
+        }
+    }
+    Err(match manual.source {
+        ReplacementSource::Prompt(_) => format!(
+            "the pasted replacement was rejected {attempts} times, last: {last}; no consumer was updated"
+        ),
+        ReplacementSource::Supplied(_) => format!(
+            "the supplied replacement was rejected: {last}; no consumer was updated"
+        ),
+    })
+}
+
+/// Accepts a pasted value when it is not blank, not the leaked secret, and
+/// `verify` says it belongs to `identity`.
+async fn check_paste(
+    value: SecretValue,
+    rotation: &PlannedRotation,
+    provider: &dyn Provider,
+    identity: &crate::provider::Identity,
+) -> Result<Credential, String> {
+    let value = input::normalize_replacement(value).map_err(|err| match err {
+        ReplacementInputError::Empty => "nothing was pasted".to_owned(),
+        other => other.to_string(),
+    })?;
+    let credential =
+        input::replacement_credential(value, &rotation.credential).map_err(|e| e.to_string())?;
+    if credential.fingerprint() == rotation.fingerprint {
+        return Err("it is the leaked secret itself; paste the new one".to_owned());
+    }
+    provider
+        .verify(&credential, identity)
+        .await
+        .map_err(|err| format!("it did not verify as {identity}: {err}"))?;
+    Ok(credential)
 }
 
 /// Every rotation id in `plan`, in order.
@@ -1067,20 +1401,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_and_in_progress_are_ineligible() {
-        let value = "npm_apply_unit_manual";
-        let mut f = fixture(
-            value,
-            MockProvider::new("npm").mode(ReplacementMode::Manual),
-        );
+    async fn in_progress_and_no_scope_are_ineligible() {
+        let value = "npm_apply_unit_inprogress";
+        let mut f = fixture(value, MockProvider::new("npm"));
         let mut plan = plan(&mut f, value, "0s").await;
-        assert_eq!(eligibility(&plan.rotations[0]), Err(Ineligible::Manual));
-        let outcome = run(&mut f, &plan).await;
-        assert_eq!(outcome.result, RunResult::Skipped(Ineligible::Manual));
-        assert!(f.log.is_empty());
+        assert_eq!(eligibility(&plan.rotations[0]), Ok(()));
 
-        plan.rotations[0].replacement_mode = ReplacementMode::Automatic;
         plan.rotations[0].step = Step::Created;
+        let outcome = run(&mut f, &plan).await;
+        assert_eq!(
+            outcome.result,
+            RunResult::Skipped(Ineligible::InProgress(Step::Created))
+        );
+        assert!(f.log.is_empty());
         assert_eq!(
             eligibility(&plan.rotations[0]),
             Err(Ineligible::InProgress(Step::Created))
@@ -1089,6 +1422,208 @@ mod tests {
         plan.rotations[0].scope = None;
         assert_eq!(eligibility(&plan.rotations[0]), Err(Ineligible::NoScope));
         assert_eq!(run_status(&[outcome]), RunStatus::Unsupported);
+    }
+
+    /// Records what the executor writes, as the console would print it.
+    #[derive(Default)]
+    struct Recorder {
+        out: String,
+        err: String,
+    }
+
+    impl Terminal for Recorder {
+        fn stdout(&mut self, text: &str) {
+            self.out.push_str(text);
+        }
+
+        fn stderr(&mut self, text: &str) {
+            self.err.push_str(text);
+        }
+    }
+
+    async fn run_manual(
+        f: &mut Fixture,
+        plan: &Plan,
+        source: ReplacementSource,
+        term: &mut Recorder,
+    ) -> Outcome {
+        let mut executor = Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit)
+            .with_manual(source, term);
+        executor.run(&plan.rotations[0]).await
+    }
+
+    fn manual_mock() -> MockProvider {
+        MockProvider::new("npm").mode(ReplacementMode::Manual)
+    }
+
+    // SHA-257 T1 (AC1), T2 (AC2)
+    #[tokio::test]
+    async fn manual_create_never_calls_create_replacement() {
+        let value = "npm_manual_unit_leaked";
+        let pasted = "npm_manual_unit_pasted_ok";
+        let mut f = fixture(value, manual_mock());
+        let plan = plan(&mut f, value, "0s").await;
+        assert_eq!(eligibility(&plan.rotations[0]), Ok(()));
+        let mut term = Recorder::default();
+        let prompt = ScriptedPrompt::new([format!("{pasted}\n")]);
+        let outcome = run_manual(
+            &mut f,
+            &plan,
+            ReplacementSource::Prompt(Box::new(prompt)),
+            &mut term,
+        )
+        .await;
+
+        assert_eq!(outcome.result, RunResult::Revoked, "{}", term.err);
+        assert_eq!(
+            mutating(&f.log),
+            [
+                "npm.verify",
+                "github-actions.update",
+                "aws-secrets-manager.update",
+                "npm.verify",
+                "npm.revoke",
+            ]
+        );
+        assert!(f
+            .log
+            .calls()
+            .iter()
+            .all(|c| c.method != "create_replacement"));
+        assert!(term.out.contains("cannot create the replacement itself"));
+        assert!(term
+            .out
+            .contains("Create a new npm credential for npm-user"));
+        assert!(term.err.contains("(input is hidden)"));
+        assert!(!term.out.contains(pasted) && !term.err.contains(pasted));
+
+        assert_eq!(outcome.replacement_fingerprint, Some(fp(pasted)));
+        assert_eq!(f.gha.current("gha:org/repo:NPM_TOKEN"), Some(fp(pasted)));
+        assert_eq!(f.sm.current("sm:prod/npm"), Some(fp(pasted)));
+        assert!(f.provider.is_revoked(&fp(value)));
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.replacement_ref.as_deref(), Some(MANUAL_REF));
+        assert_eq!(stored.replacement_fingerprint, Some(fp(pasted)));
+
+        let create = crate::audit::read_all(&f.audit_path)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.step == AuditStep::Create)
+            .unwrap();
+        assert_eq!(create.replacement_mode, Some(ReplacementMode::Manual));
+        assert_eq!(create.replacement_fingerprint, Some(fp(pasted)));
+    }
+
+    // SHA-257 T3 (AC3): blank, the leaked secret itself and a foreign
+    // secret are each one attempt; only the last reaches verify.
+    #[tokio::test]
+    async fn pasting_the_leaked_secret_is_rejected() {
+        let value = "npm_manual_unit_leaked_again";
+        let foreign = "npm_manual_unit_foreign";
+        let mut f = fixture(
+            value,
+            manual_mock().owner(fp(foreign), crate::provider::Identity("other".into())),
+        );
+        let plan = plan(&mut f, value, "0s").await;
+        let mut term = Recorder::default();
+        let prompt = ScriptedPrompt::new(["\n".to_owned(), format!("{value}\n"), foreign.into()]);
+        let outcome = run_manual(
+            &mut f,
+            &plan,
+            ReplacementSource::Prompt(Box::new(prompt)),
+            &mut term,
+        )
+        .await;
+
+        let RunResult::Failed { step, error } = &outcome.result else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(*step, AuditStep::Create);
+        assert!(error.to_string().contains("rejected 3 times"), "{error}");
+        assert!(term.err.contains("nothing was pasted"));
+        assert!(term.err.contains("the leaked secret itself"));
+        assert!(term.err.contains("attempt 3 of 3"));
+        assert_eq!(mutating(&f.log), ["npm.verify"]);
+        assert_eq!(f.gha.current("gha:org/repo:NPM_TOKEN"), Some(fp(value)));
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::Failed);
+        assert!(stored.consumers.is_empty());
+        assert!(!term.out.contains(foreign) && !term.err.contains(foreign));
+    }
+
+    // SHA-257: a supplied value gets one attempt and no prompt.
+    #[tokio::test]
+    async fn supplied_replacement_gets_one_attempt() {
+        let value = "npm_manual_unit_supplied_leaked";
+        let foreign = "npm_manual_unit_supplied_foreign";
+        let mut f = fixture(
+            value,
+            manual_mock().owner(fp(foreign), crate::provider::Identity("other".into())),
+        );
+        let first = plan(&mut f, value, "0s").await;
+        let mut term = Recorder::default();
+        let outcome = run_manual(
+            &mut f,
+            &first,
+            ReplacementSource::Supplied(Some(SecretValue::from(foreign))),
+            &mut term,
+        )
+        .await;
+        let RunResult::Failed { step, error } = &outcome.result else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(*step, AuditStep::Create);
+        assert!(
+            error
+                .to_string()
+                .contains("supplied replacement was rejected"),
+            "{error}"
+        );
+        assert!(!term.err.contains("Try again"));
+        assert_eq!(mutating(&f.log), ["npm.verify"]);
+
+        let value = "npm_manual_unit_supplied_ok_leaked";
+        let mut f = fixture(value, manual_mock());
+        let second = plan(&mut f, value, "0s").await;
+        let outcome = run_manual(
+            &mut f,
+            &second,
+            ReplacementSource::Supplied(Some(SecretValue::from("npm_manual_unit_supplied_new\n"))),
+            &mut term,
+        )
+        .await;
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert_eq!(
+            outcome.replacement_fingerprint,
+            Some(fp("npm_manual_unit_supplied_new"))
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_without_input_fails_at_create() {
+        let value = "npm_manual_unit_no_input";
+        let mut f = fixture(value, manual_mock());
+        let plan = plan(&mut f, value, "0s").await;
+        let outcome = run(&mut f, &plan).await;
+        let RunResult::Failed { step, error } = &outcome.result else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(*step, AuditStep::Create);
+        assert!(error.to_string().contains("--replacement-from-env"));
+        assert!(mutating(&f.log).is_empty());
+    }
+
+    #[test]
+    fn question_writer_sends_on_flush() {
+        let mut term = Recorder::default();
+        {
+            let mut w = QuestionWriter::new(&mut term);
+            write!(w, "Type ").unwrap();
+            write!(w, "it: ").unwrap();
+            w.flush().unwrap();
+            write!(w, "tail").unwrap();
+        }
+        assert_eq!(term.err, "Type it: tail");
     }
 
     // T1 (AC1), T3 (AC3), T4 (AC4)
