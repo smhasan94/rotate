@@ -50,20 +50,25 @@ What works now:
   above 0 the revoke is recorded as pending and apply exits 3.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
+- AWS access keys are identified and checked with STS, signed with the
+  leaked key itself.
+- `plan` and `apply` search two real consumers, using the targets in
+  `rotate.yaml`: GitHub Actions secrets, matched by name in the
+  `consumers.github_actions.targets` repos and orgs and written as sealed
+  values with the operator token from `ROTATE_GITHUB_TOKEN` or
+  `GITHUB_TOKEN`; and AWS Secrets Manager entries named or tagged under
+  `consumers.aws_secrets_manager`, matched by value (a plain value or a
+  top-level JSON string field) and written as a new version with the
+  standard AWS credentials. With those sections empty, neither makes a
+  call.
 
 Not done yet:
 
-- The four real providers. Until they land, a release build reports every
-  secret as unsupported. Mock providers exist only behind the
-  `test-providers` cargo feature, for tests.
-- Passing the loaded config to the real consumers. Both are built in: the
-  GitHub Actions secrets consumer matches by name in the
-  `consumers.github_actions.targets` repos and orgs and writes sealed values
-  with the operator token from `ROTATE_GITHUB_TOKEN` or `GITHUB_TOKEN`; the
-  AWS Secrets Manager consumer reads the entries named or tagged under
-  `consumers.aws_secrets_manager`, matches by value (a plain value or a
-  top-level JSON string field) and writes a new version. The CLI does not
-  pass them `rotate.yaml` yet, so a release build searches neither.
+- Rotating anything for real. The AWS provider cannot yet create, verify
+  or revoke keys, and the GitHub, npm and OpenAI providers do not exist, so
+  a release build can assess AWS keys but reports other secrets as
+  unsupported. Mock providers exist only behind the `test-providers` cargo
+  feature, for tests.
 - `rotate apply`: `--force`, manual replacement mode (the rotation is
   skipped), resuming an interrupted or pending rotation, and `--json`.
 - `rotate rollback` and `rotate status`. These are stubs.
