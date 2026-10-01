@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 pub mod assess;
+pub mod audit;
 pub mod calls;
 pub mod config;
 pub mod conformance;
