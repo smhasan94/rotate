@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use rotate::config::{Overlap, Overrides};
+use rotate::report::ReportFormat;
 
 /// Revoke and rotate leaked secrets safely, end to end.
 #[derive(Debug, Parser)]
@@ -62,27 +63,57 @@ impl GlobalArgs {
     }
 }
 
+/// Where the leaked secrets come from (SHA-247): a scanner report, or a
+/// single secret on stdin. Secrets are never accepted as arguments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct InputArgs {
+    /// TruffleHog (JSON lines) or gitleaks (JSON) report to read.
+    #[arg(value_name = "REPORT", conflicts_with = "stdin")]
+    pub report: Option<PathBuf>,
+
+    /// Report format. Detected from the file when omitted.
+    #[arg(long, value_enum, value_name = "FORMAT", requires = "report")]
+    pub format: Option<ReportFormat>,
+
+    /// Read one secret from stdin instead of a report. An AWS key pair may
+    /// be given as KEY_ID:SECRET or on two lines.
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Provider of the stdin secret, skipping identification.
+    #[arg(long, value_name = "NAME", requires = "stdin")]
+    pub provider: Option<String>,
+}
+
 /// The four workflow commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Show what would be created, updated and revoked. Makes no changes.
-    Plan,
+    Plan(InputArgs),
     /// Create the replacement, update consumers, verify, then revoke.
-    Apply,
+    Apply(InputArgs),
     /// Restore the previous state where the provider allows it.
-    Rollback,
+    Rollback(InputArgs),
     /// Show in-progress rotations.
     Status,
 }
 
 impl Command {
     /// Name as typed on the command line.
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
-            Command::Plan => "plan",
-            Command::Apply => "apply",
-            Command::Rollback => "rollback",
+            Command::Plan(_) => "plan",
+            Command::Apply(_) => "apply",
+            Command::Rollback(_) => "rollback",
             Command::Status => "status",
+        }
+    }
+
+    /// The input arguments of a command that reads secrets.
+    pub fn input(&self) -> Option<&InputArgs> {
+        match self {
+            Command::Plan(input) | Command::Apply(input) | Command::Rollback(input) => Some(input),
+            Command::Status => None,
         }
     }
 }
@@ -90,7 +121,9 @@ impl Command {
 impl Cli {
     /// The subcommand to run, applying the `plan` default.
     pub fn subcommand(&self) -> Command {
-        self.subcommand.unwrap_or(Command::Plan)
+        self.subcommand
+            .clone()
+            .unwrap_or_else(|| Command::Plan(InputArgs::default()))
     }
 }
 
@@ -101,7 +134,7 @@ mod tests {
     #[test]
     fn no_subcommand_means_plan() {
         let cli = Cli::parse_from(["rotate"]);
-        assert_eq!(cli.subcommand(), Command::Plan);
+        assert_eq!(cli.subcommand(), Command::Plan(InputArgs::default()));
     }
 
     #[test]
@@ -109,7 +142,7 @@ mod tests {
         let cli = Cli::parse_from(["rotate", "-vv", "--json"]);
         assert_eq!(cli.global.verbose, 2);
         assert!(cli.global.json);
-        assert_eq!(cli.subcommand(), Command::Plan);
+        assert_eq!(cli.subcommand(), Command::Plan(InputArgs::default()));
     }
 
     #[test]
@@ -146,6 +179,39 @@ mod tests {
         );
         assert_eq!(overrides.overlap_window.unwrap().to_string(), "1h30m");
         assert!(Cli::try_parse_from(["rotate", "--overlap", "soon"]).is_err());
+    }
+
+    #[test]
+    fn input_args_parse() {
+        let cli = Cli::parse_from(["rotate", "plan", "report.json", "--format", "gitleaks"]);
+        let input = cli.subcommand().input().cloned().unwrap();
+        assert_eq!(
+            input.report.as_deref(),
+            Some(std::path::Path::new("report.json"))
+        );
+        assert_eq!(input.format, Some(ReportFormat::Gitleaks));
+        assert!(!input.stdin);
+
+        let cli = Cli::parse_from(["rotate", "apply", "--stdin", "--provider", "aws"]);
+        let input = cli.subcommand().input().cloned().unwrap();
+        assert!(input.stdin);
+        assert_eq!(input.provider.as_deref(), Some("aws"));
+        assert_eq!(
+            Cli::parse_from(["rotate", "status"]).subcommand().input(),
+            None
+        );
+    }
+
+    #[test]
+    fn input_args_conflicts() {
+        for args in [
+            vec!["rotate", "plan", "r.json", "--stdin"],
+            vec!["rotate", "plan", "--provider", "aws"],
+            vec!["rotate", "plan", "--format", "gitleaks"],
+            vec!["rotate", "plan", "r.json", "--format", "csv"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?} accepted");
+        }
     }
 
     #[test]

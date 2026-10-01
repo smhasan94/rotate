@@ -8,6 +8,11 @@ description = "Revoke and rotate leaked secrets safely, end to end"
 repository = "https://github.com/smhasan94/rotate"
 publish = false
 
+[features]
+# Registers mock providers under the real names so CLI tests can run end
+# to end before the real providers exist. Never enabled for releases.
+test-providers = []
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }

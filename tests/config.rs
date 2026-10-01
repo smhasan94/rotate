@@ -60,10 +60,10 @@ fn bad_overlap_env_exits_2() {
 fn valid_config_reaches_the_subcommand() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("rotate.yaml"), "overlap_window: 30m\n").unwrap();
-    // The subcommand itself is still a stub (SHA-250); reaching it proves the
-    // config loaded.
+    // `status` is still a stub (SHA-263) and needs no input; reaching it
+    // proves the config loaded.
     rotate_in(dir.path())
-        .arg("plan")
+        .arg("status")
         .assert()
-        .stderr(predicate::str::contains("rotate plan: not implemented"));
+        .stderr(predicate::str::contains("rotate status: not implemented"));
 }
