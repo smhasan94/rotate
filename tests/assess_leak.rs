@@ -82,7 +82,9 @@ async fn secret_never_reaches_output_or_logs() {
     const FAILING: &str = "failing_canary-3c5d-secret";
     const UNSUPPORTED: &str = "zzz_canary-4d6e-secret";
     const CANARY_AWS: &str = "awscanary_canary-5e7f-secret";
-    const KEY_ID_ONLY: &str = "AKIACANARY0000000000";
+    // Not AWS-shaped on purpose: only the gitleaks rule name matters here,
+    // and an AKIA-shaped literal trips GitHub secret scanning.
+    const KEY_ID_ONLY: &str = "keyid_canary-6f80-only";
     let secrets = [
         VALID,
         INVALID,
