@@ -56,11 +56,14 @@ Not done yet:
 - The four real providers. Until they land, a release build reports every
   secret as unsupported. Mock providers exist only behind the
   `test-providers` cargo feature, for tests.
-- The AWS Secrets Manager consumer. The GitHub Actions secrets consumer
-  exists (matches by name in the `consumers.github_actions.targets` repos
-  and orgs, writes sealed values with the operator token from
-  `ROTATE_GITHUB_TOKEN` or `GITHUB_TOKEN`), but the CLI does not pass it the
-  loaded config yet, so a release build does not search Actions secrets.
+- Passing the loaded config to the real consumers. Both are built in: the
+  GitHub Actions secrets consumer matches by name in the
+  `consumers.github_actions.targets` repos and orgs and writes sealed values
+  with the operator token from `ROTATE_GITHUB_TOKEN` or `GITHUB_TOKEN`; the
+  AWS Secrets Manager consumer reads the entries named or tagged under
+  `consumers.aws_secrets_manager`, matches by value (a plain value or a
+  top-level JSON string field) and writes a new version. The CLI does not
+  pass them `rotate.yaml` yet, so a release build searches neither.
 - `rotate apply`: `--force`, manual replacement mode (the rotation is
   skipped), resuming an interrupted or pending rotation, and `--json`.
 - `rotate rollback` and `rotate status`. These are stubs.

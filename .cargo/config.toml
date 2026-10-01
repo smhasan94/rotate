@@ -1,0 +1,4 @@
+# Resolve dependencies to versions that support the MSRV in Cargo.toml
+# (rust-version), so a fresh resolution never needs a newer compiler.
+[resolver]
+incompatible-rust-versions = "fallback"

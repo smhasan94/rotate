@@ -1,7 +1,8 @@
 //! The provider and consumer registries the CLI runs with.
 //!
 //! Real plugins register in builds without `test-providers`: the AWS
-//! provider (SHA-251) and the GitHub Actions secrets consumer (SHA-253).
+//! provider (SHA-251), the AWS Secrets Manager consumer (SHA-252) and the
+//! GitHub Actions secrets consumer (SHA-253).
 //! Constructing one makes no call and loads no credentials; that happens on
 //! first use. The `test-providers` feature instead registers
 //! `MockProvider`s under the four real names so integration tests can drive
@@ -10,7 +11,7 @@
 //! enable it, and nothing in this file reads the variable without it.
 
 use rotate::apply::Prompt;
-use rotate::config::{ConsumersConfig, GithubConfig};
+use rotate::config::{AwsConfig, ConsumersConfig, GithubConfig};
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -28,28 +29,44 @@ pub fn registry() -> ProviderRegistry {
 }
 
 /// Every consumer this build knows, with default settings: no Actions
-/// targets, so the GitHub Actions consumer makes no call. Callers with a
-/// loaded config use [`consumers_with`].
+/// targets and no Secrets Manager names or tags, so neither real consumer
+/// makes a call. Callers with a loaded config use [`consumers_with`].
 pub fn consumers() -> ConsumerRegistry {
-    consumers_with(&ConsumersConfig::default(), &GithubConfig::default())
+    consumers_with(
+        &ConsumersConfig::default(),
+        &GithubConfig::default(),
+        &AwsConfig::default(),
+    )
 }
 
 /// Every consumer this build knows, configured from `rotate.yaml`.
-/// Building the registry makes no network call.
+/// Building the registry makes no network call and loads no credentials.
 ///
 /// As with providers, real consumers and the scenario's mocks never share a
 /// registry: both use the real names, and the first registration of a name
 /// would win.
-pub fn consumers_with(config: &ConsumersConfig, github: &GithubConfig) -> ConsumerRegistry {
+pub fn consumers_with(
+    config: &ConsumersConfig,
+    github: &GithubConfig,
+    aws: &AwsConfig,
+) -> ConsumerRegistry {
     #[allow(unused_mut)]
     let mut registry = ConsumerRegistry::new();
     #[cfg(not(feature = "test-providers"))]
-    registry.register(std::sync::Arc::new(
-        rotate::consumer::github_actions::GithubActionsConsumer::from_config(config, github),
-    ));
+    {
+        registry.register(std::sync::Arc::new(
+            rotate::consumer::github_actions::GithubActionsConsumer::from_config(config, github),
+        ));
+        registry.register(std::sync::Arc::new(
+            rotate::consumer::aws_secrets_manager::SecretsManagerConsumer::new(
+                config.aws_secrets_manager.clone(),
+                aws.region.clone(),
+            ),
+        ));
+    }
     #[cfg(feature = "test-providers")]
     {
-        let _ = (config, github);
+        let _ = (config, github, aws);
         scenario::register_consumers(&mut registry);
     }
     registry

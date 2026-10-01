@@ -5,6 +5,7 @@
 //! secret, a Secrets Manager entry. `find` is read-only; the methods listed
 //! in [`MUTATING`] write to the real service.
 
+pub mod aws_secrets_manager;
 pub mod github_actions;
 pub mod mock;
 
