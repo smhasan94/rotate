@@ -44,8 +44,14 @@ Not done yet:
 - The four real providers. Until they land, a release build reports every
   secret as unsupported. Mock providers exist only behind the
   `test-providers` cargo feature, for tests.
-- Real consumers (GitHub Actions secrets, AWS Secrets Manager), so a
-  release build finds no consumers yet.
+- The GitHub Actions secrets consumer. The AWS Secrets Manager consumer is
+  built in: it reads the entries named or tagged under
+  `consumers.aws_secrets_manager` with `GetSecretValue`, matches by value
+  (a plain value, or a top-level JSON string field, plus the access key id
+  field for an AWS pair), and writes a new version with `PutSecretValue`.
+  It uses the standard AWS environment for credentials and makes no call
+  when that section is empty. Until the providers land, no secret reaches
+  it.
 - `rotate apply`, `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).

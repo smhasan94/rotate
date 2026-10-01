@@ -54,7 +54,8 @@ consumers:
       - key: team
         values: [payments]
     # For JSON secrets, the keys to compare and update. Omit to compare
-    # every top-level string value.
+    # every top-level string value. Other keys are kept as they are, and an
+    # AWS pair stored as two keys is updated in one new version.
     json_keys: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
 
 providers:

@@ -133,7 +133,7 @@ fn plan(
         Err(err) => return state_error(console, err),
     };
     let registry = providers::registry();
-    let consumers = providers::consumers();
+    let consumers = providers::consumers(config);
     let opts = AssessOptions {
         concurrency: usize::from(input.concurrency),
         force_provider: input
@@ -144,7 +144,7 @@ fn plan(
         ..AssessOptions::default()
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
     {
         Ok(runtime) => runtime,

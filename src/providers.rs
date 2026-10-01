@@ -7,6 +7,7 @@
 //! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
 //! enable it, and nothing in this file reads the variable without it.
 
+use rotate::config::Config;
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
@@ -19,12 +20,24 @@ pub fn registry() -> ProviderRegistry {
     registry
 }
 
-/// Every consumer this build knows.
-pub fn consumers() -> ConsumerRegistry {
-    #[allow(unused_mut)]
+/// Every consumer this build knows, configured from `config`. With
+/// `test-providers` the scenario's mocks are the only consumers, so CLI
+/// tests never reach a real service. The real consumers make no call until
+/// `find` runs (SHA-252).
+pub fn consumers(config: &Config) -> ConsumerRegistry {
     let mut registry = ConsumerRegistry::new();
     #[cfg(feature = "test-providers")]
-    scenario::register_consumers(&mut registry);
+    {
+        let _ = config;
+        scenario::register_consumers(&mut registry);
+    }
+    #[cfg(not(feature = "test-providers"))]
+    registry.register(std::sync::Arc::new(
+        rotate::consumer::aws_secrets_manager::SecretsManagerConsumer::new(
+            config.consumers.aws_secrets_manager.clone(),
+            config.providers.aws.region.clone(),
+        ),
+    ));
     registry
 }
 

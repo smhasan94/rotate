@@ -209,6 +209,14 @@ a place where a credential is stored for use.
   the server stores, the `new` one the suite writes, the `SecretRef` for
   `old` (with the name hints a by-name store needs) and a `MutationProbe`.
   `rotate::conformance::mock::consumer_fixture` is the reference wiring.
+- Register it in `providers::consumers(config)` for builds without
+  `test-providers`, configured from the `Config` it is given. Construction
+  must make no network call and load no credentials; build clients lazily
+  on the first call that needs them.
+- Put whatever `update` and `restore` need to find the value again into
+  `consumer_ref`: they may run in a later process, after an overlap window.
+  `consumer::aws_secrets_manager` is the example (field paths after `#`),
+  and `tests/sm_fake/` is a stateful wiremock fake of an AWS JSON service.
 
 `consumer::mock::MockConsumer` is the reference double. It shares
 `CallLog` with `MockProvider`, keeps the fingerprint each consumer holds
