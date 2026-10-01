@@ -1,0 +1,200 @@
+# Release binaries for Linux and macOS (SHA-215).
+#
+# A tag push `v*` builds four targets, checks the tag matches Cargo.toml,
+# and publishes a GitHub Release with four tarballs and SHA256SUMS, then
+# downloads them back and verifies them.
+#
+# A pull request that changes this workflow, or a manual run, does the same
+# build, smoke test, packaging and checksums but never publishes.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - ci/release-version.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  version:
+    # AC4: on a tag push, fail before anything is built or uploaded unless
+    # the tag is v<Cargo.toml version>.
+    name: version check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            ci/release-version.sh "$REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            ci/release-version.sh >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Native runners so every binary can run its own smoke test.
+          # Ubuntu 22.04 keeps the glibc requirement older.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # No features: the test-providers mocks never ship.
+      - name: cargo build
+        shell: bash
+        run: cargo build --release --locked --target "$TARGET"
+      - name: smoke test (AC3)
+        shell: bash
+        run: |
+          out=$("target/$TARGET/release/rotate" --version)
+          echo "$out"
+          if [[ "$out" != *" $VERSION" ]]; then
+            echo "expected --version to end with $VERSION"
+            exit 1
+          fi
+      - name: package
+        shell: bash
+        run: |
+          name="rotate-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/rotate" LICENSE "dist/$name/"
+          if [ -f README.md ]; then cp README.md "dist/$name/"; fi
+          (cd "dist/$name" && tar -czf "../$name.tar.gz" *)
+          tar -tzf "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS (AC2)
+        shell: bash
+        working-directory: dist
+        run: |
+          count=$(ls rotate-*.tar.gz | wc -l)
+          if [ "$count" -ne 4 ]; then
+            echo "expected 4 tarballs, found $count"
+            exit 1
+          fi
+          sha256sum rotate-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    # AC1. The only job with write access, and the only one that runs on a
+    # tag alone. No third-party actions here.
+    name: publish
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, build, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Every artifact of this run: the four tarballs and SHA256SUMS.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create release
+        shell: bash
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum -c SHA256SUMS
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            rotate-*.tar.gz SHA256SUMS
+
+  verify:
+    # T1 to T3 against the published release.
+    name: verify release
+    needs: [version, publish]
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: five assets (T1)
+        shell: bash
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | tee assets.txt
+          if [ "$(wc -l < assets.txt)" -ne 5 ]; then
+            echo "expected 5 assets"
+            exit 1
+          fi
+      - name: checksum (T2)
+        shell: bash
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "rotate-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
+            --pattern SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+      - name: --version (T3)
+        shell: bash
+        run: |
+          tar -xzf "rotate-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          out=$(./rotate --version)
+          echo "$out"
+          if [[ "$out" != *" $VERSION" ]]; then
+            echo "expected --version to end with $VERSION"
+            exit 1
+          fi
