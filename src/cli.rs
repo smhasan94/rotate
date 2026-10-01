@@ -105,13 +105,29 @@ impl Default for InputArgs {
     }
 }
 
+/// Arguments of `rotate apply` (SHA-254).
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct ApplyArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Confirm this rotation id from the plan instead of typing it.
+    /// Repeat for more rotations; only confirmed rotations run.
+    #[arg(long, value_name = "ROTATION_ID", conflicts_with = "all")]
+    pub confirm: Vec<String>,
+
+    /// Confirm every rotation in the plan with one prompt.
+    #[arg(long)]
+    pub all: bool,
+}
+
 /// The four workflow commands.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Show what would be created, updated and revoked. Makes no changes.
     Plan(InputArgs),
     /// Create the replacement, update consumers, verify, then revoke.
-    Apply(InputArgs),
+    Apply(ApplyArgs),
     /// Restore the previous state where the provider allows it.
     Rollback(InputArgs),
     /// Show in-progress rotations.
@@ -157,7 +173,8 @@ impl Command {
     /// The input arguments of a command that reads secrets.
     pub fn input(&self) -> Option<&InputArgs> {
         match self {
-            Command::Plan(input) | Command::Apply(input) | Command::Rollback(input) => Some(input),
+            Command::Plan(input) | Command::Rollback(input) => Some(input),
+            Command::Apply(args) => Some(&args.input),
             Command::Status => None,
             #[cfg(feature = "test-commands")]
             Command::TestConsole { .. } => None,
@@ -240,6 +257,10 @@ mod tests {
         assert!(!input.stdin);
 
         let cli = Cli::parse_from(["rotate", "apply", "--stdin", "--provider", "aws"]);
+        let Command::Apply(apply) = cli.subcommand() else {
+            panic!("not apply");
+        };
+        assert!(apply.confirm.is_empty() && !apply.all);
         let input = cli.subcommand().input().cloned().unwrap();
         assert!(input.stdin);
         assert_eq!(input.provider.as_deref(), Some("aws"));
@@ -261,6 +282,32 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?} accepted");
         }
+    }
+
+    #[test]
+    fn apply_confirm_flags() {
+        let cli = Cli::parse_from([
+            "rotate",
+            "apply",
+            "r.json",
+            "--confirm",
+            "rot-1",
+            "--confirm",
+            "rot-2",
+        ]);
+        let Command::Apply(apply) = cli.subcommand() else {
+            panic!("not apply");
+        };
+        assert_eq!(apply.confirm, ["rot-1", "rot-2"]);
+        assert!(Cli::parse_from(["rotate", "apply", "r.json", "--all"])
+            .subcommand()
+            .input()
+            .is_some());
+        assert!(
+            Cli::try_parse_from(["rotate", "apply", "r.json", "--all", "--confirm", "rot-1"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["rotate", "plan", "r.json", "--confirm", "rot-1"]).is_err());
     }
 
     #[test]
