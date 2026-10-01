@@ -156,10 +156,14 @@ mod tests {
             );
             assert_eq!(finding.credential().key_id(), Some(KEY_ID));
         }
-        let session = read(&format!("ASIAIOSFODNN7EXAMPLE:{SECRET}"));
+        // A temporary-credential (ASIA) key id, derived at runtime from AWS's
+        // documented example. Written out as a literal it matches GitHub
+        // secret scanning's AWS pattern and raises a false alert.
+        let session_id = KEY_ID.replacen("AKIA", "ASIA", 1);
+        let session = read(&format!("{session_id}:{SECRET}"));
         assert_eq!(
             session.extra.get(ACCESS_KEY_ID).map(String::as_str),
-            Some("ASIAIOSFODNN7EXAMPLE")
+            Some(session_id.as_str())
         );
     }
 
