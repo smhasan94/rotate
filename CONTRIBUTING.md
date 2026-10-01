@@ -65,6 +65,20 @@ with Apache-2.0 and rejects known advisories. If a new crate needs a license
 that is not on the allowlist, say why in the pull request and add a note
 here.
 
+HTTP, TLS and the AWS SDK (decided in SHA-273, see
+`docs/plans/SHA-273.md`):
+
+- `reqwest` uses `default-features = false` with `rustls-tls-native-roots`.
+  Certificates come from the OS trust store, so corporate TLS-inspecting
+  proxies and private CAs work. A minimal container image needs CA
+  certificates installed. The bundled-roots feature (`rustls-tls`) brings
+  `webpki-roots`, whose CDLA-Permissive-2.0 license is not on the allowlist.
+- The AWS SDK crates (`aws-config`, `aws-sdk-*`) use
+  `default-features = false` with `default-https-client` and `rt-tokio`
+  (plus `behavior-version-latest` on `aws-config`). Their default features
+  pull a legacy `hyper` 0.14 / `rustls` 0.21 stack with open advisories;
+  `deny.toml` bans it, so `cargo deny check` fails if it comes back.
+
 ## Writing tests
 
 Three kinds of test, and where each lives:
