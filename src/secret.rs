@@ -6,9 +6,13 @@
 //! [`SecretValue::expose_secret`]. [`SecretPair`] carries an AWS access key id
 //! next to its secret half.
 //!
+//! Every value of 8 bytes or more registers itself with the redaction
+//! registry while alive, so any copy that reaches a log is replaced by its
+//! fingerprint marker (SHA-218, [`crate::redact`]).
+//!
 //! What this module does not do: lock pages in memory, block core dumps, or
-//! scrub copies that other code makes. Those are Later tickets and the
-//! redaction layer (SHA-218) respectively.
+//! scrub copies that other code makes. The first two are Later tickets; the
+//! third is what the redaction layer is for.
 
 use std::fmt::{self, Write as _};
 use std::io::{self, Read};
@@ -19,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::redact::registry::Registration;
 
 /// Bytes reserved before reading a secret from a reader, so that a typical
 /// credential arrives without the buffer growing. Growth reallocates, and the
@@ -53,14 +59,29 @@ const FINGERPRINT_HEX_LEN: usize = 16;
 /// let json = serde_json::to_string(&secret.fingerprint()).unwrap();
 /// assert!(json.starts_with("\"sha256:"));
 /// ```
+///
+/// Building a value registers it with the redaction registry; the
+/// registration is shared by clones and released when the last one drops.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct SecretValue(Zeroizing<Vec<u8>>);
+pub struct SecretValue {
+    bytes: Zeroizing<Vec<u8>>,
+    #[zeroize(skip)]
+    registration: Option<Registration>,
+}
 
 impl SecretValue {
     /// Wraps the given bytes. The caller's original buffer is moved, not
     /// copied, when it is already a `Vec<u8>` or `String`.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(Zeroizing::new(bytes.into()))
+        Self::wrap(Zeroizing::new(bytes.into()))
+    }
+
+    fn wrap(bytes: Zeroizing<Vec<u8>>) -> Self {
+        let registration = Registration::new(&bytes);
+        Self {
+            bytes,
+            registration,
+        }
     }
 
     /// Reads the whole reader into a new secret.
@@ -71,7 +92,7 @@ impl SecretValue {
     pub fn from_reader(mut reader: impl Read) -> io::Result<Self> {
         let mut buf = Zeroizing::new(Vec::with_capacity(READ_RESERVE));
         reader.read_to_end(&mut buf)?;
-        Ok(Self(buf))
+        Ok(Self::wrap(buf))
     }
 
     /// Runs `f` on the secret bytes and returns its result.
@@ -79,30 +100,30 @@ impl SecretValue {
     /// Keep the closure small and never let the bytes escape it into a type
     /// that can be printed or serialized.
     pub fn expose_secret<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        f(&self.0)
+        f(&self.bytes)
     }
 
     /// Like [`expose_secret`](Self::expose_secret) but as `&str`, for
     /// providers that put the value in a header. Returns the UTF-8 error
     /// instead of calling `f` when the bytes are not valid UTF-8.
     pub fn expose_secret_str<R>(&self, f: impl FnOnce(&str) -> R) -> Result<R, Utf8Error> {
-        std::str::from_utf8(&self.0).map(f)
+        std::str::from_utf8(&self.bytes).map(f)
     }
 
     /// Length of the secret in bytes. Not itself sensitive for the high
     /// entropy tokens rotate handles.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 
     /// True when the secret holds no bytes.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.bytes.is_empty()
     }
 
     /// Stable one-way digest of the value (FR21), safe to print and store.
     pub fn fingerprint(&self) -> Fingerprint {
-        Fingerprint::of(&self.0)
+        Fingerprint::of(&self.bytes)
     }
 }
 
@@ -147,7 +168,7 @@ impl fmt::Display for SecretValue {
 /// attacker is after.
 impl PartialEq for SecretValue {
     fn eq(&self, other: &Self) -> bool {
-        self.0.as_slice().ct_eq(other.0.as_slice()).into()
+        self.bytes.as_slice().ct_eq(other.bytes.as_slice()).into()
     }
 }
 
@@ -345,18 +366,18 @@ mod tests {
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(PLAINTEXT.as_bytes());
         let mut secret = SecretValue::from(bytes);
-        let capacity = secret.0.capacity();
+        let capacity = secret.bytes.capacity();
         assert!(capacity >= 64, "test needs spare capacity");
 
         secret.zeroize();
 
-        assert!(secret.0.is_empty());
+        assert!(secret.bytes.is_empty());
         assert_eq!(
-            secret.0.capacity(),
+            secret.bytes.capacity(),
             capacity,
             "zeroize must keep the allocation"
         );
-        let ptr = secret.0.as_ptr();
+        let ptr = secret.bytes.as_ptr();
         // SAFETY: `secret` is alive and not mutated for the rest of this
         // function, the allocation spans `capacity` bytes, and every byte in
         // it was written by `zeroize` above, so the slice is initialized.

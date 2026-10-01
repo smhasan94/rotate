@@ -13,5 +13,6 @@ pub mod consumer;
 pub mod finding;
 pub mod input;
 pub mod provider;
+pub mod redact;
 pub mod report;
 pub mod secret;
