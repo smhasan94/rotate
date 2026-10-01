@@ -12,11 +12,13 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 
-use rotate::assess::{assess, render_json, render_table, AssessOptions};
+use rotate::assess::{assess, AssessOptions};
 use rotate::config::{Config, ConfigError};
 use rotate::console::{self, Console};
 use rotate::finding::Finding;
+use rotate::plan;
 use rotate::report::{read_report, ReportError};
+use rotate::state::{StateError, StateStore};
 
 use crate::cli::{Cli, Command, InputArgs};
 use crate::exit::Exit;
@@ -70,6 +72,9 @@ fn main() -> ExitCode {
     };
     #[cfg(not(feature = "test-commands"))]
     let result = run(&mut console, cli.subcommand(), &config, cli.global.json);
+    // Writes the mock call log when a test scenario asks for it; a no-op in
+    // release builds (SHA-250).
+    providers::finish();
     match result {
         Ok(exit) => exit.into(),
         Err(err) => {
@@ -92,7 +97,7 @@ fn install_logging(verbose: u8) {
 fn run(
     console: &mut Console,
     command: Command,
-    _config: &Config,
+    config: &Config,
     json: bool,
 ) -> Result<Exit, rotate::error::Error> {
     if let Some(input) = command.input() {
@@ -101,7 +106,7 @@ fn run(
             Err(exit) => return Ok(exit),
         };
         if let Command::Plan(_) = command {
-            return Ok(plan(console, findings, input, json));
+            return Ok(plan(console, findings, input, config, json));
         }
     }
     // Still stubs until their tickets land (SHA-254 apply, SHA-259
@@ -110,11 +115,25 @@ fn run(
     Ok(Exit::Usage)
 }
 
-/// Assesses the findings and prints the table or JSON (SHA-248). The
-/// planner (SHA-250) adds consumers and the rotation steps to this output.
-/// Unsupported and unknown rows are information, not failures: exit 0.
-fn plan(console: &mut Console, findings: Vec<Finding>, input: &InputArgs, json: bool) -> Exit {
+/// Builds the plan (SHA-250) and prints the table or JSON: assessment
+/// (SHA-248), then `find` on every consumer, then a `planned` record per new
+/// rotation in the state file. No state-changing remote call is made.
+/// Blockers and skipped rows are information, not failures: exit 0. A held
+/// or unusable state file exits 2 before any provider call; a plain I/O
+/// error writing it exits 1.
+fn plan(
+    console: &mut Console,
+    findings: Vec<Finding>,
+    input: &InputArgs,
+    config: &Config,
+    json: bool,
+) -> Exit {
+    let mut store = match StateStore::open(&config.state_file) {
+        Ok(store) => store,
+        Err(err) => return state_error(console, err),
+    };
     let registry = providers::registry();
+    let consumers = providers::consumers();
     let opts = AssessOptions {
         concurrency: usize::from(input.concurrency),
         force_provider: input
@@ -137,14 +156,39 @@ fn plan(console: &mut Console, findings: Vec<Finding>, input: &InputArgs, json: 
             return Exit::RotationFailed;
         }
     };
-    let assessed = runtime.block_on(assess(findings, &registry, &opts));
+    let mut plan = runtime.block_on(async {
+        let assessed = assess(findings, &registry, &opts).await;
+        plan::build(
+            assessed,
+            &registry,
+            &consumers,
+            config.overlap_window,
+            &config.consumers,
+        )
+        .await
+    });
+    if let Err(err) = plan::assign_ids(&mut plan, &mut store) {
+        return state_error(console, err);
+    }
+    drop(store);
     let rendered = if json {
-        render_json(&assessed) + "\n"
+        plan::render_json(&plan) + "\n"
     } else {
-        render_table(&assessed)
+        plan::render_table(&plan)
     };
     print_out(console, &rendered);
     Exit::Ok
+}
+
+/// Reports a state-store error: exit 2 for a held lock or an unusable file
+/// (the operator must act), exit 1 for a plain I/O failure.
+fn state_error(console: &mut Console, err: StateError) -> Exit {
+    let _ = writeln!(console.err(), "error: {err}");
+    if err.is_usage() {
+        Exit::Usage
+    } else {
+        Exit::RotationFailed
+    }
 }
 
 /// The single stdout print site for command output (plan table or JSON):
