@@ -28,18 +28,8 @@ pub fn registry() -> ProviderRegistry {
     registry
 }
 
-/// Every consumer this build knows, with default settings: no Actions
-/// targets and no Secrets Manager names or tags, so neither real consumer
-/// makes a call. Callers with a loaded config use [`consumers_with`].
-pub fn consumers() -> ConsumerRegistry {
-    consumers_with(
-        &ConsumersConfig::default(),
-        &GithubConfig::default(),
-        &AwsConfig::default(),
-    )
-}
-
-/// Every consumer this build knows, configured from `rotate.yaml`.
+/// Every consumer this build knows, configured from `rotate.yaml`. With
+/// empty consumer sections neither real consumer makes a call.
 /// Building the registry makes no network call and loads no credentials.
 ///
 /// As with providers, real consumers and the scenario's mocks never share a
