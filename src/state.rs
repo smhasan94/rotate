@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
+use crate::audit::AuditStep;
 use crate::fsutil::{self, FsError, LockFile};
 use crate::secret::Fingerprint;
 
@@ -119,6 +120,10 @@ pub struct Rotation {
     pub updated_at: OffsetDateTime,
     /// The operator passed `--force` (NFR5).
     pub force: bool,
+    /// The step that failed, while `step` is `failed` (SHA-256). Absent
+    /// otherwise, and in files written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<AuditStep>,
 }
 
 impl Rotation {
@@ -141,6 +146,7 @@ impl Rotation {
             started_at: now,
             updated_at: now,
             force: false,
+            failed_step: None,
         }
     }
 

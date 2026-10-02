@@ -119,6 +119,11 @@ pub struct ApplyArgs {
     /// Confirm every rotation in the plan with one prompt.
     #[arg(long)]
     pub all: bool,
+
+    /// Revoke even if some consumers could not be updated. Never skips a
+    /// failed create or verify. Recorded in the audit log with the actor.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// The four workflow commands.
