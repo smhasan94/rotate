@@ -83,11 +83,12 @@ What works now:
 
 Not done yet:
 
-- Rotating anything for real. The AWS provider cannot yet create, verify
-  or revoke keys, and the GitHub, npm and OpenAI providers do not exist, so
-  a release build can assess AWS keys but reports other secrets as
-  unsupported. Mock providers exist only behind the `test-providers` cargo
-  feature, for tests.
+- Rotating GitHub, npm and OpenAI secrets: those providers do not exist
+  yet, so a release build reports them as unsupported. The AWS IAM provider
+  is complete: validity with the leaked key's one `sts:GetCallerIdentity`
+  call, and scope, key creation, deactivation and reactivation with your
+  own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
+  providers exist only behind the `test-providers` cargo feature, for tests.
 - `rotate apply`: resuming an interrupted, failed or pending rotation (only
   a rotation held at `verified` can be re-run, to finish it with `--force`),
   and `--json`.
@@ -113,7 +114,7 @@ These hold for every change; a pull request that breaks one is not merged.
 
 ## Build from source
 
-Needs Rust stable (1.91 or newer).
+Needs Rust stable (1.94.1 or newer).
 
 ```sh
 git clone https://github.com/smhasan94/rotate.git
@@ -164,6 +165,8 @@ NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env
   gitleaks fields rotate reads.
 - [docs/rotate.example.yaml](docs/rotate.example.yaml): every config option
   with its default.
+- [docs/permissions.md](docs/permissions.md): the operator permissions each
+  provider needs.
 - [CONTRIBUTING.md](CONTRIBUTING.md): checks, branches, commits and pull
   requests.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
