@@ -279,7 +279,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         Ok(plan) => plan,
         Err(exit) => return exit,
     };
-    print_out(console, &plan::render_table(&plan));
+    print_out(console, &plan::render_apply_table(&plan));
     if plan.rotations.is_empty() {
         let _ = writeln!(console.err(), "Nothing to apply.");
         return Exit::Ok;
@@ -371,6 +371,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
             None => ReplacementSource::Prompt(prompt),
         };
         let mut executor = Executor::new(&registry, &consumers, &mut store, &mut audit)
+            .with_force(args.force)
             .with_manual(source, &mut *console);
         runtime.block_on(async {
             for rotation in &requested {

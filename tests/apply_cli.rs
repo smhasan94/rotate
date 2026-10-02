@@ -427,7 +427,7 @@ fn not_updatable_consumer_holds_before_revoke() {
     assert_eq!(run.state()["rotations"][0]["step"], "verified");
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(
-        out.contains("1 consumer not updated; revoke skipped"),
+        out.contains("1 consumer not updated (gha:org/repo:NPM_TOKEN); re-run with --force"),
         "{out}"
     );
 }

@@ -130,6 +130,11 @@ pub struct ApplyArgs {
     /// rotation.
     #[arg(long, value_name = "PATH")]
     pub replacement_file: Option<PathBuf>,
+
+    /// Revoke even if some consumers could not be updated. Never skips a
+    /// failed create or verify. Recorded in the audit log with the actor.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// The four workflow commands.

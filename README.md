@@ -45,9 +45,18 @@ What works now:
   consumer, verifies the replacement belongs to the same owner, and only
   then revokes the old secret. State is saved after every step and every
   step is appended to `.rotate/audit.jsonl`. Any failure before the revoke
-  stops that rotation, marks it `failed`, never revokes, and exits 1; a
-  consumer that cannot be updated holds the revoke. With an overlap window
-  above 0 the revoke is recorded as pending and apply exits 3.
+  stops that rotation, marks it `failed` with the step that failed, never
+  revokes, and exits 1; the summary says the old secret is still valid and
+  where every consumer stands (`updated`, `failed`, `skipped`,
+  `unchanged`). Other rotations in the run still go ahead. A consumer that
+  could not be updated (not updatable, or its update failed) holds the
+  revoke at `verified` and exits 1; re-run with `--force` to revoke anyway.
+  `--force` is recorded in the state file (`force: true`) and as one
+  `force` audit entry per consumer revoked past, with the actor, before the
+  revoke. It never skips a failed create or verify. If the revoke itself
+  fails, the summary says the replacement is live and the old secret may
+  still be valid. With an overlap window above 0 the revoke is recorded as
+  pending and apply exits 3.
 - Manual replacement mode, for providers whose API cannot mint a
   replacement (GitHub and npm tokens). Apply prints what to create, then
   asks you to paste the new secret with terminal echo turned off. It is
@@ -79,7 +88,8 @@ Not done yet:
   a release build can assess AWS keys but reports other secrets as
   unsupported. Mock providers exist only behind the `test-providers` cargo
   feature, for tests.
-- `rotate apply`: `--force`, resuming an interrupted or pending rotation,
+- `rotate apply`: resuming an interrupted, failed or pending rotation (only
+  a rotation held at `verified` can be re-run, to finish it with `--force`),
   and `--json`.
 - `rotate rollback` and `rotate status`. These are stubs.
 
