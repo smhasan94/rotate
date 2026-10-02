@@ -9,8 +9,10 @@
 //! Revoke is always the last step. Any error before it marks the rotation
 //! `failed` and returns without calling `revoke`; the old secret stays
 //! valid. [`revoke_gate`] holds the revoke while a consumer is not known to
-//! hold the replacement, and defers it while the overlap window is open
-//! (decision D2).
+//! hold the replacement, unless the operator passed `--force` (NFR5), and
+//! defers it while the overlap window is open (decision D2). `--force` never
+//! bypasses a failed create or verify; when it lets a revoke through, it is
+//! recorded in the state file and the audit log before the revoke (SHA-256).
 //!
 //! The replacement credential is a local of [`Executor::run`]: it is held in
 //! zeroized memory, registered with the redactor while alive, and dropped
@@ -34,7 +36,7 @@ use crate::audit::RedactedText;
 use crate::audit::{AuditError, AuditEvent, AuditLog, AuditStep, Outcome as AuditOutcome};
 use crate::consumer::ConsumerRegistry;
 use crate::plan::{Plan, PlannedRotation};
-use crate::provider::{ProviderRegistry, ReplacementMode};
+use crate::provider::{Provider, ProviderRegistry, ReplacementMode};
 use crate::secret::Fingerprint;
 use crate::state::{ConsumerState, ConsumerStatus, Rotation, StateError, StateStore, Step};
 
@@ -223,7 +225,9 @@ pub fn confirm(
 pub enum Ineligible {
     /// The provider needs the operator to paste the replacement (SHA-257).
     Manual,
-    /// An earlier apply left it at this step; resuming is SHA-258.
+    /// An earlier apply left it at this step; resuming is SHA-258. A
+    /// rotation at `verified` is not ineligible: it goes straight to the
+    /// revoke gate (SHA-256).
     InProgress(Step),
     /// The owner identity is unknown, so the replacement cannot be verified.
     NoScope,
@@ -250,7 +254,7 @@ pub fn eligibility(rotation: &PlannedRotation) -> Result<(), Ineligible> {
     if rotation.replacement_mode == ReplacementMode::Manual {
         return Err(Ineligible::Manual);
     }
-    if rotation.step != Step::Planned {
+    if !matches!(rotation.step, Step::Planned | Step::Verified) {
         return Err(Ineligible::InProgress(rotation.step));
     }
     if rotation.scope.is_none() {
@@ -270,28 +274,45 @@ pub enum Gate {
     Wait(OffsetDateTime),
 }
 
+/// The consumers that do not hold the replacement: the ref of every
+/// consumer not `updated` (skipped as not updatable, or whose update
+/// failed), then `<name> (not searched)` for every consumer whose `find`
+/// failed. These block the revoke unless `--force` is given (NFR5).
+pub fn not_updated(rotation: &PlannedRotation, consumers: &[ConsumerState]) -> Vec<String> {
+    consumers
+        .iter()
+        .filter(|c| c.status != ConsumerStatus::Updated)
+        .map(|c| c.consumer_ref.clone())
+        .chain(
+            rotation
+                .lookup_errors
+                .iter()
+                .map(|e| format!("{} (not searched)", e.consumer)),
+        )
+        .collect()
+}
+
 /// The single decision before `revoke`. Holds while any consumer was not
-/// updated or could not be searched; waits while the overlap window is open
-/// (decision D2). `--force` (SHA-256) and resume with `--wait` (SHA-258)
-/// change this function only.
+/// updated or could not be searched, unless `force`; waits while the
+/// overlap window is open (decision D2). Resume with `--wait` (SHA-258)
+/// changes this function only.
 pub fn revoke_gate(
     rotation: &PlannedRotation,
     consumers: &[ConsumerState],
     verified_at: OffsetDateTime,
+    force: bool,
 ) -> Gate {
-    let not_updated = consumers
-        .iter()
-        .filter(|c| c.status != ConsumerStatus::Updated)
-        .count()
-        + rotation.lookup_errors.len();
-    if not_updated > 0 {
-        let noun = if not_updated == 1 {
+    let blocked = not_updated(rotation, consumers);
+    if !blocked.is_empty() && !force {
+        let noun = if blocked.len() == 1 {
             "consumer"
         } else {
             "consumers"
         };
         return Gate::Hold(format!(
-            "{not_updated} {noun} not updated; revoke skipped, the old secret is still valid"
+            "{} {noun} not updated ({}); re-run with --force to revoke anyway; the old secret is still valid",
+            blocked.len(),
+            blocked.join(", ")
         ));
     }
     let window = rotation.overlap_window.as_duration();
@@ -341,6 +362,12 @@ pub struct Outcome {
     pub replacement_fingerprint: Option<Fingerprint>,
     /// Consumers touched.
     pub consumers: Vec<ConsumerState>,
+    /// Refs of planned consumers never touched: they still hold the old
+    /// secret.
+    pub unchanged: Vec<String>,
+    /// Consumers `--force` revoked past (see [`not_updated`]); empty unless
+    /// the force was used and recorded.
+    pub forced: Vec<String>,
     /// How it ended.
     pub result: RunResult,
 }
@@ -354,6 +381,8 @@ impl Outcome {
             fingerprint: rotation.fingerprint.clone(),
             replacement_fingerprint: None,
             consumers: Vec::new(),
+            unchanged: Vec::new(),
+            forced: Vec::new(),
             result: RunResult::Skipped(why),
         }
     }
@@ -403,6 +432,7 @@ pub struct Executor<'a> {
     store: &'a mut StateStore,
     audit: &'a mut AuditLog,
     clock: fn() -> OffsetDateTime,
+    force: bool,
 }
 
 impl fmt::Debug for Executor<'_> {
@@ -410,6 +440,7 @@ impl fmt::Debug for Executor<'_> {
         f.debug_struct("Executor")
             .field("providers", &self.providers)
             .field("consumers", &self.consumers)
+            .field("force", &self.force)
             .finish_non_exhaustive()
     }
 }
@@ -418,6 +449,7 @@ impl fmt::Debug for Executor<'_> {
 struct Progress {
     record: Rotation,
     provider: &'static str,
+    forced: Vec<String>,
 }
 
 impl<'a> Executor<'a> {
@@ -434,7 +466,15 @@ impl<'a> Executor<'a> {
             store,
             audit,
             clock: OffsetDateTime::now_utc,
+            force: false,
         }
+    }
+
+    /// `--force`: revoke even when some consumers were not updated
+    /// (NFR5). Never bypasses a failed create or verify.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
     }
 
     /// Uses `clock` for the overlap window instead of the system clock.
@@ -445,6 +485,8 @@ impl<'a> Executor<'a> {
 
     /// Runs one confirmed rotation: create, update every consumer, verify,
     /// revoke gate, revoke. Never calls `revoke` after an earlier failure.
+    /// A rotation already at `verified` (held by the gate on an earlier
+    /// run) goes straight to the gate with the consumers in the state file.
     /// The caller checks [`eligibility`] first; an ineligible rotation is
     /// returned as skipped without a call.
     pub async fn run(&mut self, rotation: &PlannedRotation) -> Outcome {
@@ -464,14 +506,30 @@ impl<'a> Executor<'a> {
                     )
                 }),
             provider: rotation.provider,
+            forced: Vec::new(),
         };
         let result = self.steps(rotation, &mut progress).await;
+        let unchanged = rotation
+            .consumers
+            .iter()
+            .map(|c| &c.found.consumer_ref)
+            .filter(|r| {
+                !progress
+                    .record
+                    .consumers
+                    .iter()
+                    .any(|c| &c.consumer_ref == *r)
+            })
+            .cloned()
+            .collect();
         Outcome {
             rotation_id: rotation.rotation_id.clone(),
             provider: rotation.provider,
             fingerprint: rotation.fingerprint.clone(),
             replacement_fingerprint: progress.record.replacement_fingerprint.clone(),
             consumers: progress.record.consumers.clone(),
+            unchanged,
+            forced: progress.forced,
             result,
         }
     }
@@ -488,6 +546,11 @@ impl<'a> Executor<'a> {
                 None,
             );
         };
+        if progress.record.step == Step::Verified {
+            // Held at the gate by an earlier run: nothing is created or
+            // updated again (SHA-256; other resumes are SHA-258).
+            return self.finish(rotation, provider.as_ref(), progress).await;
+        }
 
         // Create. The replacement lives in this frame only.
         let replacement = match provider.create_replacement(&rotation.credential).await {
@@ -559,12 +622,24 @@ impl<'a> Executor<'a> {
                         .record
                         .consumers
                         .push(state(ConsumerStatus::Failed));
-                    return self.fail(
-                        progress,
-                        AuditStep::Update,
-                        &format!("{reference}: {err}"),
-                        Some(&reference),
-                    );
+                    let error = format!("{reference}: {err}");
+                    if !self.force {
+                        return self.fail(progress, AuditStep::Update, &error, Some(&reference));
+                    }
+                    // --force: record it and keep updating the others. The
+                    // gate lists it among the consumers revoked past.
+                    let recorded = self.save(progress).and_then(|()| {
+                        self.event(
+                            progress,
+                            AuditStep::Update,
+                            AuditOutcome::Failed,
+                            Some(&reference),
+                            Some(&error),
+                        )
+                    });
+                    if let Err(err) = recorded {
+                        return self.fail(progress, AuditStep::Update, &err.to_string(), None);
+                    }
                 }
             }
         }
@@ -593,9 +668,30 @@ impl<'a> Executor<'a> {
             return self.fail(progress, AuditStep::Verify, &err.to_string(), None);
         }
         drop(replacement);
+        self.finish(rotation, provider.as_ref(), progress).await
+    }
 
-        // The gate, then revoke: always the last step.
-        match revoke_gate(rotation, &progress.record.consumers, (self.clock)()) {
+    /// The revoke gate, the force record, then revoke: always the last
+    /// step. Runs only once the replacement is verified.
+    async fn finish(
+        &mut self,
+        rotation: &PlannedRotation,
+        provider: &dyn Provider,
+        progress: &mut Progress,
+    ) -> RunResult {
+        let gate = revoke_gate(
+            rotation,
+            &progress.record.consumers,
+            (self.clock)(),
+            self.force,
+        );
+        if !matches!(gate, Gate::Hold(_)) && self.force {
+            // NFR5: the force is on record before anything is revoked.
+            if let Err(err) = self.record_force(rotation, progress) {
+                return self.fail(progress, AuditStep::Force, &err.to_string(), None);
+            }
+        }
+        match gate {
             Gate::Revoke => {}
             Gate::Hold(reason) => {
                 if let Err(err) = self.event(
@@ -635,6 +731,34 @@ impl<'a> Executor<'a> {
             };
         }
         RunResult::Revoked
+    }
+
+    /// Records `--force` when it lets the revoke through past consumers
+    /// that do not hold the replacement: `force: true` in the state file,
+    /// then one `force` audit entry per such consumer (the log stamps the
+    /// actor). Nothing is recorded when nothing was bypassed.
+    fn record_force(
+        &mut self,
+        rotation: &PlannedRotation,
+        progress: &mut Progress,
+    ) -> Result<(), RecordError> {
+        let bypassed = not_updated(rotation, &progress.record.consumers);
+        if bypassed.is_empty() {
+            return Ok(());
+        }
+        progress.record.force = true;
+        self.save(progress)?;
+        for consumer in &bypassed {
+            self.event(
+                progress,
+                AuditStep::Force,
+                AuditOutcome::Ok,
+                Some(consumer),
+                None,
+            )?;
+        }
+        progress.forced = bypassed;
+        Ok(())
     }
 
     /// Saves the record, then appends an ok entry for `step`.
@@ -693,6 +817,7 @@ impl<'a> Executor<'a> {
         consumer: Option<&str>,
     ) -> RunResult {
         progress.record.step = Step::Failed;
+        progress.record.failed_step = Some(step);
         let recorded = self
             .save(progress)
             .and_then(|()| self.event(progress, step, AuditOutcome::Failed, consumer, Some(error)));
@@ -744,6 +869,29 @@ fn audit_step_name(step: AuditStep) -> &'static str {
     }
 }
 
+/// `<ref> updated, <ref> failed, <ref> unchanged`: where every consumer of a
+/// rotation that stopped before revoke stands. `none` when it has none.
+fn consumer_statuses(o: &Outcome) -> String {
+    let parts: Vec<String> = o
+        .consumers
+        .iter()
+        .map(|c| {
+            let status = match c.status {
+                ConsumerStatus::Updated => "updated",
+                ConsumerStatus::Failed => "failed",
+                ConsumerStatus::Skipped => "skipped",
+            };
+            format!("{} {status}", c.consumer_ref)
+        })
+        .chain(o.unchanged.iter().map(|r| format!("{r} unchanged")))
+        .collect();
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// The summary printed after apply: one line per rotation with its outcome,
 /// then a line per failure or hold explaining it.
 pub fn render_summary(outcomes: &[Outcome]) -> String {
@@ -777,7 +925,15 @@ pub fn render_summary(outcomes: &[Outcome]) -> String {
             .iter()
             .filter(|c| c.status == ConsumerStatus::Updated)
             .count();
+        if !o.forced.is_empty() {
+            notes.push(format!(
+                "{}: --force used; not updated: {}",
+                o.rotation_id,
+                o.forced.join(", ")
+            ));
+        }
         let outcome = match &o.result {
+            RunResult::Revoked if !o.forced.is_empty() => "revoked (forced)".to_owned(),
             RunResult::Revoked => "revoked".to_owned(),
             RunResult::PendingRevoke { not_before } => {
                 let when = not_before
@@ -795,9 +951,12 @@ pub fn render_summary(outcomes: &[Outcome]) -> String {
             }
             RunResult::Failed { step, error } => {
                 let tail = if *step == AuditStep::Revoke {
-                    ""
+                    String::new()
                 } else {
-                    "; stopped before revoke, the old secret is still valid"
+                    format!(
+                        "; stopped before revoke; old secret still valid; consumers: {}",
+                        consumer_statuses(o)
+                    )
                 };
                 notes.push(format!(
                     "{}: {} failed: {error}{tail}",
@@ -1180,18 +1339,249 @@ mod tests {
         };
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            revoke_gate(&rotation, &[status(ConsumerStatus::Updated)], now),
+            revoke_gate(&rotation, &[status(ConsumerStatus::Updated)], now, false),
             Gate::Revoke
         );
+        for blocked in [ConsumerStatus::Skipped, ConsumerStatus::Failed] {
+            let Gate::Hold(reason) = revoke_gate(&rotation, &[status(blocked)], now, false) else {
+                panic!("{blocked:?} did not hold");
+            };
+            assert!(
+                reason.starts_with("1 consumer not updated (c:1); re-run with --force"),
+                "{reason}"
+            );
+            assert_eq!(
+                revoke_gate(&rotation, &[status(blocked)], now, true),
+                Gate::Revoke
+            );
+        }
+        let mut unsearched = rotation.clone();
+        unsearched.lookup_errors.push(crate::plan::LookupError {
+            consumer: "github-actions",
+            error: "403".into(),
+        });
+        assert_eq!(
+            not_updated(&unsearched, &[status(ConsumerStatus::Skipped)]),
+            ["c:1", "github-actions (not searched)"]
+        );
         assert!(matches!(
-            revoke_gate(&rotation, &[status(ConsumerStatus::Skipped)], now),
-            Gate::Hold(_)
+            revoke_gate(&unsearched, &[], now, false),
+            Gate::Hold(ref r) if r.starts_with("1 consumer not updated (github-actions (not searched))")
         ));
         let mut waiting = rotation.clone();
         waiting.overlap_window = "1h".parse().unwrap();
         assert_eq!(
-            revoke_gate(&waiting, &[], now),
+            revoke_gate(&waiting, &[], now, false),
             Gate::Wait(now + std::time::Duration::from_secs(3600))
         );
+        assert_eq!(
+            revoke_gate(&waiting, &[status(ConsumerStatus::Skipped)], now, true),
+            Gate::Wait(now + std::time::Duration::from_secs(3600))
+        );
+    }
+
+    async fn run_forced(f: &mut Fixture, plan: &Plan) -> Outcome {
+        let mut executor =
+            Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit).with_force(true);
+        executor.run(&plan.rotations[0]).await
+    }
+
+    fn audit_steps(f: &Fixture) -> Vec<(AuditStep, AuditOutcome, Option<String>)> {
+        crate::audit::read_all(&f.audit_path)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.step, e.outcome, e.consumer)
+            })
+            .collect()
+    }
+
+    fn add_blocked(f: &mut Fixture, value: &str) {
+        let blocked = Arc::new(
+            MockConsumer::new("blocked")
+                .matching(
+                    fp(value),
+                    ConsumerMatch::by_name("gha:org:NPM_TOKEN").not_updatable("needs admin"),
+                )
+                .log(f.log.clone()),
+        );
+        f.consumers.register(blocked);
+    }
+
+    // T1 (AC1), T7 (AC7)
+    #[tokio::test]
+    async fn update_failure_without_force_stops_at_once() {
+        let value = "npm_apply_unit_update_stop";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "0s").await;
+        f.gha
+            .fail_always("update", ConsumerError::Permanent("403 denied".into()));
+        let outcome = run(&mut f, &plan).await;
+        assert_eq!(
+            mutating(&f.log),
+            ["npm.create_replacement", "github-actions.update"]
+        );
+        assert_eq!(f.sm.current("sm:prod/npm"), Some(fp(value)));
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::Failed);
+        assert_eq!(stored.failed_step, Some(AuditStep::Update));
+        assert!(!stored.force);
+        assert_eq!(outcome.unchanged, ["sm:prod/npm"]);
+        let summary = render_summary(std::slice::from_ref(&outcome));
+        assert!(
+            summary.contains(
+                "update failed: gha:org/repo:NPM_TOKEN: 403 denied; stopped before revoke; \
+                 old secret still valid; consumers: gha:org/repo:NPM_TOKEN failed, sm:prod/npm unchanged"
+            ),
+            "{summary}"
+        );
+        assert_eq!(run_status(&[outcome]), RunStatus::Failed);
+    }
+
+    // T2 (AC2), T7 (AC7): --force never bypasses a failed create or verify.
+    #[tokio::test]
+    async fn force_never_bypasses_create_or_verify() {
+        for method in ["create_replacement", "verify"] {
+            let value = format!("npm_apply_unit_force_{method}");
+            let mut f = fixture(&value, MockProvider::new("npm"));
+            add_blocked(&mut f, &value);
+            let plan = plan(&mut f, &value, "0s").await;
+            f.provider
+                .fail_always(method, ProviderError::Permanent("denied".into()));
+            let outcome = run_forced(&mut f, &plan).await;
+            assert!(
+                matches!(outcome.result, RunResult::Failed { .. }),
+                "{method}"
+            );
+            assert!(f.log.calls().iter().all(|c| c.method != "revoke"));
+            let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+            assert!(!stored.force, "{method}");
+            assert!(outcome.forced.is_empty());
+            assert!(audit_steps(&f).iter().all(|e| e.0 != AuditStep::Force));
+            if method == "create_replacement" {
+                assert!(f.log.calls().iter().all(|c| c.method != "update"));
+                assert_eq!(f.gha.current("gha:org/repo:NPM_TOKEN"), Some(fp(&value)));
+                assert_eq!(stored.failed_step, Some(AuditStep::Create));
+            } else {
+                assert_eq!(stored.failed_step, Some(AuditStep::Verify));
+            }
+        }
+    }
+
+    // T4 (AC4)
+    #[tokio::test]
+    async fn force_records_state_and_audit_before_revoke() {
+        let value = "npm_apply_unit_force_record";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        add_blocked(&mut f, value);
+        let plan = plan(&mut f, value, "0s").await;
+        let outcome = run_forced(&mut f, &plan).await;
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert_eq!(outcome.forced, ["gha:org:NPM_TOKEN"]);
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert!(stored.force);
+        assert_eq!(stored.step, Step::Revoked);
+        let steps = audit_steps(&f);
+        let force = steps
+            .iter()
+            .position(|e| e.0 == AuditStep::Force)
+            .expect("force entry");
+        assert_eq!(steps[force].2.as_deref(), Some("gha:org:NPM_TOKEN"));
+        assert_eq!(steps.last().unwrap().0, AuditStep::Revoke);
+        assert!(force < steps.len() - 1);
+        let summary = render_summary(&[outcome]);
+        assert!(summary.contains("revoked (forced)"), "{summary}");
+        assert!(summary.contains("--force used; not updated: gha:org:NPM_TOKEN"));
+    }
+
+    // With nothing to bypass, --force changes and records nothing.
+    #[tokio::test]
+    async fn unneeded_force_is_not_recorded() {
+        let value = "npm_apply_unit_force_unneeded";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "0s").await;
+        let outcome = run_forced(&mut f, &plan).await;
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert!(!f.store.get(&plan.rotations[0].rotation_id).unwrap().force);
+        assert!(audit_steps(&f).iter().all(|e| e.0 != AuditStep::Force));
+    }
+
+    // T4 (AC4): a failed update is one of the consumers --force revokes past.
+    #[tokio::test]
+    async fn force_past_failed_update() {
+        let value = "npm_apply_unit_force_update";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "0s").await;
+        f.gha
+            .fail_always("update", ConsumerError::Permanent("403 denied".into()));
+        let outcome = run_forced(&mut f, &plan).await;
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert_eq!(
+            mutating(&f.log),
+            [
+                "npm.create_replacement",
+                "github-actions.update",
+                "aws-secrets-manager.update",
+                "npm.verify",
+                "npm.revoke",
+            ]
+        );
+        assert_eq!(outcome.forced, ["gha:org/repo:NPM_TOKEN"]);
+        let steps = audit_steps(&f);
+        assert!(steps.contains(&(
+            AuditStep::Update,
+            AuditOutcome::Failed,
+            Some("gha:org/repo:NPM_TOKEN".into())
+        )));
+        assert!(steps.contains(&(
+            AuditStep::Force,
+            AuditOutcome::Ok,
+            Some("gha:org/repo:NPM_TOKEN".into())
+        )));
+    }
+
+    // AC3 then AC4: a held rotation is finished by a re-run with --force,
+    // without creating or updating again.
+    #[tokio::test]
+    async fn held_rotation_finishes_with_force() {
+        let value = "npm_apply_unit_held_rerun";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        add_blocked(&mut f, value);
+        let mut plan = plan(&mut f, value, "0s").await;
+        let held = run(&mut f, &plan).await;
+        assert!(matches!(held.result, RunResult::Held { .. }));
+        f.log.clear();
+
+        plan.rotations[0].step = Step::Verified;
+        assert_eq!(eligibility(&plan.rotations[0]), Ok(()));
+        let again = run(&mut f, &plan).await;
+        assert!(matches!(again.result, RunResult::Held { .. }));
+        assert!(mutating(&f.log).is_empty(), "{:?}", mutating(&f.log));
+
+        let outcome = run_forced(&mut f, &plan).await;
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert_eq!(mutating(&f.log), ["npm.revoke"]);
+        assert!(f.store.get(&plan.rotations[0].rotation_id).unwrap().force);
+    }
+
+    // T6 (AC6)
+    #[tokio::test]
+    async fn revoke_failure_says_replacement_is_live() {
+        let value = "npm_apply_unit_revoke_fail";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "0s").await;
+        f.provider
+            .fail_always("revoke", ProviderError::Permanent("denied".into()));
+        let outcome = run(&mut f, &plan).await;
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::Failed);
+        assert_eq!(stored.failed_step, Some(AuditStep::Revoke));
+        let summary = render_summary(std::slice::from_ref(&outcome));
+        assert!(
+            summary.contains("the replacement is live and the old secret may still be valid"),
+            "{summary}"
+        );
+        assert!(!summary.contains("stopped before revoke"));
+        assert_eq!(run_status(&[outcome]), RunStatus::Failed);
     }
 }
