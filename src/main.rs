@@ -199,7 +199,7 @@ fn plan(
         Ok(store) => store,
         Err(err) => return state_error(console, err),
     };
-    let registry = providers::registry();
+    let registry = providers::registry_with(&config.providers);
     let consumers = providers::consumers_with(
         &config.consumers,
         &config.providers.github,
@@ -243,7 +243,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         Ok(store) => store,
         Err(err) => return state_error(console, err),
     };
-    let registry = providers::registry();
+    let registry = providers::registry_with(&config.providers);
     let consumers = providers::consumers_with(
         &config.consumers,
         &config.providers.github,

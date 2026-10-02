@@ -11,21 +11,40 @@
 //! enable it, and nothing in this file reads the variable without it.
 
 use rotate::apply::Prompt;
-use rotate::config::{AwsConfig, ConsumersConfig, GithubConfig};
+use rotate::config::{AwsConfig, ConsumersConfig, GithubConfig, ProvidersConfig};
 use rotate::consumer::ConsumerRegistry;
 use rotate::provider::ProviderRegistry;
 
-/// Every provider this build knows.
+/// Every provider this build knows, with default settings: enough to list
+/// the provider names. Callers with a loaded config use [`registry_with`].
 pub fn registry() -> ProviderRegistry {
+    registry_with(&ProvidersConfig::default())
+}
+
+/// Every provider this build knows, configured from `rotate.yaml`
+/// (`providers.aws.region`). Building the registry makes no network call
+/// and loads no credentials.
+pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
     #[allow(unused_mut)]
     let mut registry = ProviderRegistry::new();
     #[cfg(feature = "test-providers")]
-    scenario::register_providers(&mut registry);
+    {
+        let _ = config;
+        scenario::register_providers(&mut registry);
+    }
     #[cfg(not(feature = "test-providers"))]
-    registry.register(std::sync::Arc::new(
-        rotate::provider::aws::AwsProvider::new(),
-    ));
+    registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
     registry
+}
+
+/// The AWS provider with the configured region, if any.
+#[cfg(any(test, not(feature = "test-providers")))]
+fn aws_provider(config: &AwsConfig) -> rotate::provider::aws::AwsProvider {
+    let provider = rotate::provider::aws::AwsProvider::new();
+    match &config.region {
+        Some(region) => provider.with_region(region.clone()),
+        None => provider,
+    }
 }
 
 /// Every consumer this build knows, configured from `rotate.yaml`. With
@@ -341,5 +360,28 @@ mod scenario {
         }
         std::fs::write(path, text)
             .unwrap_or_else(|err| panic!("{ENV}: cannot write the call log: {err}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aws_region_comes_from_config() {
+        let mut config = AwsConfig::default();
+        let debug = format!("{:?}", aws_provider(&config));
+        assert!(debug.contains("region: None"), "{debug}");
+        config.region = Some("eu-west-1".into());
+        let debug = format!("{:?}", aws_provider(&config));
+        assert!(debug.contains("region: Some(\"eu-west-1\")"), "{debug}");
+    }
+
+    #[test]
+    fn registry_with_registers_aws() {
+        let mut config = ProvidersConfig::default();
+        config.aws.region = Some("eu-west-1".into());
+        assert!(registry_with(&config).get("aws").is_some());
+        assert!(registry().get("aws").is_some());
     }
 }
