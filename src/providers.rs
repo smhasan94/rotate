@@ -9,8 +9,11 @@
 //! first use. The `test-providers` feature instead registers
 //! `MockProvider`s under the four real names so integration tests can drive
 //! the CLI end to end, and lets a test describe a scenario in a JSON file
-//! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). Release builds never
-//! enable it, and nothing in this file reads the variable without it.
+//! named by `ROTATE_TEST_SCENARIO` (see [`scenario`]). A scenario with
+//! `"real_plugins": true` gets the real plugins instead, registered exactly
+//! as a release build registers them, so end-to-end tests can drive them
+//! against a local server (SHA-264). Release builds never enable the
+//! feature, and nothing in this file reads the variable without it.
 
 use rotate::apply::Prompt;
 use rotate::config::{AwsConfig, ConsumersConfig, GithubConfig, ProvidersConfig};
@@ -28,42 +31,54 @@ pub fn registry() -> ProviderRegistry {
 /// `providers.npm.registry`). Building the
 /// registry makes no network call and loads no credentials.
 pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
-    #[allow(unused_mut)]
     let mut registry = ProviderRegistry::new();
     #[cfg(feature = "test-providers")]
-    {
-        let _ = config;
+    if !scenario::real_plugins() {
         scenario::register_providers(&mut registry);
+        return registry;
     }
-    #[cfg(not(feature = "test-providers"))]
-    {
-        registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
-        registry.register(std::sync::Arc::new(github_provider(&config.github)));
-        registry.register(std::sync::Arc::new(npm_provider(&config.npm)));
-    }
+    registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
+    registry.register(std::sync::Arc::new(github_provider(&config.github)));
+    registry.register(std::sync::Arc::new(npm_provider(&config.npm)));
     registry
 }
 
 /// The GitHub token provider (SHA-260) for the configured API URL.
-#[cfg(any(test, not(feature = "test-providers")))]
 fn github_provider(config: &GithubConfig) -> rotate::provider::github::GithubProvider {
     rotate::provider::github::GithubProvider::new(config.api_url.as_str())
 }
 
 /// The npm token provider (SHA-261) for the configured registry. The
 /// operator token is read from the environment on first use.
-#[cfg(any(test, not(feature = "test-providers")))]
 fn npm_provider(config: &rotate::config::NpmConfig) -> rotate::provider::npm::NpmProvider {
     rotate::provider::npm::NpmProvider::new(config.registry.as_str())
 }
 
-/// The AWS provider with the configured region, if any.
-#[cfg(any(test, not(feature = "test-providers")))]
+/// The AWS provider with the configured region and endpoint, if any.
 fn aws_provider(config: &AwsConfig) -> rotate::provider::aws::AwsProvider {
-    let provider = rotate::provider::aws::AwsProvider::new();
-    match &config.region {
-        Some(region) => provider.with_region(region.clone()),
-        None => provider,
+    let mut provider = rotate::provider::aws::AwsProvider::new();
+    if let Some(region) = &config.region {
+        provider = provider.with_region(region.clone());
+    }
+    if let Some(url) = &config.endpoint_url {
+        provider = provider.with_endpoint_url(url.as_str());
+    }
+    provider
+}
+
+/// The Secrets Manager consumer (SHA-252) with the configured region and
+/// endpoint, if any.
+fn secrets_manager(
+    config: &ConsumersConfig,
+    aws: &AwsConfig,
+) -> rotate::consumer::aws_secrets_manager::SecretsManagerConsumer {
+    let consumer = rotate::consumer::aws_secrets_manager::SecretsManagerConsumer::new(
+        config.aws_secrets_manager.clone(),
+        aws.region.clone(),
+    );
+    match &aws.endpoint_url {
+        Some(url) => consumer.with_endpoint_url(url.as_str()),
+        None => consumer,
     }
 }
 
@@ -79,25 +94,16 @@ pub fn consumers_with(
     github: &GithubConfig,
     aws: &AwsConfig,
 ) -> ConsumerRegistry {
-    #[allow(unused_mut)]
     let mut registry = ConsumerRegistry::new();
-    #[cfg(not(feature = "test-providers"))]
-    {
-        registry.register(std::sync::Arc::new(
-            rotate::consumer::github_actions::GithubActionsConsumer::from_config(config, github),
-        ));
-        registry.register(std::sync::Arc::new(
-            rotate::consumer::aws_secrets_manager::SecretsManagerConsumer::new(
-                config.aws_secrets_manager.clone(),
-                aws.region.clone(),
-            ),
-        ));
-    }
     #[cfg(feature = "test-providers")]
-    {
-        let _ = (config, github, aws);
+    if !scenario::real_plugins() {
         scenario::register_consumers(&mut registry);
+        return registry;
     }
+    registry.register(std::sync::Arc::new(
+        rotate::consumer::github_actions::GithubActionsConsumer::from_config(config, github),
+    ));
+    registry.register(std::sync::Arc::new(secrets_manager(config, aws)));
     registry
 }
 
@@ -145,6 +151,9 @@ pub fn finish() {
 /// prompt; `providers.<name>.foreign` lists fingerprints that `verify`
 /// reports as belonging to another identity.
 ///
+/// For end-to-end tests of the real plugins (SHA-264): `real_plugins:
+/// true` registers them instead of mocks; only `prompt` applies then.
+///
 /// For rollback (SHA-259): `providers.<name>.restore` is `"unsupported"` to
 /// make `restore` return `Unsupported`; each call-log line also has
 /// `reference`, the consumer ref, restore handle or replacement ref the
@@ -184,6 +193,10 @@ mod scenario {
         call_log: Option<PathBuf>,
         consumer_state: Option<PathBuf>,
         prompt: Option<serde_json::Value>,
+        /// Register the real plugins, as a release build does, instead of
+        /// mocks (SHA-264). Only `prompt` applies then.
+        #[serde(default)]
+        real_plugins: bool,
     }
 
     #[derive(Default, Deserialize)]
@@ -244,6 +257,11 @@ mod scenario {
                 consumers: Mutex::new(Vec::new()),
             }
         })
+    }
+
+    /// True when the scenario asks for the real plugins (SHA-264).
+    pub fn real_plugins() -> bool {
+        loaded().scenario.real_plugins
     }
 
     pub fn register_providers(registry: &mut ProviderRegistry) {
@@ -443,6 +461,20 @@ mod tests {
         config.region = Some("eu-west-1".into());
         let debug = format!("{:?}", aws_provider(&config));
         assert!(debug.contains("region: Some(\"eu-west-1\")"), "{debug}");
+    }
+
+    #[test]
+    fn aws_endpoint_url_comes_from_config() {
+        let mut aws = AwsConfig::default();
+        let consumers = ConsumersConfig::default();
+        assert!(format!("{:?}", aws_provider(&aws)).contains("endpoint_url: None"));
+        assert!(format!("{:?}", secrets_manager(&consumers, &aws)).contains("endpoint_url: None"));
+        aws = serde_norway::from_str("endpoint_url: http://127.0.0.1:4566\n").unwrap();
+        let shown = "endpoint_url: Some(\"http://127.0.0.1:4566\")";
+        let debug = format!("{:?}", aws_provider(&aws));
+        assert!(debug.contains(shown), "{debug}");
+        let debug = format!("{:?}", secrets_manager(&consumers, &aws));
+        assert!(debug.contains(shown), "{debug}");
     }
 
     #[test]
