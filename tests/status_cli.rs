@@ -38,7 +38,9 @@ fn canary() -> String {
 }
 
 fn at(offset: Duration) -> String {
-    (OffsetDateTime::now_utc() + offset).format(&Rfc3339).unwrap()
+    (OffsetDateTime::now_utc() + offset)
+        .format(&Rfc3339)
+        .unwrap()
 }
 
 struct Run {
@@ -290,7 +292,10 @@ fn failed_with_canary(run: &Run) {
             "npm_status-f",
             "update",
             "failed",
-            Some(&format!("PutSecretValue denied: upstream echoed {}", canary())),
+            Some(&format!(
+                "PutSecretValue denied: upstream echoed {}",
+                canary()
+            )),
         ),
     ]);
 }
@@ -409,7 +414,10 @@ fn t5_json_rows_match_schema_and_table() {
 
     let planned = &rows[2];
     assert_eq!(planned["pending"], false);
-    assert_eq!(planned["hint"], "not started: run `rotate apply` to start it");
+    assert_eq!(
+        planned["hint"],
+        "not started: run `rotate apply` to start it"
+    );
 
     // The table shows the same rows with the same hints.
     let output = run.run(&["status"]);
@@ -563,7 +571,11 @@ fn t7_no_secret_in_any_output() {
         .collect();
     let mut leftovers = leftovers;
     leftovers.sort();
-    assert_eq!(leftovers, ["audit.jsonl", "state.json"], "status wrote a file");
+    assert_eq!(
+        leftovers,
+        ["audit.jsonl", "state.json"],
+        "status wrote a file"
+    );
 }
 
 #[test]
@@ -579,7 +591,9 @@ fn rollback_in_progress_of_revoked_is_listed_and_pending() {
     let line = row(&table, "rot-000000rb");
     assert!(line.contains("rolling_back (revoked)"), "{line}");
     assert!(
-        line.contains("rollback in progress: re-run `rotate rollback` with the same input to finish it"),
+        line.contains(
+            "rollback in progress: re-run `rotate rollback` with the same input to finish it"
+        ),
         "{line}"
     );
 }
@@ -589,7 +603,10 @@ fn needs_rollback_and_planned_hints() {
     let run = Run::new();
     let mut nr = rotation("rot-00000001", "npm_status-nr", "needs_rollback");
     nr["failed_step"] = json!("update");
-    run.seed(json!([nr, rotation("rot-00000002", "npm_status-pl", "planned")]));
+    run.seed(json!([
+        nr,
+        rotation("rot-00000002", "npm_status-pl", "planned")
+    ]));
     let output = run.run(&["status"]);
     assert_eq!(output.status.code(), Some(3), "{}", shown(&output));
     let table = stdout(&output);
@@ -598,7 +615,11 @@ fn needs_rollback_and_planned_hints() {
     assert!(row(&table, "rot-00000002").contains("not started"));
 
     // Only planned: listed, but nothing is pending.
-    run.seed(json!([rotation("rot-00000002", "npm_status-pl", "planned")]));
+    run.seed(json!([rotation(
+        "rot-00000002",
+        "npm_status-pl",
+        "planned"
+    )]));
     let output = run.run(&["status"]);
     assert_eq!(output.status.code(), Some(0), "{}", shown(&output));
 }

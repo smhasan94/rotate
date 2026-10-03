@@ -7,17 +7,6 @@ fn rotate() -> Command {
     Command::cargo_bin("rotate").expect("rotate binary builds")
 }
 
-fn assert_stub(name: &str) {
-    rotate()
-        .arg(name)
-        .assert()
-        .code(2)
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains(format!(
-            "rotate {name}: not implemented"
-        )));
-}
-
 /// `plan`, `apply` and `rollback` need input before doing anything.
 fn assert_needs_input(args: &[&str]) {
     rotate()
@@ -58,10 +47,21 @@ fn rollback_without_input_exits_2() {
     assert_needs_input(&["rollback"]);
 }
 
-/// T4 covers AC4.
+/// T4 covers AC4. `status` was a stub until SHA-263; with no state file
+/// it now prints "no rotations" and exits 0.
 #[test]
-fn status_stub_exits_2() {
-    assert_stub("status");
+fn status_without_state_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    rotate()
+        .current_dir(dir.path())
+        .env_remove("ROTATE_CONFIG")
+        .env_remove("ROTATE_STATE_FILE")
+        .env_remove("ROTATE_AUDIT_LOG")
+        .arg("status")
+        .assert()
+        .code(0)
+        .stdout("no rotations\n")
+        .stderr(predicate::str::is_empty());
 }
 
 /// T5 covers AC5.

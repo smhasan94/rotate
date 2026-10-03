@@ -28,7 +28,7 @@ use rotate::rollback;
 use rotate::secret::SecretValue;
 use rotate::state::{StateError, StateStore};
 
-use crate::cli::{ApplyArgs, Cli, Command, InputArgs, RollbackArgs};
+use crate::cli::{ApplyArgs, Cli, Command, InputArgs, RollbackArgs, StatusArgs};
 use crate::exit::Exit;
 
 fn main() -> ExitCode {
@@ -128,9 +128,50 @@ fn run(
             _ => {}
         }
     }
-    // Still a stub until its ticket lands (SHA-263 status).
-    let _ = writeln!(console.err(), "rotate {}: not implemented", command.name());
-    Ok(Exit::Usage)
+    match &command {
+        Command::Status(args) => Ok(status(console, args, config, json)),
+        other => {
+            let _ = writeln!(console.err(), "rotate {}: not implemented", other.name());
+            Ok(Exit::Usage)
+        }
+    }
+}
+
+/// `rotate status` (SHA-263): reads the state file without taking its lock
+/// and the audit log read-only, and prints one row per rotation in
+/// progress (every rotation with `--all`). It builds no provider or
+/// consumer registry and starts no runtime, so it cannot make a call, and
+/// it writes nothing. Exit 3 when any rotation is pending, else 0; an
+/// unusable state file exits 2 (1 for a plain I/O error). An unusable
+/// audit log is a warning: the rows are shown without its errors.
+fn status(console: &mut Console, args: &StatusArgs, config: &Config, json: bool) -> Exit {
+    let snapshot = match StateStore::read(&config.state_file) {
+        Ok(snapshot) => snapshot,
+        Err(err) => return state_error(console, err),
+    };
+    let (errors, warnings) = match rotate::audit::read_all(&config.audit_log) {
+        Ok(entries) => rotate::status::last_errors(entries),
+        Err(err) => (
+            Default::default(),
+            vec![format!("audit log errors are not shown: {err}")],
+        ),
+    };
+    for warning in &warnings {
+        let _ = writeln!(console.err(), "warning: {warning}");
+    }
+    let now = providers::clock().map_or_else(time::OffsetDateTime::now_utc, |clock| clock());
+    let rows = rotate::status::rows(&snapshot, &errors, now, args.all);
+    let rendered = if json {
+        rotate::status::render_json(&rows) + "\n"
+    } else {
+        rotate::status::render_table(&rows, snapshot.rotations().len(), now)
+    };
+    print_out(console, &rendered);
+    if rotate::status::any_pending(&snapshot) {
+        Exit::Pending
+    } else {
+        Exit::Ok
+    }
 }
 
 /// A single-threaded runtime for the provider and consumer calls. The real
