@@ -53,6 +53,11 @@ pub enum Step {
     Revoked,
     /// A step failed before revoke; the old secret is still valid.
     Failed,
+    /// Apply could not continue: the replacement exists, but its value
+    /// was lost when an earlier run exited before every consumer held it
+    /// (SHA-258). The old secret is still valid. Only `rollback` moves it
+    /// on; apply leaves it alone.
+    NeedsRollback,
     /// Rolled back; the rotation is finished.
     RolledBack,
 }
@@ -146,8 +151,9 @@ pub struct Rotation {
     pub updated_at: OffsetDateTime,
     /// The operator passed `--force` (NFR5).
     pub force: bool,
-    /// The step that failed, while `step` is `failed` (SHA-256). Absent
-    /// otherwise, and in files written before it existed.
+    /// The step that failed, while `step` is `failed` (SHA-256), or the
+    /// step that could not continue, while it is `needs_rollback`
+    /// (SHA-258). Absent otherwise, and in files written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_step: Option<AuditStep>,
     /// The handle the provider's `revoke` returned for the old secret,
@@ -696,6 +702,7 @@ mod tests {
             Step::PendingRevoke,
             Step::Revoked,
             Step::Failed,
+            Step::NeedsRollback,
             Step::RolledBack,
         ]
         .iter()
@@ -711,10 +718,12 @@ mod tests {
                 "\"pending_revoke\"",
                 "\"revoked\"",
                 "\"failed\"",
+                "\"needs_rollback\"",
                 "\"rolled_back\""
             ]
         );
         assert!(!Step::Failed.is_terminal());
+        assert!(!Step::NeedsRollback.is_terminal());
         assert!(Step::RolledBack.is_terminal());
     }
 

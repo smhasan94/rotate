@@ -32,6 +32,9 @@ pub const PLAN_JSON_VERSION: u32 = 1;
 /// Replacement wording for a provider in manual mode (decision D1).
 pub const MANUAL_REPLACEMENT: &str = "manual: you will be asked to paste the new secret";
 
+/// Skip reason for a secret whose rotation already finished (SHA-258).
+pub const ALREADY_ROTATED: &str = "already rotated";
+
 /// Blocker for a credential the provider cannot revoke (see
 /// [`Provider::manual_revoke`](crate::provider::Provider::manual_revoke)).
 pub const MANUAL_REVOKE_BLOCKER: &str =
@@ -110,7 +113,7 @@ pub struct Skipped {
     /// Owning provider, when one was identified.
     pub provider: Option<&'static str>,
     /// One of `invalid`, `unsupported`, `not rotatable`, `unknown`,
-    /// `unchecked`.
+    /// `unchecked`, `already rotated`.
     pub reason: &'static str,
     /// More detail, for example why validity is unknown.
     pub detail: Option<String>,
@@ -341,7 +344,9 @@ fn blockers(rotation: &PlannedRotation) -> Vec<String> {
 /// Gives every rotation its id and records new ones at step `planned`.
 ///
 /// An unfinished rotation in the state file for the same provider and
-/// fingerprint keeps its id, so running `plan` twice gives the same ids.
+/// fingerprint keeps its id, so running `plan` twice gives the same ids. So
+/// does a finished one whose rollback is in progress (SHA-258): apply then
+/// reports the rollback instead of starting a second rotation.
 /// Its stored step is copied onto the plan and the record is not touched,
 /// so `plan` never rewinds an `apply` in progress. Anything else gets a new
 /// id. Writes the state file only; no remote call.
@@ -352,7 +357,7 @@ pub fn assign_ids(plan: &mut Plan, store: &mut StateStore) -> Result<(), StateEr
             .rotations()
             .iter()
             .filter(|r| {
-                r.is_in_progress()
+                (r.is_in_progress() || r.is_rolling_back())
                     && r.provider == rotation.provider
                     && r.fingerprint == rotation.fingerprint
             })
@@ -414,8 +419,73 @@ fn step_name(step: Step) -> &'static str {
         Step::PendingRevoke => "pending_revoke",
         Step::Revoked => "revoked",
         Step::Failed => "failed",
+        Step::NeedsRollback => "needs_rollback",
         Step::RolledBack => "rolled_back",
     }
+}
+
+/// What `rotate apply` will do with a rotation an earlier run left at
+/// `step` (SHA-258). A rollback in progress is reported by apply itself.
+fn resume_text(step: Step) -> &'static str {
+    match step {
+        Step::Planned => "rotate apply runs it",
+        Step::Created => {
+            "the replacement value from the earlier run is gone, so rotate apply will mark it needs_rollback"
+        }
+        Step::ConsumersUpdated => "rotate apply resumes it at verify",
+        Step::Verified => "rotate apply resumes it at revoke",
+        Step::PendingRevoke => "rotate apply revokes once the overlap window has passed",
+        Step::Failed => "rotate apply resumes it where it can",
+        Step::NeedsRollback => "run rotate rollback with the same input",
+        Step::Revoked | Step::RolledBack => "a rollback of it is in progress",
+    }
+}
+
+/// Splits off the findings whose secret was already rotated: the latest
+/// rotation in `rotations` for its fingerprint is `revoked` and no rollback
+/// of it is in progress (SHA-258, FR22). They are returned as skipped with
+/// reason `already rotated`, before identification, so `plan` and `apply`
+/// make no provider or consumer call for them. Local and pure.
+#[cfg(unix)]
+pub fn split_already_rotated(
+    findings: Vec<crate::finding::Finding>,
+    rotations: &[Rotation],
+    providers: &ProviderRegistry,
+) -> (Vec<crate::finding::Finding>, Vec<Skipped>) {
+    use time::format_description::well_known::Rfc3339;
+
+    let mut kept = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    for finding in findings {
+        let fingerprint = finding.fingerprint();
+        let latest = rotations
+            .iter()
+            .filter(|r| r.fingerprint == fingerprint)
+            .max_by_key(|r| r.updated_at);
+        let Some(done) = latest.filter(|r| r.step == Step::Revoked && !r.is_rolling_back()) else {
+            kept.push(finding);
+            continue;
+        };
+        if let Some(entry) = skipped.iter_mut().find(|s| s.fingerprint == fingerprint) {
+            entry.sources.push(finding.source.clone());
+            continue;
+        }
+        let when = done
+            .updated_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| done.updated_at.to_string());
+        skipped.push(Skipped {
+            fingerprint,
+            provider: providers.get(&done.provider).map(|p| p.name()),
+            reason: ALREADY_ROTATED,
+            detail: Some(format!(
+                "rotation {} already rotated on {when}; nothing to do",
+                done.rotation_id
+            )),
+            sources: vec![finding.source.clone()],
+        });
+    }
+    (kept, skipped)
 }
 
 fn match_name(method: MatchMethod) -> &'static str {
@@ -511,8 +581,9 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
         }
         if r.step != Step::Planned {
             let state = format!(
-                "in progress at step {}; rotate apply resumes it",
-                step_name(r.step)
+                "in progress at step {}; {}",
+                step_name(r.step),
+                resume_text(r.step)
             );
             field(&mut out, "state:", &state);
         }
@@ -963,5 +1034,54 @@ mod tests {
         assert_eq!(json["rotations"][0]["replacement"]["mode"], "automatic");
         assert_eq!(json["rotations"][0]["state"], "planned");
         assert_eq!(json["skipped"][0]["reason"], "unsupported");
+    }
+
+    // SHA-258 (AC7): only a finished, not rolling back, latest rotation
+    // makes a finding "already rotated"; duplicates share one entry.
+    #[cfg(unix)]
+    #[test]
+    fn split_already_rotated_uses_the_latest_rotation() {
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(MockProvider::new("npm")));
+        let (done, rolled, rolling, fresh) = (
+            "npm_split_done",
+            "npm_split_rolled",
+            "npm_split_rolling",
+            "npm_split_fresh",
+        );
+        let at = |s: i64| time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(s);
+        let rotation = |id: &str, value: &str, step: Step, when: i64| {
+            let mut r = Rotation::new(id, "npm", fp(value));
+            r.step = step;
+            r.updated_at = at(when);
+            r
+        };
+        let mut rolling_back = rotation("rot-4", rolling, Step::Revoked, 1);
+        rolling_back.rollback = Some(crate::state::RollbackProgress::default());
+        let rotations = [
+            rotation("rot-1", done, Step::Revoked, 1),
+            rotation("rot-2", rolled, Step::Revoked, 1),
+            rotation("rot-3", rolled, Step::RolledBack, 2),
+            rolling_back,
+        ];
+        let findings = vec![
+            finding(done),
+            finding(rolled),
+            finding(done),
+            finding(rolling),
+            finding(fresh),
+        ];
+        let (kept, skipped) = split_already_rotated(findings, &rotations, &providers);
+        let kept: Vec<Fingerprint> = kept.iter().map(Finding::fingerprint).collect();
+        assert_eq!(kept, [fp(rolled), fp(rolling), fp(fresh)]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].fingerprint, fp(done));
+        assert_eq!(skipped[0].reason, ALREADY_ROTATED);
+        assert_eq!(skipped[0].provider, Some("npm"));
+        assert_eq!(skipped[0].sources.len(), 2);
+        assert_eq!(
+            skipped[0].detail.as_deref(),
+            Some("rotation rot-1 already rotated on 1970-01-01T00:00:01Z; nothing to do")
+        );
     }
 }

@@ -245,6 +245,24 @@ pub trait Provider: Send + Sync {
         identity: &Identity,
     ) -> Result<(), ProviderError>;
 
+    /// Read-only check, by the `replacement_ref` that `create_replacement`
+    /// returned, that the replacement still exists, is active and belongs
+    /// to `identity` (SHA-258). Used when apply resumes at verify in a new
+    /// process: rotate never stores the replacement's value, so
+    /// [`verify`](Self::verify) cannot be used. The default returns
+    /// `Unsupported`; apply then marks the rotation `needs_rollback`.
+    async fn verify_replacement(
+        &self,
+        replacement_ref: &str,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let _ = (replacement_ref, identity);
+        Err(ProviderError::Unsupported(format!(
+            "{} cannot check a replacement by its reference",
+            self.name()
+        )))
+    }
+
     /// Revokes the credential. Mutating, and always the last step.
     async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError>;
 

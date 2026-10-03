@@ -135,6 +135,13 @@ pub struct ApplyArgs {
     /// failed create or verify. Recorded in the audit log with the actor.
     #[arg(long)]
     pub force: bool,
+
+    /// When the overlap window is still open, wait for it in this run and
+    /// then revoke, instead of recording the pending revoke and exiting 3.
+    /// Meant for short windows; interrupting leaves a pending revoke that
+    /// a later rotate apply finishes.
+    #[arg(long)]
+    pub wait: bool,
 }
 
 /// Arguments of `rotate rollback` (SHA-259).

@@ -274,6 +274,7 @@ fn step_name(step: Step) -> &'static str {
         Step::PendingRevoke => "pending_revoke",
         Step::Revoked => "revoked",
         Step::Failed => "failed",
+        Step::NeedsRollback => "needs_rollback",
         Step::RolledBack => "rolled_back",
     }
 }

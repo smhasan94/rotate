@@ -641,6 +641,13 @@ fn is_key_id(id: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// The user name in an IAM user ARN (`arn:aws:iam::ACCOUNT:user/PATH/NAME`):
+/// the part after the last `/`. `None` for any other ARN.
+fn arn_user_name(arn: &str) -> Option<&str> {
+    let (_, resource) = arn.split_once(":user/")?;
+    resource.rsplit('/').next().filter(|name| !name.is_empty())
+}
+
 /// A temporary (STS) key id.
 fn is_temporary(id: &str) -> bool {
     id.starts_with("ASIA")
@@ -886,6 +893,45 @@ impl Provider for AwsProvider {
         }
     }
 
+    /// The replacement key, by its id (SHA-258): it must belong to the IAM
+    /// user named by `identity` and be Active. Read with the operator's
+    /// credentials (`iam:GetAccessKeyLastUsed`, `iam:ListAccessKeys`); the
+    /// replacement's secret is not needed and not used.
+    async fn verify_replacement(
+        &self,
+        replacement_ref: &str,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        if !is_key_id(replacement_ref) || is_temporary(replacement_ref) {
+            return Err(ProviderError::Permanent(
+                "not an AWS access key id; the replacement reference must be the new key's id"
+                    .into(),
+            ));
+        }
+        let iam = self.iam().await?;
+        let owner = self.owner(&iam, replacement_ref).await?;
+        if arn_user_name(&identity.0) != Some(owner.user.as_str()) {
+            return Err(ProviderError::Permanent(format!(
+                "the replacement key {replacement_ref} belongs to IAM user {} but the leaked key belongs to {identity}",
+                owner.user
+            )));
+        }
+        let slots = self
+            .key_slots(&iam, &owner.user, false)
+            .await
+            .map_err(|f| f.into_operator_error("iam:ListAccessKeys"))?;
+        match slots.iter().find(|s| s.id == replacement_ref) {
+            Some(slot) if slot.status == StatusType::Active.as_str() => Ok(()),
+            Some(slot) => Err(ProviderError::Permanent(format!(
+                "the replacement key {replacement_ref} is {}, not Active",
+                slot.status
+            ))),
+            None => Err(ProviderError::Permanent(format!(
+                "the replacement key {replacement_ref} no longer exists"
+            ))),
+        }
+    }
+
     /// `iam:UpdateAccessKey Status=Inactive` on the leaked key, never a
     /// delete. Already inactive or already gone is `Ok`.
     async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError> {
@@ -965,6 +1011,20 @@ mod tests {
     fn pair_finding(id: &str, detector: &str) -> Finding {
         Finding::new(secret(), detector, SourceLocation::file("a.env"))
             .with_extra(ACCESS_KEY_ID, id)
+    }
+
+    #[test]
+    fn arn_user_name_takes_the_last_path_segment() {
+        assert_eq!(
+            arn_user_name("arn:aws:iam::123456789012:user/ci"),
+            Some("ci")
+        );
+        assert_eq!(
+            arn_user_name("arn:aws:iam::123456789012:user/team/ci"),
+            Some("ci")
+        );
+        assert_eq!(arn_user_name("arn:aws:iam::123456789012:root"), None);
+        assert_eq!(arn_user_name("arn:aws:iam::123456789012:user/"), None);
     }
 
     // T1 (AC1)

@@ -21,9 +21,20 @@
 //! only once `verify` confirms it belongs to the leaked secret's owner. No
 //! consumer is touched before that.
 //!
-//! The replacement credential is a local of [`Executor::run`]: it is held in
-//! zeroized memory, registered with the redactor while alive, and dropped
-//! when the rotation ends. Nothing returned from here holds a value.
+//! Every run picks the rotation up where the state file says it is
+//! (SHA-258, FR15, FR22): see [`resume_point`]. A step an earlier run
+//! finished is never repeated; it gets a `skipped` audit entry. A pending
+//! revoke keeps its recorded `revoke_not_before`; a re-run before then makes
+//! no state-changing call, one after it revokes, and `--wait` sleeps until
+//! then in the same run. A rotation that stopped after create in a process
+//! that has exited cannot go on, since its replacement's value is gone: it
+//! is marked `needs_rollback`.
+//!
+//! The replacement credential is held by the [`Executor`] from create until
+//! it is verified, so a second run of the same rotation in the same process
+//! can still update the consumers that missed it. It is zeroized,
+//! registered with the redactor while alive, and dropped with the executor.
+//! Nothing returned from here holds a value.
 //!
 //! Nothing here prints. The binary prints the plan, asks the questions
 //! through a [`Prompt`], and renders the [`Outcome`]s with
@@ -31,7 +42,7 @@
 
 #![cfg(unix)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -48,7 +59,9 @@ use crate::console::Console;
 use crate::consumer::ConsumerRegistry;
 use crate::input::{self, ReplacementInputError, REPLACEMENT_MAX};
 use crate::plan::{Plan, PlannedRotation};
-use crate::provider::{Credential, Provider, ProviderRegistry, Replacement, ReplacementMode};
+use crate::provider::{
+    Credential, Provider, ProviderError, ProviderRegistry, Replacement, ReplacementMode,
+};
 use crate::secret::{Fingerprint, SecretValue};
 use crate::state::{ConsumerState, ConsumerStatus, Rotation, StateError, StateStore, Step};
 
@@ -447,13 +460,14 @@ pub fn confirm(
     }
 }
 
-/// Why apply cannot run a rotation yet. Nothing is called for it.
+/// Why apply cannot run a rotation. Nothing is called for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {
-    /// An earlier apply left it at this step; resuming is SHA-258. A
-    /// rotation at `verified` is not ineligible: it goes straight to the
-    /// revoke gate (SHA-256).
-    InProgress(Step),
+    /// An earlier run marked it `needs_rollback` (SHA-258): only `rotate
+    /// rollback` moves it on.
+    NeedsRollback,
+    /// It is finished: `revoked` or `rolled_back`.
+    Finished(Step),
     /// The owner identity is unknown, so the replacement cannot be verified.
     NoScope,
     /// `rotate rollback` started on it and has not finished (SHA-259).
@@ -463,11 +477,12 @@ pub enum Ineligible {
 impl fmt::Display for Ineligible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Ineligible::InProgress(step) => write!(
-                f,
-                "already at step {}; resuming is not supported yet",
-                step_name(*step)
+            Ineligible::NeedsRollback => f.write_str(
+                "it needs rollback: the replacement value from an earlier run is gone; run rotate rollback with the same input",
             ),
+            Ineligible::Finished(step) => {
+                write!(f, "already finished at step {}", step_name(*step))
+            }
             Ineligible::NoScope => f.write_str(
                 "the owner identity is unknown, so the replacement could not be verified",
             ),
@@ -478,30 +493,77 @@ impl fmt::Display for Ineligible {
     }
 }
 
-/// [`eligibility`], and not while a rollback of the stored rotation is in
-/// progress (SHA-259): continuing it would revoke the old secret that the
-/// rollback put back.
+/// [`eligibility`], checked against the stored rotation too: not while a
+/// rollback of it is in progress (SHA-259), since continuing would revoke
+/// the old secret the rollback put back, and not when the stored step is
+/// `needs_rollback` or finished.
 pub fn eligibility_in(rotation: &PlannedRotation, store: &StateStore) -> Result<(), Ineligible> {
-    if store
-        .get(&rotation.rotation_id)
-        .is_some_and(Rotation::is_rolling_back)
-    {
-        return Err(Ineligible::RollingBack);
+    if let Some(stored) = store.get(&rotation.rotation_id) {
+        if stored.is_rolling_back() {
+            return Err(Ineligible::RollingBack);
+        }
+        step_eligibility(stored.step)?;
     }
     eligibility(rotation)
 }
 
-/// Whether apply can run `rotation` now, from the plan alone. The binary
-/// uses [`eligibility_in`], which also reads the state file.
+/// Whether apply can run `rotation` now, from the plan alone. Every
+/// unfinished step can be resumed (SHA-258) except `needs_rollback`. The
+/// binary uses [`eligibility_in`], which also reads the state file.
 pub fn eligibility(rotation: &PlannedRotation) -> Result<(), Ineligible> {
-    if !matches!(rotation.step, Step::Planned | Step::Verified) {
-        return Err(Ineligible::InProgress(rotation.step));
-    }
+    step_eligibility(rotation.step)?;
     if rotation.scope.is_none() {
         return Err(Ineligible::NoScope);
     }
     Ok(())
 }
+
+fn step_eligibility(step: Step) -> Result<(), Ineligible> {
+    match step {
+        Step::NeedsRollback => Err(Ineligible::NeedsRollback),
+        Step::Revoked | Step::RolledBack => Err(Ineligible::Finished(step)),
+        _ => Ok(()),
+    }
+}
+
+/// Where apply picks a rotation up, from what an earlier run recorded
+/// (SHA-258). Ordered: every phase from the resume point on runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Resume {
+    /// Nothing was created: create, update, verify, revoke.
+    Create,
+    /// The replacement exists; some consumers may not hold it yet.
+    Update,
+    /// Every consumer was dealt with; verify, then revoke.
+    Verify,
+    /// Verified; only the revoke gate and revoke are left.
+    Revoke,
+}
+
+/// The resume point for `record`. A `failed` rotation resumes at the step
+/// that failed; with no replacement recorded it starts over, since nothing
+/// was created. Not meaningful for an ineligible step.
+pub fn resume_point(record: &Rotation) -> Resume {
+    match record.step {
+        Step::Planned => Resume::Create,
+        Step::Created => Resume::Update,
+        Step::ConsumersUpdated => Resume::Verify,
+        Step::Verified | Step::PendingRevoke => Resume::Revoke,
+        Step::Failed if record.replacement_ref.is_none() => Resume::Create,
+        Step::Failed => match record.failed_step {
+            Some(AuditStep::Verify) => Resume::Verify,
+            Some(AuditStep::Force | AuditStep::Revoke) => Resume::Revoke,
+            _ => Resume::Update,
+        },
+        Step::NeedsRollback | Step::Revoked | Step::RolledBack => Resume::Revoke,
+    }
+}
+
+/// Why a rotation that stopped after create cannot go on in a new process.
+const LOST_REPLACEMENT: &str = "the replacement value from the earlier run is gone (rotate never stores it), so the consumers that do not hold it yet cannot be updated; run rotate rollback with the same input to restore the updated consumers and revoke the replacement, then run rotate apply again";
+
+/// Audit detail of a step a resume does not repeat.
+const DONE_EARLIER: &str = "already done in an earlier run";
 
 /// What the revoke gate decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,8 +596,7 @@ pub fn not_updated(rotation: &PlannedRotation, consumers: &[ConsumerState]) -> V
 
 /// The single decision before `revoke`. Holds while any consumer was not
 /// updated or could not be searched, unless `force`; waits while the
-/// overlap window is open (decision D2). Resume with `--wait` (SHA-258)
-/// changes this function only.
+/// overlap window is open (decision D2).
 pub fn revoke_gate(
     rotation: &PlannedRotation,
     consumers: &[ConsumerState],
@@ -563,6 +624,36 @@ pub fn revoke_gate(
     }
 }
 
+/// [`revoke_gate`] for a rotation that may already have a pending revoke
+/// (SHA-258): a recorded `revoke_not_before` replaces the window, so a
+/// re-run neither moves the time nor revokes early, whatever `--overlap`
+/// says now.
+pub fn resume_gate(
+    rotation: &PlannedRotation,
+    consumers: &[ConsumerState],
+    now: OffsetDateTime,
+    recorded: Option<OffsetDateTime>,
+    force: bool,
+) -> Gate {
+    match (revoke_gate(rotation, consumers, now, force), recorded) {
+        (Gate::Hold(reason), _) => Gate::Hold(reason),
+        (_, Some(at)) if now < at => Gate::Wait(at),
+        (_, Some(_)) => Gate::Revoke,
+        (gate, None) => gate,
+    }
+}
+
+/// `1h 5m`, `9m 59s`, `45s`: whole seconds, rounded down, never negative.
+pub fn remaining_text(remaining: time::Duration) -> String {
+    let secs = remaining.whole_seconds().max(0);
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    match (h, m) {
+        (0, 0) => format!("{s}s"),
+        (0, _) => format!("{m}m {s}s"),
+        _ => format!("{h}h {m}m"),
+    }
+}
+
 /// How one rotation ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunResult {
@@ -572,6 +663,8 @@ pub enum RunResult {
     PendingRevoke {
         /// Earliest revoke time.
         not_before: OffsetDateTime,
+        /// Time left until then, by apply's clock.
+        remaining: time::Duration,
     },
     /// Verified, but the revoke was held by [`revoke_gate`].
     Held {
@@ -584,6 +677,12 @@ pub enum RunResult {
         step: AuditStep,
         /// Why, redacted.
         error: RedactedText,
+    },
+    /// Marked `needs_rollback` (SHA-258): the replacement exists but its
+    /// value is gone, so apply cannot go on. Revoke was not called.
+    NeedsRollback {
+        /// Why, and what to do, redacted.
+        reason: RedactedText,
     },
     /// Not attempted.
     Skipped(Ineligible),
@@ -631,24 +730,38 @@ impl Outcome {
 /// The exit class of a run, worst first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
-    /// Every rotation was revoked.
+    /// Every rotation was revoked (or was already finished).
     Done,
-    /// Some rotation failed or was held before revoke (exit 1).
+    /// Some rotation failed, was held before revoke or needs rollback
+    /// (exit 1).
     Failed,
     /// Some revoke waits for its overlap window (exit 3).
     Pending,
-    /// Some rotation needs a feature not built yet (exit 2).
+    /// Some rotation could not be attempted (exit 2).
     Unsupported,
 }
 
 /// Exit class for `outcomes`: failed, then pending, then unsupported.
 pub fn run_status(outcomes: &[Outcome]) -> RunStatus {
     let any = |f: fn(&RunResult) -> bool| outcomes.iter().any(|o| f(&o.result));
-    if any(|r| matches!(r, RunResult::Failed { .. } | RunResult::Held { .. })) {
+    if any(|r| {
+        matches!(
+            r,
+            RunResult::Failed { .. }
+                | RunResult::Held { .. }
+                | RunResult::NeedsRollback { .. }
+                | RunResult::Skipped(Ineligible::NeedsRollback)
+        )
+    }) {
         RunStatus::Failed
     } else if any(|r| matches!(r, RunResult::PendingRevoke { .. })) {
         RunStatus::Pending
-    } else if any(|r| matches!(r, RunResult::Skipped(_))) {
+    } else if any(|r| {
+        matches!(
+            r,
+            RunResult::Skipped(Ineligible::NoScope | Ineligible::RollingBack)
+        )
+    }) {
         RunStatus::Unsupported
     } else {
         RunStatus::Done
@@ -674,6 +787,13 @@ pub struct Executor<'a> {
     clock: fn() -> OffsetDateTime,
     manual: Option<Manual<'a>>,
     force: bool,
+    wait: bool,
+    /// Replacements created by this executor and not yet verified, by
+    /// rotation id (SHA-258): a second [`run`](Self::run) of a rotation
+    /// that stopped before verify uses it instead of marking the rotation
+    /// `needs_rollback`. Zeroized and registered with the redactor while
+    /// held; gone when this executor is dropped.
+    held: HashMap<String, Credential>,
 }
 
 impl fmt::Debug for Executor<'_> {
@@ -682,6 +802,8 @@ impl fmt::Debug for Executor<'_> {
             .field("providers", &self.providers)
             .field("consumers", &self.consumers)
             .field("force", &self.force)
+            .field("wait", &self.wait)
+            .field("held", &self.held.len())
             .finish_non_exhaustive()
     }
 }
@@ -710,12 +832,14 @@ impl<'a> Executor<'a> {
             clock: OffsetDateTime::now_utc,
             manual: None,
             force: false,
+            wait: false,
+            held: HashMap::new(),
         }
     }
 
     /// Where manual-mode rotations get their replacement, and where their
-    /// instructions (stdout) and questions (stderr) go. Without it a
-    /// manual rotation fails at create and nothing is changed.
+    /// instructions (stdout) and questions and notes (stderr) go. Without
+    /// it a manual rotation fails at create and nothing is changed.
     pub fn with_manual(mut self, source: ReplacementSource, term: &'a mut dyn Terminal) -> Self {
         self.manual = Some(Manual { source, term });
         self
@@ -728,18 +852,26 @@ impl<'a> Executor<'a> {
         self
     }
 
+    /// `--wait` (SHA-258): when the overlap window is open, record the
+    /// pending revoke, sleep until it has passed, then revoke in the same
+    /// run instead of returning [`RunResult::PendingRevoke`].
+    pub fn with_wait(mut self, wait: bool) -> Self {
+        self.wait = wait;
+        self
+    }
+
     /// Uses `clock` for the overlap window instead of the system clock.
     pub fn with_clock(mut self, clock: fn() -> OffsetDateTime) -> Self {
         self.clock = clock;
         self
     }
 
-    /// Runs one confirmed rotation: create, update every consumer, verify,
-    /// revoke gate, revoke. Never calls `revoke` after an earlier failure.
-    /// A rotation already at `verified` (held by the gate on an earlier
-    /// run) goes straight to the gate with the consumers in the state file.
-    /// The caller checks [`eligibility`] first; an ineligible rotation is
-    /// returned as skipped without a call.
+    /// Runs one confirmed rotation from where the state file says it is
+    /// (SHA-258): create, update every consumer not yet updated, verify,
+    /// revoke gate, revoke. A step finished by an earlier run is not
+    /// repeated; it gets a `skipped` audit entry. Never calls `revoke`
+    /// after an earlier failure. An ineligible rotation is returned as
+    /// skipped without a call.
     pub async fn run(&mut self, rotation: &PlannedRotation) -> Outcome {
         if let Err(why) = eligibility_in(rotation, self.store) {
             return Outcome::skipped(rotation, why);
@@ -788,7 +920,11 @@ impl<'a> Executor<'a> {
 
     async fn steps(&mut self, rotation: &PlannedRotation, progress: &mut Progress) -> RunResult {
         if let Err(err) = self.event(progress, AuditStep::Plan, AuditOutcome::Ok, None, None) {
-            return self.fail(progress, AuditStep::Plan, &err.to_string(), None);
+            // Nothing was done; the stored step stays as it is.
+            return RunResult::Failed {
+                step: AuditStep::Plan,
+                error: RedactedText::new(&err.to_string()),
+            };
         }
         let Some(provider) = self.providers.get(rotation.provider) else {
             return self.fail(
@@ -798,43 +934,159 @@ impl<'a> Executor<'a> {
                 None,
             );
         };
-        if progress.record.step == Step::Verified {
-            // Held at the gate by an earlier run: nothing is created or
-            // updated again (SHA-256; other resumes are SHA-258).
-            return self.finish(rotation, provider.as_ref(), progress).await;
+        let from = resume_point(&progress.record);
+        let id = rotation.rotation_id.clone();
+        if let Err(err) = self.audit_done(progress, from) {
+            // Nothing was done; the stored step stays as it is.
+            return RunResult::Failed {
+                step: AuditStep::Plan,
+                error: RedactedText::new(&err.to_string()),
+            };
         }
 
-        // Create, or in manual mode take the operator's verified paste. The
-        // replacement lives in this frame only.
+        if from == Resume::Create {
+            // Nothing was created (a fresh rotation, or one whose create
+            // failed): start over.
+            progress.record.failed_step = None;
+            progress.record.consumers.clear();
+            if let Err(result) = self.create(rotation, provider.as_ref(), progress).await {
+                return result;
+            }
+        }
+        if from <= Resume::Update {
+            // The replacement lives in `held` until it is verified; a copy
+            // lives in this frame. Without it nothing can be updated.
+            let Some(credential) = self.held.get(&id).cloned() else {
+                return self.needs_rollback(progress, AuditStep::Update, LOST_REPLACEMENT);
+            };
+            progress.record.failed_step = None;
+            if let Err(result) = self.update_all(rotation, progress, &credential).await {
+                return result;
+            }
+        }
+        if from <= Resume::Verify {
+            progress.record.failed_step = None;
+            if let Err(result) = self.verify(rotation, provider.as_ref(), progress).await {
+                return result;
+            }
+            self.held.remove(&id);
+        }
+        self.finish(rotation, provider.as_ref(), progress).await
+    }
+
+    /// One `skipped` audit entry for every step an earlier run finished
+    /// and this one does not repeat: create, each consumer updated, verify.
+    /// Consumers left for this run are handled by [`update_all`].
+    fn audit_done(&mut self, progress: &Progress, from: Resume) -> Result<(), RecordError> {
+        if from >= Resume::Update {
+            self.event(
+                progress,
+                AuditStep::Create,
+                AuditOutcome::Skipped,
+                None,
+                Some(DONE_EARLIER),
+            )?;
+        }
+        if from >= Resume::Verify {
+            let refs: Vec<String> = progress
+                .record
+                .consumers
+                .iter()
+                .filter(|c| c.status == ConsumerStatus::Updated)
+                .map(|c| c.consumer_ref.clone())
+                .collect();
+            for consumer in &refs {
+                self.event(
+                    progress,
+                    AuditStep::Update,
+                    AuditOutcome::Skipped,
+                    Some(consumer),
+                    Some(DONE_EARLIER),
+                )?;
+            }
+        }
+        if from >= Resume::Revoke {
+            self.event(
+                progress,
+                AuditStep::Verify,
+                AuditOutcome::Skipped,
+                None,
+                Some(DONE_EARLIER),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Create, or in manual mode take the operator's verified paste, and
+    /// hold the replacement until it is verified.
+    async fn create(
+        &mut self,
+        rotation: &PlannedRotation,
+        provider: &dyn Provider,
+        progress: &mut Progress,
+    ) -> Result<(), RunResult> {
         let replacement = match rotation.replacement_mode {
             ReplacementMode::Automatic => {
                 match provider.create_replacement(&rotation.credential).await {
                     Ok(replacement) => replacement,
                     Err(err) => {
-                        return self.fail(progress, AuditStep::Create, &err.to_string(), None)
+                        return Err(self.fail(progress, AuditStep::Create, &err.to_string(), None))
                     }
                 }
             }
             ReplacementMode::Manual => {
-                match manual_replacement(self.manual.as_mut(), rotation, provider.as_ref()).await {
+                match manual_replacement(self.manual.as_mut(), rotation, provider).await {
                     Ok(credential) => Replacement {
                         credential,
                         replacement_ref: MANUAL_REF.to_owned(),
                     },
-                    Err(error) => return self.fail(progress, AuditStep::Create, &error, None),
+                    Err(error) => return Err(self.fail(progress, AuditStep::Create, &error, None)),
                 }
             }
         };
         progress.record.step = Step::Created;
         progress.record.replacement_ref = Some(replacement.replacement_ref.clone());
         progress.record.replacement_fingerprint = Some(replacement.credential.fingerprint());
+        self.held
+            .insert(rotation.rotation_id.clone(), replacement.credential);
         if let Err(err) = self.checkpoint(progress, AuditStep::Create, None) {
-            return self.fail(progress, AuditStep::Create, &err.to_string(), None);
+            return Err(self.fail(progress, AuditStep::Create, &err.to_string(), None));
         }
+        Ok(())
+    }
 
-        // Update every consumer, saving after each.
+    /// Updates every planned consumer that does not hold the replacement
+    /// yet, saving after each. One an earlier run updated is not called
+    /// again; it gets a `skipped` audit entry.
+    async fn update_all(
+        &mut self,
+        rotation: &PlannedRotation,
+        progress: &mut Progress,
+        credential: &Credential,
+    ) -> Result<(), RunResult> {
         for planned in &rotation.consumers {
             let reference = planned.found.consumer_ref.clone();
+            let earlier = progress
+                .record
+                .consumers
+                .iter()
+                .position(|c| c.consumer == planned.consumer && c.consumer_ref == reference);
+            if let Some(i) = earlier {
+                if progress.record.consumers[i].status == ConsumerStatus::Updated {
+                    if let Err(err) = self.event(
+                        progress,
+                        AuditStep::Update,
+                        AuditOutcome::Skipped,
+                        Some(&reference),
+                        Some(DONE_EARLIER),
+                    ) {
+                        return Err(self.fail(progress, AuditStep::Update, &err.to_string(), None));
+                    }
+                    continue;
+                }
+                // Failed or skipped last time: try again.
+                progress.record.consumers.remove(i);
+            }
             let state = |status| ConsumerState {
                 consumer: planned.consumer.to_owned(),
                 consumer_ref: reference.clone(),
@@ -856,7 +1108,7 @@ impl<'a> Executor<'a> {
                     )
                 });
                 if let Err(err) = saved {
-                    return self.fail(progress, AuditStep::Update, &err.to_string(), None);
+                    return Err(self.fail(progress, AuditStep::Update, &err.to_string(), None));
                 }
                 continue;
             }
@@ -865,17 +1117,14 @@ impl<'a> Executor<'a> {
                     .record
                     .consumers
                     .push(state(ConsumerStatus::Failed));
-                return self.fail(
+                return Err(self.fail(
                     progress,
                     AuditStep::Update,
                     &format!("{reference}: the consumer is not registered"),
                     Some(&reference),
-                );
+                ));
             };
-            match consumer
-                .update(&planned.found, &replacement.credential)
-                .await
-            {
+            match consumer.update(&planned.found, credential).await {
                 Ok(_receipt) => {
                     progress
                         .record
@@ -883,7 +1132,7 @@ impl<'a> Executor<'a> {
                         .push(state(ConsumerStatus::Updated));
                     if let Err(err) = self.checkpoint(progress, AuditStep::Update, Some(&reference))
                     {
-                        return self.fail(progress, AuditStep::Update, &err.to_string(), None);
+                        return Err(self.fail(progress, AuditStep::Update, &err.to_string(), None));
                     }
                 }
                 Err(err) => {
@@ -893,7 +1142,12 @@ impl<'a> Executor<'a> {
                         .push(state(ConsumerStatus::Failed));
                     let error = format!("{reference}: {err}");
                     if !self.force {
-                        return self.fail(progress, AuditStep::Update, &error, Some(&reference));
+                        return Err(self.fail(
+                            progress,
+                            AuditStep::Update,
+                            &error,
+                            Some(&reference),
+                        ));
                     }
                     // --force: record it and keep updating the others. The
                     // gate lists it among the consumers revoked past.
@@ -907,54 +1161,88 @@ impl<'a> Executor<'a> {
                         )
                     });
                     if let Err(err) = recorded {
-                        return self.fail(progress, AuditStep::Update, &err.to_string(), None);
+                        return Err(self.fail(progress, AuditStep::Update, &err.to_string(), None));
                     }
                 }
             }
         }
         progress.record.step = Step::ConsumersUpdated;
         if let Err(err) = self.save(progress) {
-            return self.fail(progress, AuditStep::Update, &err.to_string(), None);
+            return Err(self.fail(progress, AuditStep::Update, &err.to_string(), None));
         }
+        Ok(())
+    }
 
-        // Verify the replacement belongs to the same owner (assumption A5).
+    /// Verifies the replacement belongs to the same owner (assumption A5):
+    /// with its value when this executor holds it, else by its ref
+    /// (SHA-258, read-only). A provider that cannot check by ref, or a
+    /// manual replacement, leaves the rotation `needs_rollback`.
+    async fn verify(
+        &mut self,
+        rotation: &PlannedRotation,
+        provider: &dyn Provider,
+        progress: &mut Progress,
+    ) -> Result<(), RunResult> {
         let Some(scope) = &rotation.scope else {
-            return self.fail(
+            return Err(self.fail(
                 progress,
                 AuditStep::Verify,
                 &Ineligible::NoScope.to_string(),
                 None,
-            );
+            ));
         };
-        if let Err(err) = provider
-            .verify(&replacement.credential, &scope.identity)
-            .await
-        {
-            return self.fail(progress, AuditStep::Verify, &err.to_string(), None);
+        let held = self.held.get(&rotation.rotation_id).cloned();
+        let checked = match (&held, progress.record.replacement_ref.as_deref()) {
+            (Some(credential), _) => provider.verify(credential, &scope.identity).await,
+            (None, Some(reference)) if reference != MANUAL_REF => {
+                provider
+                    .verify_replacement(reference, &scope.identity)
+                    .await
+            }
+            (None, _) => Err(ProviderError::Unsupported(
+                "a pasted replacement has no provider reference to check".into(),
+            )),
+        };
+        drop(held);
+        match checked {
+            Ok(()) => {}
+            Err(ProviderError::Unsupported(why)) => {
+                let reason = format!(
+                    "the replacement value from the earlier run is gone and it cannot be verified without it ({why}); run rotate rollback with the same input to restore the updated consumers and revoke the replacement, then run rotate apply again"
+                );
+                return Err(self.needs_rollback(progress, AuditStep::Verify, &reason));
+            }
+            Err(err) => {
+                return Err(self.fail(progress, AuditStep::Verify, &err.to_string(), None));
+            }
         }
         progress.record.step = Step::Verified;
         if let Err(err) = self.checkpoint(progress, AuditStep::Verify, None) {
-            return self.fail(progress, AuditStep::Verify, &err.to_string(), None);
+            return Err(self.fail(progress, AuditStep::Verify, &err.to_string(), None));
         }
-        drop(replacement);
-        self.finish(rotation, provider.as_ref(), progress).await
+        Ok(())
     }
 
-    /// The revoke gate, the force record, then revoke: always the last
-    /// step. Runs only once the replacement is verified.
+    /// The revoke gate, the force record, the overlap window (waited out
+    /// with `--wait`), then revoke: always the last step. Runs only once
+    /// the replacement is verified.
     async fn finish(
         &mut self,
         rotation: &PlannedRotation,
         provider: &dyn Provider,
         progress: &mut Progress,
     ) -> RunResult {
-        let gate = revoke_gate(
+        let now = (self.clock)();
+        // A force recorded by an earlier run still stands.
+        let force = self.force || progress.record.force;
+        let gate = resume_gate(
             rotation,
             &progress.record.consumers,
-            (self.clock)(),
-            self.force,
+            now,
+            progress.record.revoke_not_before,
+            force,
         );
-        if !matches!(gate, Gate::Hold(_)) && self.force {
+        if !matches!(gate, Gate::Hold(_)) && force {
             // NFR5: the force is on record before anything is revoked.
             if let Err(err) = self.record_force(rotation, progress) {
                 return self.fail(progress, AuditStep::Force, &err.to_string(), None);
@@ -975,12 +1263,35 @@ impl<'a> Executor<'a> {
                 return RunResult::Held { reason };
             }
             Gate::Wait(not_before) => {
+                let remaining = not_before - now;
+                let when = rfc3339(not_before);
                 progress.record.step = Step::PendingRevoke;
                 progress.record.revoke_not_before = Some(not_before);
-                if let Err(err) = self.save(progress) {
+                let recorded = self.save(progress).and_then(|()| {
+                    self.event(
+                        progress,
+                        AuditStep::Revoke,
+                        AuditOutcome::Skipped,
+                        None,
+                        Some(&format!("overlap window open until {when}")),
+                    )
+                });
+                if let Err(err) = recorded {
                     return self.fail(progress, AuditStep::Revoke, &err.to_string(), None);
                 }
-                return RunResult::PendingRevoke { not_before };
+                if !self.wait {
+                    return RunResult::PendingRevoke {
+                        not_before,
+                        remaining,
+                    };
+                }
+                self.notice(&format!(
+                    "Rotation {}: waiting until {when} ({}) to revoke the old secret; interrupt to stop, then re-run rotate apply after that time.\n",
+                    progress.record.rotation_id,
+                    remaining_text(remaining)
+                ));
+                let pause = std::time::Duration::try_from(remaining).unwrap_or_default();
+                tokio::time::sleep(pause).await;
             }
         }
         let revoked = match provider.revoke(&rotation.credential).await {
@@ -997,6 +1308,7 @@ impl<'a> Executor<'a> {
             }
         };
         progress.record.step = Step::Revoked;
+        progress.record.failed_step = None;
         // Kept for `rotate rollback` (SHA-259).
         progress.record.restore_ref = revoked.restore_ref;
         if let Err(err) = self.checkpoint(progress, AuditStep::Revoke, None) {
@@ -1012,7 +1324,8 @@ impl<'a> Executor<'a> {
     /// Records `--force` when it lets the revoke through past consumers
     /// that do not hold the replacement: `force: true` in the state file,
     /// then one `force` audit entry per such consumer (the log stamps the
-    /// actor). Nothing is recorded when nothing was bypassed.
+    /// actor). Nothing is recorded when nothing was bypassed, or again when
+    /// an earlier run already recorded it.
     fn record_force(
         &mut self,
         rotation: &PlannedRotation,
@@ -1022,19 +1335,29 @@ impl<'a> Executor<'a> {
         if bypassed.is_empty() {
             return Ok(());
         }
-        progress.record.force = true;
-        self.save(progress)?;
-        for consumer in &bypassed {
-            self.event(
-                progress,
-                AuditStep::Force,
-                AuditOutcome::Ok,
-                Some(consumer),
-                None,
-            )?;
+        if !progress.record.force {
+            progress.record.force = true;
+            self.save(progress)?;
+            for consumer in &bypassed {
+                self.event(
+                    progress,
+                    AuditStep::Force,
+                    AuditOutcome::Ok,
+                    Some(consumer),
+                    None,
+                )?;
+            }
         }
         progress.forced = bypassed;
         Ok(())
+    }
+
+    /// Writes a note to the operator's stderr, when there is a terminal.
+    fn notice(&mut self, text: &str) {
+        match self.manual.as_mut() {
+            Some(manual) => manual.term.stderr(text),
+            None => tracing::info!("{}", text.trim_end()),
+        }
     }
 
     /// Saves the record, then appends an ok entry for `step`.
@@ -1111,6 +1434,35 @@ impl<'a> Executor<'a> {
             error: RedactedText::new(error),
         }
     }
+
+    /// Marks the rotation `needs_rollback` (SHA-258): it stopped at `step`
+    /// because the replacement's value is gone. Recorded like a failure,
+    /// best effort. Nothing is changed remotely; revoke is never called.
+    fn needs_rollback(
+        &mut self,
+        progress: &mut Progress,
+        step: AuditStep,
+        reason: &str,
+    ) -> RunResult {
+        progress.record.step = Step::NeedsRollback;
+        progress.record.failed_step = Some(step);
+        let recorded = self
+            .save(progress)
+            .and_then(|()| self.event(progress, step, AuditOutcome::Failed, None, Some(reason)));
+        if let Err(err) = recorded {
+            tracing::warn!(
+                rotation_id = %progress.record.rotation_id,
+                "could not record that the rotation needs rollback: {err}"
+            );
+        }
+        RunResult::NeedsRollback {
+            reason: RedactedText::new(reason),
+        }
+    }
+}
+
+fn rfc3339(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339).unwrap_or_else(|_| at.to_string())
 }
 
 /// Obtains a manual replacement: prints the provider's instructions, then
@@ -1212,6 +1564,7 @@ fn step_name(step: Step) -> &'static str {
         Step::PendingRevoke => "pending_revoke",
         Step::Revoked => "revoked",
         Step::Failed => "failed",
+        Step::NeedsRollback => "needs_rollback",
         Step::RolledBack => "rolled_back",
     }
 }
@@ -1261,11 +1614,12 @@ pub fn render_summary(outcomes: &[Outcome]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Apply: {} revoked, {} pending revoke, {} held, {} failed, {} skipped.",
+        "Apply: {} revoked, {} pending revoke, {} held, {} failed, {} need rollback, {} skipped.",
         count(|r| matches!(r, RunResult::Revoked)),
         count(|r| matches!(r, RunResult::PendingRevoke { .. })),
         count(|r| matches!(r, RunResult::Held { .. })),
         count(|r| matches!(r, RunResult::Failed { .. })),
+        count(|r| matches!(r, RunResult::NeedsRollback { .. })),
         count(|r| matches!(r, RunResult::Skipped(_))),
     );
     if outcomes.is_empty() {
@@ -1297,15 +1651,21 @@ pub fn render_summary(outcomes: &[Outcome]) -> String {
         let outcome = match &o.result {
             RunResult::Revoked if !o.forced.is_empty() => "revoked (forced)".to_owned(),
             RunResult::Revoked => "revoked".to_owned(),
-            RunResult::PendingRevoke { not_before } => {
-                let when = not_before
-                    .format(&Rfc3339)
-                    .unwrap_or_else(|_| not_before.to_string());
+            RunResult::PendingRevoke {
+                not_before,
+                remaining,
+            } => {
                 notes.push(format!(
-                    "{}: revoke pending until {when}; the old secret stays valid until then",
-                    o.rotation_id
+                    "{}: revoke pending until {} (in {}); the old secret stays valid until then; re-run rotate apply after that time to revoke it",
+                    o.rotation_id,
+                    rfc3339(*not_before),
+                    remaining_text(*remaining)
                 ));
                 "pending revoke".to_owned()
+            }
+            RunResult::NeedsRollback { reason } => {
+                notes.push(format!("{}: needs rollback: {reason}", o.rotation_id));
+                "needs rollback".to_owned()
             }
             RunResult::Held { reason } => {
                 notes.push(format!("{}: {reason}", o.rotation_id));
@@ -1577,7 +1937,7 @@ mod tests {
         let mut f = fixture(value, MockProvider::new("npm"));
         let plan = plan(&mut f, value, "10m").await;
         let outcome = run(&mut f, &plan).await;
-        let RunResult::PendingRevoke { not_before } = outcome.result else {
+        let RunResult::PendingRevoke { not_before, .. } = outcome.result else {
             panic!("{outcome:?}");
         };
         assert!(not_before > OffsetDateTime::now_utc() + time::Duration::minutes(9));
@@ -1588,27 +1948,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_progress_and_no_scope_are_ineligible() {
+    async fn needs_rollback_finished_and_no_scope_are_ineligible() {
         let value = "npm_apply_unit_inprogress";
         let mut f = fixture(value, MockProvider::new("npm"));
         let mut plan = plan(&mut f, value, "0s").await;
         assert_eq!(eligibility(&plan.rotations[0]), Ok(()));
+        for step in [
+            Step::Created,
+            Step::ConsumersUpdated,
+            Step::Verified,
+            Step::PendingRevoke,
+            Step::Failed,
+        ] {
+            plan.rotations[0].step = step;
+            assert_eq!(eligibility(&plan.rotations[0]), Ok(()), "{step:?}");
+        }
 
-        plan.rotations[0].step = Step::Created;
+        plan.rotations[0].step = Step::NeedsRollback;
         let outcome = run(&mut f, &plan).await;
         assert_eq!(
             outcome.result,
-            RunResult::Skipped(Ineligible::InProgress(Step::Created))
+            RunResult::Skipped(Ineligible::NeedsRollback)
         );
         assert!(f.log.is_empty());
+        assert_eq!(run_status(&[outcome]), RunStatus::Failed);
+        plan.rotations[0].step = Step::Revoked;
         assert_eq!(
             eligibility(&plan.rotations[0]),
-            Err(Ineligible::InProgress(Step::Created))
+            Err(Ineligible::Finished(Step::Revoked))
         );
+        let outcome = Outcome::skipped(&plan.rotations[0], Ineligible::Finished(Step::Revoked));
+        assert_eq!(run_status(&[outcome]), RunStatus::Done);
+
+        // The stored step counts too.
         plan.rotations[0].step = Step::Planned;
+        let mut stored = f.store.get(&plan.rotations[0].rotation_id).unwrap().clone();
+        stored.step = Step::NeedsRollback;
+        f.store.upsert(stored).unwrap();
+        assert_eq!(
+            eligibility_in(&plan.rotations[0], &f.store),
+            Err(Ineligible::NeedsRollback)
+        );
+
         plan.rotations[0].scope = None;
         assert_eq!(eligibility(&plan.rotations[0]), Err(Ineligible::NoScope));
+        let outcome = Outcome::skipped(&plan.rotations[0], Ineligible::NoScope);
         assert_eq!(run_status(&[outcome]), RunStatus::Unsupported);
+    }
+
+    // SHA-258: where each recorded step resumes.
+    #[test]
+    fn resume_points() {
+        let mut r = Rotation::new("rot-1", "npm", fp("npm_resume_points"));
+        let at = |r: &Rotation| resume_point(r);
+        assert_eq!(at(&r), Resume::Create);
+        r.step = Step::Failed;
+        r.failed_step = Some(AuditStep::Create);
+        assert_eq!(at(&r), Resume::Create, "nothing was created");
+        r.replacement_ref = Some("npm-ref-1".into());
+        assert_eq!(at(&r), Resume::Update);
+        r.failed_step = Some(AuditStep::Update);
+        assert_eq!(at(&r), Resume::Update);
+        r.failed_step = Some(AuditStep::Verify);
+        assert_eq!(at(&r), Resume::Verify);
+        for step in [AuditStep::Force, AuditStep::Revoke] {
+            r.failed_step = Some(step);
+            assert_eq!(at(&r), Resume::Revoke);
+        }
+        r.failed_step = None;
+        for (step, point) in [
+            (Step::Created, Resume::Update),
+            (Step::ConsumersUpdated, Resume::Verify),
+            (Step::Verified, Resume::Revoke),
+            (Step::PendingRevoke, Resume::Revoke),
+        ] {
+            r.step = step;
+            assert_eq!(at(&r), point, "{step:?}");
+        }
+        assert!(Resume::Create < Resume::Update && Resume::Verify < Resume::Revoke);
+    }
+
+    // SHA-258: a recorded time wins over the window; a hold still holds.
+    #[test]
+    fn resume_gate_uses_recorded_time() {
+        let mut rotation = gate_rotation();
+        rotation.overlap_window = "0s".parse().unwrap();
+        let now = OffsetDateTime::now_utc();
+        let later = now + time::Duration::minutes(5);
+        let updated = [ConsumerState {
+            consumer: "c".into(),
+            consumer_ref: "c:1".into(),
+            status: ConsumerStatus::Updated,
+            holds: None,
+        }];
+        assert_eq!(
+            resume_gate(&rotation, &updated, now, None, false),
+            Gate::Revoke
+        );
+        assert_eq!(
+            resume_gate(&rotation, &updated, now, Some(later), false),
+            Gate::Wait(later)
+        );
+        assert_eq!(
+            resume_gate(&rotation, &updated, later, Some(later), false),
+            Gate::Revoke
+        );
+        rotation.overlap_window = "1h".parse().unwrap();
+        assert_eq!(
+            resume_gate(&rotation, &updated, later, Some(later), false),
+            Gate::Revoke,
+            "a longer --overlap does not move a recorded time"
+        );
+        let mut skipped = updated.clone();
+        skipped[0].status = ConsumerStatus::Skipped;
+        assert!(matches!(
+            resume_gate(&rotation, &skipped, later, Some(later), false),
+            Gate::Hold(_)
+        ));
+    }
+
+    #[test]
+    fn remaining_time_text() {
+        let text = |secs| remaining_text(time::Duration::seconds(secs));
+        assert_eq!(text(45), "45s");
+        assert_eq!(text(599), "9m 59s");
+        assert_eq!(text(3600 + 5 * 60 + 7), "1h 5m");
+        assert_eq!(text(-3), "0s");
+    }
+
+    // SHA-258 AC6 in one process: a new executor does not hold the
+    // replacement an earlier one created, so the rotation needs rollback.
+    #[tokio::test]
+    async fn new_executor_after_create_needs_rollback() {
+        let value = "npm_apply_unit_lost";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "0s").await;
+        f.gha
+            .fail_next("update", ConsumerError::Transient("503".into()));
+        let first = run(&mut f, &plan).await;
+        assert!(matches!(first.result, RunResult::Failed { .. }));
+        f.log.clear();
+
+        let second = run(&mut f, &plan).await;
+        let RunResult::NeedsRollback { reason } = &second.result else {
+            panic!("{second:?}");
+        };
+        assert!(reason.to_string().contains("run rotate rollback"));
+        assert!(mutating(&f.log).is_empty(), "{:?}", mutating(&f.log));
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::NeedsRollback);
+        assert_eq!(stored.failed_step, Some(AuditStep::Update));
+        assert_eq!(run_status(std::slice::from_ref(&second)), RunStatus::Failed);
+        let summary = render_summary(&[second]);
+        assert!(summary.contains("1 need rollback"), "{summary}");
+        assert!(
+            summary.contains("needs rollback: the replacement value"),
+            "{summary}"
+        );
+
+        let third = run(&mut f, &plan).await;
+        assert_eq!(third.result, RunResult::Skipped(Ineligible::NeedsRollback));
+        assert!(f.log.is_empty());
+    }
+
+    // SHA-258: --wait sleeps out the window, then revokes in the same run.
+    #[tokio::test]
+    async fn wait_revokes_after_the_window() {
+        let value = "npm_apply_unit_wait";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "1s").await;
+        let mut term = Recorder::default();
+        let started = std::time::Instant::now();
+        let outcome = {
+            let mut executor =
+                Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit)
+                    .with_wait(true)
+                    .with_manual(ReplacementSource::Supplied(None), &mut term);
+            executor.run(&plan.rotations[0]).await
+        };
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        assert!(term.err.contains("waiting until"), "{}", term.err);
+        let steps = audit_steps(&f);
+        assert!(steps.contains(&(AuditStep::Revoke, AuditOutcome::Skipped, None)));
+        assert_eq!(steps.last().unwrap().0, AuditStep::Revoke);
+        assert_eq!(steps.last().unwrap().1, AuditOutcome::Ok);
     }
 
     /// Records what the executor writes, as the console would print it.
@@ -1877,15 +2401,8 @@ mod tests {
         assert!(confirm(&ids, &ids, &Confirmation::All, &mut prompt, &mut out).is_err());
     }
 
-    #[test]
-    fn gate_holds_waits_or_revokes() {
-        let status = |s| ConsumerState {
-            consumer: "c".into(),
-            consumer_ref: "c:1".into(),
-            status: s,
-            holds: None,
-        };
-        let rotation = PlannedRotation {
+    fn gate_rotation() -> PlannedRotation {
+        PlannedRotation {
             rotation_id: "rot-1".into(),
             provider: "npm",
             fingerprint: fp("npm_gate"),
@@ -1900,7 +2417,18 @@ mod tests {
             blockers: Vec::new(),
             step: Step::Planned,
             sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn gate_holds_waits_or_revokes() {
+        let status = |s| ConsumerState {
+            consumer: "c".into(),
+            consumer_ref: "c:1".into(),
+            status: s,
+            holds: None,
         };
+        let rotation = gate_rotation();
         let now = OffsetDateTime::now_utc();
         assert_eq!(
             revoke_gate(&rotation, &[status(ConsumerStatus::Updated)], now, false),
