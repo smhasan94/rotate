@@ -123,3 +123,40 @@ so apply runs in manual replacement mode: it names the granular token page
 and the permissions, scopes and IP ranges to copy. Read-write granular
 tokens last at most 90 days. `providers.npm.registry` points rotate at
 another registry.
+
+## OpenAI API keys (provider `openai`)
+
+The OpenAI provider uses an organization Admin API key as its operator
+credential, read from `OPENAI_ADMIN_KEY` (or the variable named by
+`providers.openai.admin_key_env`) when a call needs it. Create one at
+platform.openai.com/settings/organization/admin-keys; it needs read and
+write access to projects (projects, project API keys and project service
+accounts). rotate refuses an admin key that is the key being rotated.
+
+| Call | Signed with | Used by | Why |
+| --- | --- | --- | --- |
+| `GET /v1/models` | leaked key | plan, revoke | validity (200 and 429 valid, 401 invalid); without an admin key, the `openai-organization` header; at revoke, whether an unlisted key is already gone |
+| `GET /v1/organization/projects` | admin key | plan, apply | find the key's project |
+| `GET /v1/organization/projects/{id}/api_keys` | admin key | plan, apply | find the key by its redacted value, its owner and last use; verify the replacement is in the same project |
+| `POST /v1/organization/projects/{id}/service_accounts` | admin key | apply | create the replacement: a service account named `rotate-<fingerprint hex>` and its key |
+| `GET /v1/models` | new key | apply | the replacement works |
+| `DELETE /v1/organization/projects/{id}/api_keys/{key_id}` | admin key | apply | revoke a user-owned key |
+| `DELETE /v1/organization/projects/{id}/service_accounts/{id}` | admin key | apply, rollback | revoke a service-account key that is its account's only key; delete the replacement's service account |
+
+OpenAI's key delete endpoint refuses service-account keys, so rotate removes
+one by deleting its service account, and only when the listing shows the
+account holds no other key. Otherwise the plan's revoke row says to delete
+the key at platform.openai.com/api-keys and apply stops at the revoke step
+with the consumers already updated. A key that is in no project the admin
+key can list (a legacy user key) gets no scope and is not applied.
+
+The Admin API does not expose a key's permissions, so the replacement
+service account has the member role and all permissions; restrict it on
+the dashboard if the leaked key was restricted. OpenAI cannot bring a
+deleted key back, so rollback cannot restore the old key.
+
+Without an admin key the provider runs in manual mode: apply asks for the
+new key, accepts it once it works and reports the same `openai-organization`
+header as the leaked key, and cannot revoke. Admin keys (`sk-admin-`) are
+identified but not checked or rotated. `providers.openai.api_url` changes
+the API base URL.

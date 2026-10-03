@@ -78,5 +78,8 @@ providers:
     registry: https://registry.npmjs.org
   openai:
     # Name of the environment variable that holds the OpenAI Admin API key.
-    # Default: OPENAI_ADMIN_KEY
+    # Default: OPENAI_ADMIN_KEY. Without it the OpenAI provider runs in manual
+    # mode: it checks keys, asks for the replacement and cannot revoke.
     admin_key_env: OPENAI_ADMIN_KEY
+    # API base URL, without /v1. Default: https://api.openai.com
+    api_url: https://api.openai.com

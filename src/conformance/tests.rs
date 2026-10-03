@@ -89,6 +89,23 @@ async fn second_revoke_error_fails_idempotent_revoke() {
     assert!(message.contains("idempotent_revoke"), "{message}");
 }
 
+// SHA-262: a provider that cannot revoke at all (OpenAI without an admin
+// key) skips the revoke checks rather than failing them.
+#[tokio::test]
+async fn unsupported_revoke_skips_revoke_checks() {
+    let report = provider_suite(|| async {
+        let mock = MockProvider::new("mock");
+        mock.fail_always(
+            "revoke",
+            ProviderError::Unsupported("needs an admin key".into()),
+        );
+        provider_fixture(mock)
+    })
+    .await;
+    report.assert_ok();
+    assert_eq!(report.skipped(), ["idempotent_revoke", "restore_outcome"]);
+}
+
 // T3 (AC3)
 #[tokio::test]
 async fn mutation_in_check_valid_fails_read_only_check_valid() {
