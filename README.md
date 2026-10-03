@@ -55,8 +55,27 @@ What works now:
   `force` audit entry per consumer revoked past, with the actor, before the
   revoke. It never skips a failed create or verify. If the revoke itself
   fails, the summary says the replacement is live and the old secret may
-  still be valid. With an overlap window above 0 the revoke is recorded as
-  pending and apply exits 3.
+  still be valid. With an overlap window above 0 (`--overlap`, `overlap_window`
+  in `rotate.yaml`, default 0) the revoke is recorded as pending with its
+  earliest time (`revoke_not_before`) and apply exits 3, saying when to
+  re-run. `--wait` instead sleeps until then and revokes in the same run.
+- Re-running `rotate apply` with the same input is idempotent and resumes
+  where the last run stopped, never repeating a state-changing step: a
+  pending revoke is completed once its time has passed (before then the
+  re-run makes no state-changing call and exits 3 with the time left; a
+  different `--overlap` does not move a recorded time); a run killed after
+  updating consumers resumes at verify, checking the replacement by its
+  provider reference (AWS: the new key is Active and belongs to the same
+  IAM user; a provider that cannot check by reference, such as GitHub, or a
+  pasted replacement leaves it `needs_rollback`); a run stopped by a failed
+  verify or revoke continues from that step, and one whose create failed
+  starts over. Steps not repeated are audited with outcome `skipped`. A rotation
+  stopped after the replacement was created but before every consumer held
+  it cannot be resumed by a new process, because rotate never stores the
+  replacement's value: apply marks it `needs_rollback`, updates nothing,
+  and tells you to run `rotate rollback` with the same input, then apply
+  again. A secret whose rotation finished is listed by `plan` and `apply`
+  as "already rotated on <date>" and no call is made for it.
 - Manual replacement mode, for providers whose API cannot mint a
   replacement (GitHub and npm tokens). Apply prints what to create, then
   asks you to paste the new secret with terminal echo turned off. It is
@@ -116,9 +135,9 @@ Not done yet:
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
   providers exist only behind the `test-providers` cargo feature, for tests.
-- `rotate apply`: resuming an interrupted, failed or pending rotation (only
-  a rotation held at `verified` can be re-run, to finish it with `--force`),
-  and `--json`.
+- `rotate apply --json`. Resuming a manual-mode rotation after the process
+  exited by pasting the same replacement again (such a rotation is marked
+  `needs_rollback`).
 - `rotate status`. It is a stub. `rotate rollback` has no `--json` yet.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).

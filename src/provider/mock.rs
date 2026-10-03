@@ -406,6 +406,40 @@ impl Provider for MockProvider {
         Ok(())
     }
 
+    /// Checks a replacement by its ref. One this mock minted must belong to
+    /// `identity`; one it did not mint (another process made it) is
+    /// accepted unless it was revoked here.
+    async fn verify_replacement(
+        &self,
+        replacement_ref: &str,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let fingerprint = lock(&self.created).get(replacement_ref).cloned();
+        self.enter_ref(
+            "verify_replacement",
+            fingerprint.clone(),
+            Some(replacement_ref),
+        )?;
+        let Some(fingerprint) = fingerprint else {
+            return Ok(());
+        };
+        if self.is_revoked(&fingerprint) {
+            return Err(ProviderError::Permanent(format!(
+                "replacement {replacement_ref} is revoked"
+            )));
+        }
+        let owner = self
+            .owners
+            .get(&fingerprint)
+            .unwrap_or(&self.scope.identity);
+        if identity != owner {
+            return Err(ProviderError::Permanent(format!(
+                "replacement {replacement_ref} belongs to {owner}, not {identity}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError> {
         self.enter_with("revoke", credential)?;
         let restore_ref = match credential.key_id() {
@@ -595,6 +629,39 @@ mod tests {
         ));
         assert_eq!(mock.check_valid(&cred).await.unwrap(), Validity::Valid);
         assert_eq!(mock.call_log().len(), 3);
+    }
+
+    // SHA-258: a replacement checked by its ref, read-only.
+    #[tokio::test]
+    async fn verify_replacement_by_ref() {
+        let mock = MockProvider::new("mock");
+        let identity = mock.identity();
+        let minted = mock.create_replacement(&token("mock_abc")).await.unwrap();
+        let reference = minted.replacement_ref.clone();
+        mock.verify_replacement(&reference, &identity)
+            .await
+            .unwrap();
+        mock.verify_replacement("made-elsewhere", &identity)
+            .await
+            .unwrap();
+        assert!(mock
+            .verify_replacement(&reference, &Identity("other".into()))
+            .await
+            .is_err());
+        mock.revoke_replacement(&reference).await.unwrap();
+        assert!(mock
+            .verify_replacement(&reference, &identity)
+            .await
+            .is_err());
+        let checks: Vec<_> = mock
+            .call_log()
+            .calls()
+            .into_iter()
+            .filter(|c| c.method == "verify_replacement")
+            .collect();
+        assert_eq!(checks.len(), 4);
+        assert!(checks.iter().all(|c| !c.mutating));
+        assert_eq!(checks[1].reference.as_deref(), Some("made-elsewhere"));
     }
 
     // T5 (AC5)

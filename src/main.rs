@@ -150,7 +150,9 @@ fn runtime(console: &mut Console) -> Result<tokio::runtime::Runtime, Exit> {
 }
 
 /// Assesses `findings`, builds the plan and gives every rotation its id in
-/// `store`. Only read-only remote calls are made (SHA-250).
+/// `store`. Only read-only remote calls are made (SHA-250). Findings whose
+/// secret was already rotated are skipped first, with no call at all
+/// (SHA-258).
 fn build_plan(
     console: &mut Console,
     runtime: &tokio::runtime::Runtime,
@@ -170,6 +172,8 @@ fn build_plan(
             .map(|provider| provider.name()),
         ..AssessOptions::default()
     };
+    let (findings, already_rotated) =
+        plan::split_already_rotated(findings, store.rotations(), registry);
     let mut plan = runtime.block_on(async {
         let assessed = assess(findings, registry, &opts).await;
         plan::build(
@@ -181,6 +185,7 @@ fn build_plan(
         )
         .await
     });
+    plan.skipped.extend(already_rotated);
     if let Err(err) = plan::assign_ids(&mut plan, store) {
         return Err(state_error(console, err));
     }
@@ -380,7 +385,11 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         };
         let mut executor = Executor::new(&registry, &consumers, &mut store, &mut audit)
             .with_force(args.force)
+            .with_wait(args.wait)
             .with_manual(source, &mut *console);
+        if let Some(clock) = providers::clock() {
+            executor = executor.with_clock(clock);
+        }
         runtime.block_on(async {
             for rotation in &requested {
                 outcomes.push(executor.run(rotation).await);

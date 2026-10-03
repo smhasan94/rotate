@@ -100,6 +100,16 @@ pub fn prompt() -> Option<Box<dyn Prompt>> {
     None
 }
 
+/// The clock apply uses for the overlap window when a test scenario sets
+/// `clock_offset_secs` (SHA-258). Without `test-providers` always `None`:
+/// apply uses the system clock.
+pub fn clock() -> Option<fn() -> time::OffsetDateTime> {
+    #[cfg(feature = "test-providers")]
+    return scenario::clock();
+    #[cfg(not(feature = "test-providers"))]
+    None
+}
+
 /// Called once before exit. With `test-providers`, writes the shared call
 /// log to the scenario's `call_log` path; otherwise does nothing.
 pub fn finish() {
@@ -134,6 +144,9 @@ pub fn finish() {
 /// `{"tty": "<device>"}` to read a pseudo-terminal with the real hidden
 /// prompt; `providers.<name>.foreign` lists fingerprints that `verify`
 /// reports as belonging to another identity.
+///
+/// For resume (SHA-258): `clock_offset_secs` moves the clock apply uses
+/// for the overlap window by that many seconds from now.
 ///
 /// For rollback (SHA-259): `providers.<name>.restore` is `"unsupported"` to
 /// make `restore` return `Unsupported`; each call-log line also has
@@ -174,6 +187,7 @@ mod scenario {
         call_log: Option<PathBuf>,
         consumer_state: Option<PathBuf>,
         prompt: Option<serde_json::Value>,
+        clock_offset_secs: Option<i64>,
     }
 
     #[derive(Default, Deserialize)]
@@ -379,6 +393,14 @@ mod scenario {
                 Box::new(ScriptedPrompt::new(answers))
             }
             other => panic!("{ENV}: unknown prompt {other}"),
+        })
+    }
+
+    pub fn clock() -> Option<fn() -> time::OffsetDateTime> {
+        loaded().scenario.clock_offset_secs?;
+        Some(|| {
+            let offset = loaded().scenario.clock_offset_secs.unwrap_or_default();
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(offset)
         })
     }
 

@@ -1132,6 +1132,54 @@ async fn revoke_replacement_deactivates_key_by_id() {
     assert!(updates(&rec).await.is_empty());
 }
 
+// SHA-258: resume re-verifies the replacement by its key id with the
+// operator's credentials, read-only: same user and Active.
+#[tokio::test]
+async fn verify_replacement_checks_owner_and_status_read_only() {
+    let new_id = key_id("AKIA", "R8NEWKY");
+    for (status, user, ok) in [
+        ("Active", "max", true),
+        ("Inactive", "max", false),
+        ("Active", "someone", false),
+    ] {
+        let rec = recorder().await;
+        mount_iam(&rec, user).await;
+        mount_keys(&rec, user, &[(&new_id, status)]).await;
+        let result = provider(&rec)
+            .verify_replacement(&new_id, &Identity(user_arn("max")))
+            .await;
+        assert_eq!(result.is_ok(), ok, "{status} {user}: {result:?}");
+        if let Err(err) = result {
+            let text = err.to_string();
+            assert!(
+                text.contains("not Active") || text.contains("belongs to IAM user someone"),
+                "{text}"
+            );
+        }
+        assert_no_mutating_actions(&rec).await;
+    }
+
+    let rec = recorder().await;
+    mount_iam(&rec, "max").await;
+    mount_keys(&rec, "max", &[]).await;
+    let err = provider(&rec)
+        .verify_replacement(&new_id, &Identity(user_arn("max")))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no longer exists"), "{err}");
+
+    let rec = recorder().await;
+    let err = provider(&rec)
+        .verify_replacement("manual", &Identity(user_arn("max")))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not an AWS access key id"),
+        "{err}"
+    );
+    assert!(rec.calls().await.is_empty());
+}
+
 /// A TRACE-level capture installed as this binary's global subscriber.
 ///
 /// Global rather than scoped: with a scoped subscriber, tests running on
