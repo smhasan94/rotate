@@ -77,7 +77,8 @@ What works now:
   again. A secret whose rotation finished is listed by `plan` and `apply`
   as "already rotated on <date>" and no call is made for it.
 - Manual replacement mode, for providers whose API cannot mint a
-  replacement (GitHub and npm tokens). Apply prints what to create, then
+  replacement (GitHub and npm tokens, and OpenAI keys without an Admin API
+  key). Apply prints what to create, then
   asks you to paste the new secret with terminal echo turned off. It is
   accepted only once the provider confirms it belongs to the same account
   as the leaked one; a wrong paste is asked for again, up to three times,
@@ -117,6 +118,29 @@ What works now:
   credential revocation API, which needs no token of yours. Installation
   tokens (`ghs_`) are reported but not revoked: they expire within an hour.
   See [docs/permissions.md](docs/permissions.md).
+- npm access tokens (`npm_`, granular and `npm login` session tokens) are
+  identified by prefix and checked with `GET /-/whoami`; the plan shows the
+  npm user and, from your own token list, the token's type, access,
+  permissions, scopes, IP ranges and expiry. Set `ROTATE_NPM_TOKEN` (or
+  `NPM_TOKEN`) to an `npm login` session token of the same account; without
+  it the plan says the token is not visible to the operator account. Apply
+  asks for the new granular token in manual mode, checks it belongs to the
+  same user, and deletes the leaked one by its token id. An account that
+  asks for a one-time password to delete tokens makes the revoke fail
+  safely, naming the page to delete it on. See
+  [docs/permissions.md](docs/permissions.md).
+- OpenAI API keys (`sk-proj-`, `sk-svcacct-` and legacy `sk-` keys) are
+  identified by prefix and checked with `GET /v1/models`. With an Admin API
+  key in `OPENAI_ADMIN_KEY` (or the variable `providers.openai.admin_key_env`
+  names), the plan shows the key's project, name, owner, created and last
+  used times; apply creates a service account in the same project for the
+  replacement, checks the new key is listed there, and deletes the leaked
+  key (a user key by id; a service-account key by deleting its service
+  account when that is its only key). Rollback deletes the replacement's
+  service account. Without an admin key apply runs in manual mode and
+  cannot revoke: the plan says to delete the key on the OpenAI dashboard.
+  Admin keys (`sk-admin-`) are identified but not rotated. See
+  [docs/permissions.md](docs/permissions.md).
 - `plan` and `apply` search two real consumers, using the targets in
   `rotate.yaml`: GitHub Actions secrets, matched by name in the
   `consumers.github_actions.targets` repos and orgs and written as sealed
@@ -126,15 +150,14 @@ What works now:
   top-level JSON string field) and written as a new version with the
   standard AWS credentials. With those sections empty, neither makes a
   call.
-
-Not done yet:
-
-- Rotating npm and OpenAI secrets: those providers do not exist yet, so a
-  release build reports them as unsupported. The AWS IAM provider
+- All four MVP providers register in release builds. The AWS IAM provider
   is complete: validity with the leaked key's one `sts:GetCallerIdentity`
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
   providers exist only behind the `test-providers` cargo feature, for tests.
+
+Not done yet:
+
 - `rotate apply --json`. Resuming a manual-mode rotation after the process
   exited by pasting the same replacement again (such a rotation is marked
   `needs_rollback`).

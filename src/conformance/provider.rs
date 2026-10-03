@@ -7,7 +7,7 @@ use super::{
     canary, failed_if_any, mutations_during, MutationProbe, Outcome, Recorder, SuiteReport,
 };
 use crate::finding::{Finding, SourceLocation, ACCESS_KEY_ID};
-use crate::provider::{Credential, Identity, Provider, ReplacementMode, Validity};
+use crate::provider::{Credential, Identity, Provider, ProviderError, ReplacementMode, Validity};
 use crate::secret::SecretValue;
 
 /// One provider wired to a test server, built fresh for every check.
@@ -226,12 +226,20 @@ async fn verify_wrong_identity_fails(fx: &ProviderFixture, rec: &mut Recorder) -
     failed_if_any(problems)
 }
 
+/// Why the revoke checks are skipped: the provider cannot revoke this
+/// credential at all (for example OpenAI without an Admin API key).
+fn revoke_unsupported(e: &ProviderError) -> Option<Outcome> {
+    matches!(e, ProviderError::Unsupported(_))
+        .then(|| Outcome::Skipped("revoke is unsupported for this credential".into()))
+}
+
 async fn idempotent_revoke(fx: &ProviderFixture, rec: &mut Recorder) -> Outcome {
     if let Err(e) = fx.provider.revoke(&fx.live).await {
-        return Outcome::Failed(format!(
-            "first revoke returned an error: {}",
-            rec.error("revoke", &e)
-        ));
+        let text = rec.error("revoke", &e);
+        if let Some(skipped) = revoke_unsupported(&e) {
+            return skipped;
+        }
+        return Outcome::Failed(format!("first revoke returned an error: {text}"));
     }
     match fx.provider.revoke(&fx.live).await {
         Ok(_) => Outcome::Passed,
@@ -246,10 +254,14 @@ async fn restore_outcome(fx: &ProviderFixture, rec: &mut Recorder) -> Outcome {
     let revoked = match fx.provider.revoke(&fx.live).await {
         Ok(revoked) => revoked,
         Err(e) => {
+            if let Some(skipped) = revoke_unsupported(&e) {
+                rec.error("revoke", &e);
+                return skipped;
+            }
             return Outcome::Failed(format!(
                 "revoke returned an error: {}",
                 rec.error("revoke", &e)
-            ))
+            ));
         }
     };
     let Some(restore_ref) = revoked.restore_ref else {

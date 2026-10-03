@@ -54,6 +54,7 @@ const TOKEN_HEX_LEN: usize = 40;
 pub struct SecretsManagerConsumer {
     config: SecretsManagerConfig,
     region: Option<String>,
+    endpoint_url: Option<String>,
     client: OnceCell<Client>,
 }
 
@@ -64,8 +65,16 @@ impl SecretsManagerConsumer {
         Self {
             config,
             region,
+            endpoint_url: None,
             client: OnceCell::new(),
         }
+    }
+
+    /// Sends Secrets Manager calls to `url` instead of AWS
+    /// (`providers.aws.endpoint_url`, SHA-264). Makes no call.
+    pub fn with_endpoint_url(mut self, url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(url.into());
+        self
     }
 
     /// A consumer that uses `client` instead of building one, for tests
@@ -74,6 +83,7 @@ impl SecretsManagerConsumer {
         Self {
             config,
             region: None,
+            endpoint_url: None,
             client: OnceCell::new_with(Some(client)),
         }
     }
@@ -84,6 +94,9 @@ impl SecretsManagerConsumer {
                 let mut loader = aws_config::defaults(BehaviorVersion::latest());
                 if let Some(region) = &self.region {
                     loader = loader.region(Region::new(region.clone()));
+                }
+                if let Some(url) = &self.endpoint_url {
+                    loader = loader.endpoint_url(url.clone());
                 }
                 Client::new(&loader.load().await)
             })
@@ -211,6 +224,7 @@ impl fmt::Debug for SecretsManagerConsumer {
         f.debug_struct("SecretsManagerConsumer")
             .field("config", &self.config)
             .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
             .field("client_built", &self.client.initialized())
             .finish()
     }

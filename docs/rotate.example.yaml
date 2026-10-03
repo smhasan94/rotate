@@ -66,6 +66,9 @@ providers:
     # Region for IAM, STS and Secrets Manager. Omit to use the AWS
     # environment (AWS_REGION and so on).
     region: us-east-1
+    # Send STS, IAM and Secrets Manager calls to this URL instead of AWS,
+    # for LocalStack or a local test server. Default: AWS's own endpoints.
+    # endpoint_url: http://localhost:4566
   github:
     # REST API base URL; change it for GitHub Enterprise Server.
     # Default: https://api.github.com
@@ -75,5 +78,8 @@ providers:
     registry: https://registry.npmjs.org
   openai:
     # Name of the environment variable that holds the OpenAI Admin API key.
-    # Default: OPENAI_ADMIN_KEY
+    # Default: OPENAI_ADMIN_KEY. Without it the OpenAI provider runs in manual
+    # mode: it checks keys, asks for the replacement and cannot revoke.
     admin_key_env: OPENAI_ADMIN_KEY
+    # API base URL, without /v1. Default: https://api.openai.com
+    api_url: https://api.openai.com

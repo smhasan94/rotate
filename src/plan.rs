@@ -35,6 +35,11 @@ pub const MANUAL_REPLACEMENT: &str = "manual: you will be asked to paste the new
 /// Skip reason for a secret whose rotation already finished (SHA-258).
 pub const ALREADY_ROTATED: &str = "already rotated";
 
+/// Blocker for a credential the provider cannot revoke (see
+/// [`Provider::manual_revoke`](crate::provider::Provider::manual_revoke)).
+pub const MANUAL_REVOKE_BLOCKER: &str =
+    "rotate cannot revoke this credential; apply updates consumers and verifies, then stops at revoke: delete the old one by hand";
+
 /// Blocker wording shared by every reason apply would stop before revoke.
 const REFUSE_REVOKE: &str = "apply will refuse to revoke without --force";
 
@@ -178,10 +183,10 @@ pub fn consumer_names(provider: &str, config: &ConsumersConfig) -> ConsumerNames
 /// What revoke does at `provider`, as shown in the plan.
 pub fn revoke_action(provider: &str) -> &'static str {
     match provider {
-        "aws" => "deactivate the access key, then delete it",
+        "aws" => "deactivate the access key (not deleted; rollback can reactivate it)",
         "github" => "revoke the token (GitHub credential revocation API)",
         "npm" => "delete the access token",
-        "openai" => "delete the API key",
+        "openai" => "delete the API key (OpenAI Admin API)",
         _ => "revoke the credential",
     }
 }
@@ -286,6 +291,9 @@ pub async fn build(
             }
         }
 
+        let manual_revoke = providers
+            .get(provider)
+            .and_then(|p| p.manual_revoke(item.scope.as_ref()));
         let mut rotation = PlannedRotation {
             rotation_id: String::new(),
             provider,
@@ -298,13 +306,16 @@ pub async fn build(
                 .map_or(ReplacementMode::Automatic, |p| p.replacement_mode()),
             consumers: planned,
             lookup_errors,
-            revoke_action: revoke_action(provider),
+            revoke_action: manual_revoke.unwrap_or_else(|| revoke_action(provider)),
             overlap_window,
             blockers: Vec::new(),
             step: Step::Planned,
             sources: item.sources,
         };
         rotation.blockers = blockers(&rotation);
+        if manual_revoke.is_some() {
+            rotation.blockers.push(MANUAL_REVOKE_BLOCKER.to_owned());
+        }
         plan.rotations.push(rotation);
     }
     plan
