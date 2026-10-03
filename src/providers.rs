@@ -1,8 +1,9 @@
 //! The provider and consumer registries the CLI runs with.
 //!
 //! Real plugins register in builds without `test-providers`: the AWS
-//! provider (SHA-251), the AWS Secrets Manager consumer (SHA-252) and the
-//! GitHub Actions secrets consumer (SHA-253).
+//! provider (SHA-251), the GitHub token provider (SHA-260), the AWS Secrets
+//! Manager consumer (SHA-252) and the GitHub Actions secrets consumer
+//! (SHA-253).
 //! Constructing one makes no call and loads no credentials; that happens on
 //! first use. The `test-providers` feature instead registers
 //! `MockProvider`s under the four real names so integration tests can drive
@@ -22,8 +23,8 @@ pub fn registry() -> ProviderRegistry {
 }
 
 /// Every provider this build knows, configured from `rotate.yaml`
-/// (`providers.aws.region`). Building the registry makes no network call
-/// and loads no credentials.
+/// (`providers.aws.region`, `providers.github.api_url`). Building the
+/// registry makes no network call and loads no credentials.
 pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
     #[allow(unused_mut)]
     let mut registry = ProviderRegistry::new();
@@ -33,8 +34,17 @@ pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
         scenario::register_providers(&mut registry);
     }
     #[cfg(not(feature = "test-providers"))]
-    registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
+    {
+        registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
+        registry.register(std::sync::Arc::new(github_provider(&config.github)));
+    }
     registry
+}
+
+/// The GitHub token provider (SHA-260) for the configured API URL.
+#[cfg(any(test, not(feature = "test-providers")))]
+fn github_provider(config: &GithubConfig) -> rotate::provider::github::GithubProvider {
+    rotate::provider::github::GithubProvider::new(config.api_url.as_str())
 }
 
 /// The AWS provider with the configured region, if any.
@@ -409,6 +419,28 @@ mod tests {
         config.region = Some("eu-west-1".into());
         let debug = format!("{:?}", aws_provider(&config));
         assert!(debug.contains("region: Some(\"eu-west-1\")"), "{debug}");
+    }
+
+    #[test]
+    fn github_api_url_comes_from_config() {
+        use rotate::provider::Provider as _;
+        let mut config = GithubConfig::default();
+        let provider = github_provider(&config);
+        assert_eq!(provider.name(), "github");
+        assert_eq!(provider.web_url(), "https://github.com");
+        config = serde_norway::from_str("api_url: https://ghe.example.com/api/v3\n").unwrap();
+        let debug = format!("{:?}", github_provider(&config));
+        assert!(
+            debug.contains("base: \"https://ghe.example.com/api/v3\""),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn registry_with_registers_github() {
+        assert!(registry_with(&ProvidersConfig::default())
+            .get("github")
+            .is_some());
     }
 
     #[test]

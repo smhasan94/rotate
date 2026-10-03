@@ -1,5 +1,5 @@
 //! A small GitHub REST client shared by the GitHub Actions consumer
-//! (SHA-253) and, later, the GitHub token provider (SHA-260).
+//! (SHA-253) and the GitHub token provider (SHA-260).
 //!
 //! It knows the base URL, the operator token, the standard headers,
 //! `Link`-header pagination and GitHub's rate-limit signals. It knows
@@ -7,8 +7,11 @@
 //! not touch the OS trust store; the HTTP client is built on first use.
 //!
 //! The operator token is a [`SecretValue`] and only ever leaves it as a
-//! header marked sensitive. Errors carry the HTTP status and GitHub's own
-//! `message` field, never a request body.
+//! header marked sensitive. A request can instead be signed with another
+//! token ([`Auth::Token`], the provider's check of a leaked token) or sent
+//! with no `Authorization` header at all ([`Auth::Anonymous`], which the
+//! credential revocation API requires). Errors carry the HTTP status and
+//! GitHub's own `message` field, never a request body.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -23,6 +26,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::consumer::ConsumerError;
+use crate::provider::ProviderError;
 use crate::secret::SecretValue;
 
 /// Environment variables holding the operator token, in order of
@@ -109,6 +113,41 @@ impl From<GithubError> for ConsumerError {
     }
 }
 
+impl From<GithubError> for ProviderError {
+    fn from(err: GithubError) -> Self {
+        match err {
+            GithubError::RateLimited { retry_after } => ProviderError::RateLimited { retry_after },
+            GithubError::Status { status, .. } if status >= 500 => {
+                ProviderError::Transient(err.to_string())
+            }
+            GithubError::Transport(_) => ProviderError::Transient(err.to_string()),
+            other => ProviderError::Permanent(other.to_string()),
+        }
+    }
+}
+
+/// How a request is authenticated.
+#[derive(Clone, Copy)]
+pub enum Auth<'a> {
+    /// The operator token the client was built with.
+    Operator,
+    /// Another token, for example the one a provider is checking. Sent as a
+    /// sensitive `Authorization: Bearer` header only.
+    Token(&'a SecretValue),
+    /// No `Authorization` header.
+    Anonymous,
+}
+
+impl fmt::Debug for Auth<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Auth::Operator => "Operator",
+            Auth::Token(_) => "Token",
+            Auth::Anonymous => "Anonymous",
+        })
+    }
+}
+
 /// A GitHub REST client for one API base URL and operator token.
 pub struct GithubClient {
     base: String,
@@ -159,17 +198,28 @@ impl GithubClient {
             .map_err(|e| GithubError::Transport(e.clone()))
     }
 
+    #[cfg(test)]
     fn headers(&self) -> Result<HeaderMap, GithubError> {
-        let token = self.token.as_ref().ok_or(GithubError::NoToken)?;
-        let mut auth = token.expose_secret(|t| {
-            let mut bytes = Zeroizing::new(Vec::with_capacity(t.len() + 7));
-            bytes.extend_from_slice(b"Bearer ");
-            bytes.extend_from_slice(t);
-            HeaderValue::from_bytes(&bytes).map_err(|_| GithubError::InvalidToken)
-        })?;
-        auth.set_sensitive(true);
+        self.headers_for(Auth::Operator)
+    }
+
+    fn headers_for(&self, auth: Auth<'_>) -> Result<HeaderMap, GithubError> {
+        let token = match auth {
+            Auth::Operator => Some(self.token.as_ref().ok_or(GithubError::NoToken)?),
+            Auth::Token(token) => Some(token),
+            Auth::Anonymous => None,
+        };
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, auth);
+        if let Some(token) = token {
+            let mut value = token.expose_secret(|t| {
+                let mut bytes = Zeroizing::new(Vec::with_capacity(t.len() + 7));
+                bytes.extend_from_slice(b"Bearer ");
+                bytes.extend_from_slice(t);
+                HeaderValue::from_bytes(&bytes).map_err(|_| GithubError::InvalidToken)
+            })?;
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
         headers.insert(
             ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),
@@ -197,10 +247,27 @@ impl GithubClient {
         url: &str,
         body: Option<&B>,
     ) -> Result<Response, GithubError> {
-        let mut request = self.http()?.request(method, url).headers(self.headers()?);
-        if let Some(body) = body {
-            request = request.json(body);
-        }
+        self.send_as(method, url, Auth::Operator, |request| match body {
+            Some(body) => request.json(body),
+            None => request,
+        })
+        .await
+    }
+
+    /// Sends one request signed as `auth`, after `build` adds a body, and
+    /// returns the response when its status is a success.
+    async fn send_as(
+        &self,
+        method: Method,
+        url: &str,
+        auth: Auth<'_>,
+        build: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<Response, GithubError> {
+        let request = build(
+            self.http()?
+                .request(method, url)
+                .headers(self.headers_for(auth)?),
+        );
         let response = request
             .send()
             .await
@@ -220,6 +287,42 @@ impl GithubClient {
         decode(response).await
     }
 
+    /// `GET {base}{path}` signed as `auth`, decoded as JSON, with the
+    /// response headers (for example `x-oauth-scopes`).
+    pub async fn get_json_as<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        auth: Auth<'_>,
+    ) -> Result<(T, HeaderMap), GithubError> {
+        let response = self
+            .send_as(Method::GET, &self.url(path), auth, |r| r)
+            .await?;
+        let headers = response.headers().clone();
+        Ok((decode(response).await?, headers))
+    }
+
+    /// `POST {base}{path}` signed as `auth` with a JSON `body` the caller
+    /// built in zeroized memory; returns the success status. reqwest gets
+    /// its own copy of the bytes and frees it without wiping, as it does
+    /// for every header value.
+    pub async fn post_as(
+        &self,
+        path: &str,
+        body: &Zeroizing<Vec<u8>>,
+        auth: Auth<'_>,
+    ) -> Result<u16, GithubError> {
+        let response = self
+            .send_as(Method::POST, &self.url(path), auth, |r| {
+                r.header(
+                    reqwest::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )
+                .body(body.to_vec())
+            })
+            .await?;
+        Ok(response.status().as_u16())
+    }
+
     /// `GET {base}{path}` for a paged list wrapped in an object, for
     /// example `{"total_count": 2, "secrets": [...]}`: collects `field` from
     /// every page, following `Link: rel="next"` while it stays under the
@@ -229,11 +332,21 @@ impl GithubClient {
         path: &str,
         field: Option<&str>,
     ) -> Result<Vec<T>, GithubError> {
+        self.get_paged_as(path, field, Auth::Operator).await
+    }
+
+    /// [`GithubClient::get_paged`] signed as `auth`.
+    pub async fn get_paged_as<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        field: Option<&str>,
+        auth: Auth<'_>,
+    ) -> Result<Vec<T>, GithubError> {
         let sep = if path.contains('?') { '&' } else { '?' };
         let mut url = format!("{}{sep}per_page={PER_PAGE}", self.url(path));
         let mut items = Vec::new();
         for _ in 0..MAX_PAGES {
-            let response = self.send_url::<()>(Method::GET, &url, None).await?;
+            let response = self.send_as(Method::GET, &url, auth, |r| r).await?;
             let next = next_link(response.headers());
             let page: serde_json::Value = decode(response).await?;
             let list = match field {
@@ -464,6 +577,51 @@ mod tests {
         assert!(!format!("{headers:?}").contains("hdr-tok-1"));
         let client = GithubClient::new("https://x.test", None);
         assert_eq!(client.headers().unwrap_err(), GithubError::NoToken);
+    }
+
+    #[test]
+    fn headers_for_token_and_anonymous() {
+        let client = GithubClient::new("https://x.test", None);
+        let anon = client.headers_for(Auth::Anonymous).unwrap();
+        assert!(anon.get(AUTHORIZATION).is_none());
+        assert!(anon.get(USER_AGENT).is_some());
+        let leaked = SecretValue::from("auth-token-canary-3c");
+        let signed = client.headers_for(Auth::Token(&leaked)).unwrap();
+        assert!(signed[AUTHORIZATION].is_sensitive());
+        assert_eq!(
+            signed[AUTHORIZATION].to_str().unwrap(),
+            "Bearer auth-token-canary-3c"
+        );
+        assert!(!format!("{signed:?}").contains("auth-token-canary"));
+        assert_eq!(format!("{:?}", Auth::Token(&leaked)), "Token");
+        let bad = SecretValue::from("tok\nbad");
+        assert_eq!(
+            client.headers_for(Auth::Token(&bad)).unwrap_err(),
+            GithubError::InvalidToken
+        );
+    }
+
+    #[test]
+    fn provider_error_mapping() {
+        let rate = GithubError::RateLimited { retry_after: None };
+        assert_eq!(
+            ProviderError::from(rate),
+            ProviderError::RateLimited { retry_after: None }
+        );
+        let s503 = GithubError::Status {
+            status: 503,
+            message: "busy".into(),
+        };
+        assert!(ProviderError::from(s503).is_retryable());
+        let s422 = GithubError::Status {
+            status: 422,
+            message: "Validation Failed".into(),
+        };
+        assert_eq!(
+            ProviderError::from(s422),
+            ProviderError::Permanent("GitHub returned 422: Validation Failed".into())
+        );
+        assert!(ProviderError::from(GithubError::Transport("reset".into())).is_retryable());
     }
 
     #[test]

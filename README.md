@@ -71,6 +71,15 @@ What works now:
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 - AWS access keys are identified and checked with STS, signed with the
   leaked key itself.
+- GitHub tokens (classic and fine-grained personal access tokens, OAuth app
+  and GitHub App tokens) are identified by prefix and checked with `GET
+  /user`; the plan shows the login, token type, classic scopes (fine-grained
+  permissions are not readable through the API) and orgs. Apply asks for
+  the new token in manual mode, naming the scopes to give it, checks it
+  belongs to the same login, and revokes the leaked one through GitHub's
+  credential revocation API, which needs no token of yours. Installation
+  tokens (`ghs_`) are reported but not revoked: they expire within an hour.
+  See [docs/permissions.md](docs/permissions.md).
 - `plan` and `apply` search two real consumers, using the targets in
   `rotate.yaml`: GitHub Actions secrets, matched by name in the
   `consumers.github_actions.targets` repos and orgs and written as sealed
@@ -83,8 +92,8 @@ What works now:
 
 Not done yet:
 
-- Rotating GitHub, npm and OpenAI secrets: those providers do not exist
-  yet, so a release build reports them as unsupported. The AWS IAM provider
+- Rotating npm and OpenAI secrets: those providers do not exist yet, so a
+  release build reports them as unsupported. The AWS IAM provider
   is complete: validity with the leaked key's one `sts:GetCallerIdentity`
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
