@@ -1,7 +1,8 @@
 //! The provider and consumer registries the CLI runs with.
 //!
 //! Real plugins register in builds without `test-providers`: the AWS
-//! provider (SHA-251), the GitHub token provider (SHA-260), the AWS Secrets
+//! provider (SHA-251), the GitHub token provider (SHA-260), the npm token
+//! provider (SHA-261), the AWS Secrets
 //! Manager consumer (SHA-252) and the GitHub Actions secrets consumer
 //! (SHA-253).
 //! Constructing one makes no call and loads no credentials; that happens on
@@ -23,7 +24,8 @@ pub fn registry() -> ProviderRegistry {
 }
 
 /// Every provider this build knows, configured from `rotate.yaml`
-/// (`providers.aws.region`, `providers.github.api_url`). Building the
+/// (`providers.aws.region`, `providers.github.api_url`,
+/// `providers.npm.registry`). Building the
 /// registry makes no network call and loads no credentials.
 pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
     #[allow(unused_mut)]
@@ -37,6 +39,7 @@ pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
     {
         registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
         registry.register(std::sync::Arc::new(github_provider(&config.github)));
+        registry.register(std::sync::Arc::new(npm_provider(&config.npm)));
     }
     registry
 }
@@ -45,6 +48,13 @@ pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
 #[cfg(any(test, not(feature = "test-providers")))]
 fn github_provider(config: &GithubConfig) -> rotate::provider::github::GithubProvider {
     rotate::provider::github::GithubProvider::new(config.api_url.as_str())
+}
+
+/// The npm token provider (SHA-261) for the configured registry. The
+/// operator token is read from the environment on first use.
+#[cfg(any(test, not(feature = "test-providers")))]
+fn npm_provider(config: &rotate::config::NpmConfig) -> rotate::provider::npm::NpmProvider {
+    rotate::provider::npm::NpmProvider::new(config.registry.as_str())
 }
 
 /// The AWS provider with the configured region, if any.
@@ -454,6 +464,30 @@ mod tests {
     fn registry_with_registers_github() {
         assert!(registry_with(&ProvidersConfig::default())
             .get("github")
+            .is_some());
+    }
+
+    #[test]
+    fn npm_registry_comes_from_config() {
+        use rotate::config::NpmConfig;
+        use rotate::provider::Provider as _;
+        let provider = npm_provider(&NpmConfig::default());
+        assert_eq!(provider.name(), "npm");
+        assert_eq!(provider.registry_url(), "https://registry.npmjs.org");
+        assert_eq!(provider.web_url(), Some("https://www.npmjs.com"));
+        let config: NpmConfig =
+            serde_norway::from_str("registry: http://127.0.0.1:4873/\n").unwrap();
+        let provider = npm_provider(&config);
+        assert_eq!(provider.registry_url(), "http://127.0.0.1:4873");
+        assert_eq!(provider.web_url(), None);
+        // Building it read no operator token.
+        assert!(format!("{provider:?}").contains("[not loaded]"));
+    }
+
+    #[test]
+    fn registry_with_registers_npm() {
+        assert!(registry_with(&ProvidersConfig::default())
+            .get("npm")
             .is_some());
     }
 

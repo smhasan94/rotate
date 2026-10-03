@@ -9,6 +9,7 @@
 pub mod aws;
 pub mod github;
 pub mod mock;
+pub mod npm;
 
 use std::fmt;
 use std::sync::Arc;
