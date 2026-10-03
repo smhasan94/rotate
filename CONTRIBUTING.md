@@ -87,7 +87,10 @@ breaks interop fails `cargo test`.
 
 GitHub REST calls go through `rotate::github::GithubClient` (base URL,
 operator token from `ROTATE_GITHUB_TOKEN` then `GITHUB_TOKEN`, pagination,
-rate limits). Reuse it rather than building another reqwest client.
+rate limits). Reuse it rather than building another reqwest client. The
+`*_as` calls take an `Auth`: the operator token, another token (the GitHub
+provider's read-only checks of a leaked token) or none (the credential
+revocation API rejects authenticated requests).
 
 ## Writing tests
 
