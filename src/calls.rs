@@ -18,6 +18,9 @@ pub struct Call {
     pub mutating: bool,
     /// Fingerprint of the credential the call operated on, when any.
     pub fingerprint: Option<Fingerprint>,
+    /// The reference the call targeted, when it took one: a consumer ref,
+    /// a restore handle or a replacement ref (SHA-259). Never a value.
+    pub reference: Option<String>,
 }
 
 /// Append-only log of [`Call`]s, cheaply cloneable and shared between the
@@ -100,6 +103,7 @@ mod tests {
             method: method.into(),
             mutating,
             fingerprint: None,
+            reference: None,
         }
     }
 

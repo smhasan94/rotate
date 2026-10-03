@@ -24,5 +24,6 @@ pub mod plan;
 pub mod provider;
 pub mod redact;
 pub mod report;
+pub mod rollback;
 pub mod secret;
 pub mod state;

@@ -43,6 +43,7 @@ fn secret_value_never_reaches_state_file_or_output() {
             consumer: "github-actions".to_owned(),
             consumer_ref: "org/repo:AWS_SECRET_ACCESS_KEY".to_owned(),
             status: ConsumerStatus::Updated,
+            holds: None,
         });
         let saved = store.upsert(rotation).unwrap().clone();
         write!(console, "{saved:?} {saved:#?} {store:?}").unwrap();

@@ -136,6 +136,7 @@ impl MockConsumer {
             method: method.to_owned(),
             mutating: is_mutating(method),
             fingerprint: Some(fingerprint),
+            reference: consumer_ref.map(str::to_owned),
         });
         if let Some(consumer_ref) = consumer_ref {
             let key = (method.to_owned(), consumer_ref.to_owned());

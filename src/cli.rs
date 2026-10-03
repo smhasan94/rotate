@@ -137,6 +137,25 @@ pub struct ApplyArgs {
     pub force: bool,
 }
 
+/// Arguments of `rotate rollback` (SHA-259).
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct RollbackArgs {
+    /// The report or stdin secret that was rotated. rotate never stores
+    /// the old value, so rollback needs it again; it is matched to the
+    /// state file by fingerprint.
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Roll back only this rotation id.
+    #[arg(long, value_name = "ROTATION_ID")]
+    pub rotation: Option<String>,
+
+    /// Confirm this rotation id instead of typing it. Repeat for more
+    /// rotations; only confirmed rotations are rolled back.
+    #[arg(long, value_name = "ROTATION_ID")]
+    pub confirm: Vec<String>,
+}
+
 /// The four workflow commands.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -144,8 +163,9 @@ pub enum Command {
     Plan(InputArgs),
     /// Create the replacement, update consumers, verify, then revoke.
     Apply(ApplyArgs),
-    /// Restore the previous state where the provider allows it.
-    Rollback(InputArgs),
+    /// Restore consumers to the old secret, reactivate it where the
+    /// provider allows, and revoke the replacement.
+    Rollback(RollbackArgs),
     /// Show in-progress rotations.
     Status,
     /// Test only (`test-commands` feature): prints, fails or panics with
@@ -189,8 +209,9 @@ impl Command {
     /// The input arguments of a command that reads secrets.
     pub fn input(&self) -> Option<&InputArgs> {
         match self {
-            Command::Plan(input) | Command::Rollback(input) => Some(input),
+            Command::Plan(input) => Some(input),
             Command::Apply(args) => Some(&args.input),
+            Command::Rollback(args) => Some(&args.input),
             Command::Status => None,
             #[cfg(feature = "test-commands")]
             Command::TestConsole { .. } => None,
@@ -364,6 +385,27 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rotate", "plan", "r.json", "--replacement-file", "a"]).is_err()
         );
+    }
+
+    #[test]
+    fn rollback_flags() {
+        let cli = Cli::parse_from([
+            "rotate",
+            "rollback",
+            "--stdin",
+            "--rotation",
+            "rot-1",
+            "--confirm",
+            "rot-1",
+        ]);
+        let Command::Rollback(args) = cli.subcommand() else {
+            panic!("not rollback");
+        };
+        assert!(args.input.stdin);
+        assert_eq!(args.rotation.as_deref(), Some("rot-1"));
+        assert_eq!(args.confirm, ["rot-1"]);
+        assert!(Cli::try_parse_from(["rotate", "rollback", "r.json", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["rotate", "plan", "r.json", "--rotation", "rot-1"]).is_err());
     }
 
     #[test]

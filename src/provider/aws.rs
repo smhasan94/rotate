@@ -927,6 +927,22 @@ impl Provider for AwsProvider {
         }
         Ok(RestoreOutcome::Restored)
     }
+
+    /// Deactivates the replacement key by its id, the `replacement_ref`
+    /// `create_replacement` returned (SHA-259). Deactivating an inactive
+    /// key is not an error; nothing is deleted.
+    async fn revoke_replacement(&self, replacement_ref: &str) -> Result<(), ProviderError> {
+        if !is_key_id(replacement_ref) || is_temporary(replacement_ref) {
+            return Err(ProviderError::Permanent(
+                "not an AWS access key id; the replacement reference must be the new key's id"
+                    .into(),
+            ));
+        }
+        let iam = self.iam().await?;
+        let owner = self.owner(&iam, replacement_ref).await?;
+        self.set_status(&iam, &owner.user, replacement_ref, StatusType::Inactive)
+            .await
+    }
 }
 
 #[cfg(test)]

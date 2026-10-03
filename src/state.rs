@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
 use crate::audit::AuditStep;
+use crate::consumer::Holds;
 use crate::fsutil::{self, FsError, LockFile};
 use crate::secret::Fingerprint;
 
@@ -75,6 +76,9 @@ pub enum ConsumerStatus {
     Failed,
     /// It was not updated, for example because it cannot be automatically.
     Skipped,
+    /// It held the replacement and `rollback` put the old value back
+    /// (SHA-259).
+    Restored,
 }
 
 /// One consumer of the rotated secret.
@@ -87,6 +91,28 @@ pub struct ConsumerState {
     pub consumer_ref: String,
     /// Outcome.
     pub status: ConsumerStatus,
+    /// Which part of the credential it stores, recorded by apply so
+    /// `rollback` can write the same part of the old credential back
+    /// (SHA-259). Absent in files written before it existed; such a
+    /// consumer cannot be restored automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holds: Option<Holds>,
+}
+
+/// How far a `rotate rollback` of a rotation has got (SHA-259). Present
+/// once a rollback has started; while the rotation's step is not
+/// `rolled_back` the rollback is in progress, and apply (and resume) must
+/// leave the rotation alone. Consumers restored so far have status
+/// [`ConsumerStatus::Restored`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackProgress {
+    /// The provider step is finished: the old secret was reactivated, or
+    /// there was nothing to reactivate, or the provider cannot.
+    pub restore_done: bool,
+    /// The replacement step is finished: it was revoked, or there was none,
+    /// or it has to be revoked by hand.
+    pub revoke_done: bool,
 }
 
 /// One rotation's recorded progress. Holds no secret values.
@@ -124,6 +150,16 @@ pub struct Rotation {
     /// otherwise, and in files written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_step: Option<AuditStep>,
+    /// The handle the provider's `revoke` returned for the old secret,
+    /// recorded by apply so `rollback` can pass it to `restore` (SHA-259).
+    /// A provider-side identifier (an AWS key id), never a value. Absent
+    /// until the old secret is revoked, and when the provider cannot
+    /// restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_ref: Option<String>,
+    /// Rollback progress (SHA-259); absent until a rollback starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<RollbackProgress>,
 }
 
 impl Rotation {
@@ -147,12 +183,19 @@ impl Rotation {
             updated_at: now,
             force: false,
             failed_step: None,
+            restore_ref: None,
+            rollback: None,
         }
     }
 
     /// True until the rotation reaches a terminal step.
     pub fn is_in_progress(&self) -> bool {
         !self.step.is_terminal()
+    }
+
+    /// True while a started rollback has not finished (SHA-259).
+    pub fn is_rolling_back(&self) -> bool {
+        self.rollback.is_some() && self.step != Step::RolledBack
     }
 }
 
@@ -676,6 +719,53 @@ mod tests {
     }
 
     #[test]
+    fn older_record_without_rollback_fields_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let body = br#"{"version": 1, "rotations": [{"rotation_id": "rot-1", "provider": "aws",
+            "fingerprint": "sha256:0123456789abcdef", "replacement_fingerprint": null,
+            "replacement_ref": null, "step": "revoked",
+            "consumers": [{"consumer": "gha", "consumer_ref": "gha:o/r:X", "status": "updated"}],
+            "revoke_not_before": null, "started_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:00:00Z", "force": false}]}"#;
+        crate::fsutil::write_atomic(&path, body).unwrap();
+        let snapshot = StateStore::read(&path).unwrap();
+        let rotation = snapshot.get("rot-1").unwrap();
+        assert_eq!(rotation.restore_ref, None);
+        assert_eq!(rotation.rollback, None);
+        assert_eq!(rotation.consumers[0].holds, None);
+        assert!(!rotation.is_rolling_back());
+    }
+
+    #[test]
+    fn rollback_fields_serialize_as_documented() {
+        let mut rotation = Rotation::new("rot-1", "aws", fp("old"));
+        let plain = serde_json::to_value(&rotation).unwrap();
+        for absent in ["restore_ref", "rollback", "failed_step"] {
+            assert!(plain.get(absent).is_none(), "{absent}");
+        }
+        rotation.restore_ref = Some("AKIDOLD:AKIDNEW".into());
+        rotation.rollback = Some(RollbackProgress::default());
+        rotation.consumers.push(ConsumerState {
+            consumer: "gha".into(),
+            consumer_ref: "gha:o/r:X".into(),
+            status: ConsumerStatus::Restored,
+            holds: Some(Holds::KeyId),
+        });
+        assert!(rotation.is_rolling_back());
+        let json = serde_json::to_value(&rotation).unwrap();
+        assert_eq!(json["restore_ref"], "AKIDOLD:AKIDNEW");
+        assert_eq!(
+            json["rollback"],
+            serde_json::json!({"restore_done": false, "revoke_done": false})
+        );
+        assert_eq!(json["consumers"][0]["status"], "restored");
+        assert_eq!(json["consumers"][0]["holds"], "key_id");
+        rotation.step = Step::RolledBack;
+        assert!(!rotation.is_rolling_back());
+    }
+
+    #[test]
     fn full_record_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = state_path(&dir);
@@ -688,7 +778,13 @@ mod tests {
             consumer: "github-actions".to_owned(),
             consumer_ref: "org/repo:AWS_SECRET_ACCESS_KEY".to_owned(),
             status: ConsumerStatus::Updated,
+            holds: Some(Holds::Secret),
         }];
+        rotation.restore_ref = Some("key-id-0001".to_owned());
+        rotation.rollback = Some(RollbackProgress {
+            restore_done: true,
+            revoke_done: false,
+        });
         rotation.revoke_not_before = Some(OffsetDateTime::now_utc() + Duration::minutes(15));
         rotation.force = true;
         let saved = store.upsert(rotation).unwrap().clone();
