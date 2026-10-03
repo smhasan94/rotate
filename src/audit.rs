@@ -29,6 +29,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
 use crate::fsutil::{self, FsError};
+use crate::provider::ReplacementMode;
 use crate::redact::redact;
 use crate::secret::Fingerprint;
 
@@ -142,6 +143,8 @@ pub struct AuditEvent {
     /// The consumer's reference, for example `org/repo:AWS_SECRET_ACCESS_KEY`.
     /// A public identifier, never a value.
     pub consumer: Option<String>,
+    /// How the replacement was obtained, on `create` entries (SHA-257).
+    pub replacement_mode: Option<ReplacementMode>,
     /// The step.
     pub step: AuditStep,
     /// How it ended.
@@ -165,6 +168,7 @@ impl AuditEvent {
             fingerprint,
             replacement_fingerprint: None,
             consumer: None,
+            replacement_mode: None,
             step,
             outcome,
             error: None,
@@ -180,6 +184,12 @@ impl AuditEvent {
     /// Sets the consumer reference.
     pub fn with_consumer(mut self, consumer: impl Into<String>) -> Self {
         self.consumer = Some(consumer.into());
+        self
+    }
+
+    /// Sets how the replacement was obtained.
+    pub fn with_mode(mut self, mode: ReplacementMode) -> Self {
+        self.replacement_mode = Some(mode);
         self
     }
 
@@ -213,6 +223,9 @@ pub struct AuditEntry {
     /// Consumer reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer: Option<String>,
+    /// `automatic` or `manual`, on `create` entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_mode: Option<ReplacementMode>,
     /// The step.
     pub step: AuditStep,
     /// How it ended.
@@ -350,6 +363,7 @@ impl AuditLog {
             fingerprint: event.fingerprint,
             replacement_fingerprint: event.replacement_fingerprint,
             consumer: event.consumer,
+            replacement_mode: event.replacement_mode,
             step: event.step,
             outcome: event.outcome,
             error: event.error,

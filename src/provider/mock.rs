@@ -44,6 +44,7 @@ pub struct MockProvider {
     standing_failures: Mutex<HashMap<String, ProviderError>>,
     replacements: AtomicU64,
     revoked: Mutex<HashSet<Fingerprint>>,
+    owners: HashMap<Fingerprint, Identity>,
     restore_refs: Mutex<HashMap<String, Fingerprint>>,
     late_failures: Mutex<HashMap<String, (usize, ProviderError)>>,
     call_counts: Mutex<HashMap<String, usize>>,
@@ -87,6 +88,7 @@ impl MockProvider {
             standing_failures: Mutex::new(HashMap::new()),
             replacements: AtomicU64::new(0),
             revoked: Mutex::new(HashSet::new()),
+            owners: HashMap::new(),
             restore_refs: Mutex::new(HashMap::new()),
             late_failures: Mutex::new(HashMap::new()),
             call_counts: Mutex::new(HashMap::new()),
@@ -145,6 +147,15 @@ impl MockProvider {
     /// `Invalid`. Use it for a credential the provider does not know.
     pub fn revoked(self, fingerprint: Fingerprint) -> Self {
         lock(&self.revoked).insert(fingerprint);
+        self
+    }
+
+    /// The credential with `fingerprint` belongs to `owner`: `verify`
+    /// rejects it for any other identity. Credentials not named here belong
+    /// to the scope's identity. Use it for a pasted replacement from the
+    /// wrong account (SHA-257).
+    pub fn owner(mut self, fingerprint: Fingerprint, owner: Identity) -> Self {
+        self.owners.insert(fingerprint, owner);
         self
     }
 
@@ -367,10 +378,13 @@ impl Provider for MockProvider {
         identity: &Identity,
     ) -> Result<(), ProviderError> {
         self.read_call("verify", credential).await?;
-        if *identity != self.scope.identity {
+        let owner = self
+            .owners
+            .get(&credential.fingerprint())
+            .unwrap_or(&self.scope.identity);
+        if identity != owner {
             return Err(ProviderError::Permanent(format!(
-                "credential belongs to {}, not {identity}",
-                self.scope.identity
+                "credential belongs to {owner}, not {identity}"
             )));
         }
         Ok(())

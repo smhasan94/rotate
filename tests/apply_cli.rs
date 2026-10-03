@@ -432,13 +432,16 @@ fn not_updatable_consumer_holds_before_revoke() {
     );
 }
 
+// Manual mode runs (SHA-257; tests/apply_manual.rs). Without a terminal
+// or a supplied value it stops at create having changed nothing.
 #[test]
-fn manual_mode_is_skipped() {
+fn manual_mode_without_input_changes_nothing() {
     let run = Run::new("npm_applycli_manual_value");
-    run.scenario(json!({ "providers": { "npm": { "mode": "manual" } }, "prompt": "panic" }));
-    let output = run.run(&["apply", "--stdin"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("manual replacement is not supported yet"));
+    let id = run.planned_id();
+    run.scenario(json!({ "providers": { "npm": { "mode": "manual" } }, "prompt": "no_tty" }));
+    let output = run.run(&["apply", "--stdin", "--confirm", &id]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("failed at create"));
     assert!(run.mutating().is_empty());
 }
 

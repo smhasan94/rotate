@@ -120,6 +120,17 @@ pub struct ApplyArgs {
     #[arg(long)]
     pub all: bool,
 
+    /// Manual replacement mode: read the new secret from this environment
+    /// variable instead of a hidden prompt. One attempt, one rotation.
+    #[arg(long, value_name = "VAR", conflicts_with = "replacement_file")]
+    pub replacement_from_env: Option<std::ffi::OsString>,
+
+    /// Manual replacement mode: read the new secret from this file, which
+    /// must be readable by its owner only (chmod 600). One attempt, one
+    /// rotation.
+    #[arg(long, value_name = "PATH")]
+    pub replacement_file: Option<PathBuf>,
+
     /// Revoke even if some consumers could not be updated. Never skips a
     /// failed create or verify. Recorded in the audit log with the actor.
     #[arg(long)]
@@ -313,6 +324,46 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["rotate", "plan", "r.json", "--confirm", "rot-1"]).is_err());
+    }
+
+    #[test]
+    fn apply_replacement_flags() {
+        let cli = Cli::parse_from([
+            "rotate",
+            "apply",
+            "--stdin",
+            "--replacement-from-env",
+            "NEW_TOKEN",
+        ]);
+        let Command::Apply(apply) = cli.subcommand() else {
+            panic!("not apply");
+        };
+        assert_eq!(
+            apply.replacement_from_env.as_deref(),
+            Some(std::ffi::OsStr::new("NEW_TOKEN"))
+        );
+        assert!(apply.replacement_file.is_none());
+        let cli = Cli::parse_from(["rotate", "apply", "r.json", "--replacement-file", "new.txt"]);
+        let Command::Apply(apply) = cli.subcommand() else {
+            panic!("not apply");
+        };
+        assert_eq!(
+            apply.replacement_file.as_deref(),
+            Some(std::path::Path::new("new.txt"))
+        );
+        assert!(Cli::try_parse_from([
+            "rotate",
+            "apply",
+            "r.json",
+            "--replacement-file",
+            "a",
+            "--replacement-from-env",
+            "B",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["rotate", "plan", "r.json", "--replacement-file", "a"]).is_err()
+        );
     }
 
     #[test]

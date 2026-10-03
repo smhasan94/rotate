@@ -138,8 +138,10 @@ pub enum RestoreOutcome {
 }
 
 /// Whether the provider can mint a replacement itself or must ask the
-/// operator for one (decision D1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// operator for one (decision D1). Serialized in the audit log as
+/// `automatic` or `manual`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ReplacementMode {
     /// `create_replacement` calls the provider API.
     Automatic,
@@ -189,6 +191,18 @@ pub trait Provider: Send + Sync {
 
     /// Whether this provider can mint replacements.
     fn replacement_mode(&self) -> ReplacementMode;
+
+    /// What the operator must create by hand in manual replacement mode
+    /// (decision D1), shown before the hidden prompt. Providers in manual
+    /// mode override it to name the page and the scopes to copy. Must not
+    /// contain a value.
+    fn manual_instructions(&self, scope: &Scope) -> String {
+        format!(
+            "Create a new {} credential for {} with the same access as the leaked one, then paste it at the prompt.",
+            self.name(),
+            scope.identity
+        )
+    }
 
     /// Whether the finding looks like one of this provider's credentials.
     /// Pure: no network.

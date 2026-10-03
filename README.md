@@ -57,6 +57,16 @@ What works now:
   fails, the summary says the replacement is live and the old secret may
   still be valid. With an overlap window above 0 the revoke is recorded as
   pending and apply exits 3.
+- Manual replacement mode, for providers whose API cannot mint a
+  replacement (GitHub and npm tokens). Apply prints what to create, then
+  asks you to paste the new secret with terminal echo turned off. It is
+  accepted only once the provider confirms it belongs to the same account
+  as the leaked one; a wrong paste is asked for again, up to three times,
+  and then the rotation fails before any consumer is touched. For scripts,
+  `--replacement-from-env <VAR>` or `--replacement-file <PATH>` (a file
+  readable by its owner only, `chmod 600`) supply the value instead, for
+  one rotation and one attempt. The value is never printed or stored; the
+  state file records `replacement_ref: manual` and its fingerprint.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 - AWS access keys are identified and checked with STS, signed with the
@@ -79,9 +89,9 @@ Not done yet:
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
   providers exist only behind the `test-providers` cargo feature, for tests.
-- `rotate apply`: manual replacement mode (the rotation is skipped),
-  resuming an interrupted, failed or pending rotation (only a rotation held
-  at `verified` can be re-run, to finish it with `--force`), and `--json`.
+- `rotate apply`: resuming an interrupted, failed or pending rotation (only
+  a rotation held at `verified` can be re-run, to finish it with `--force`),
+  and `--json`.
 - `rotate rollback` and `rotate status`. These are stubs.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
@@ -132,6 +142,9 @@ rotate apply trufflehog-report.json
 
 # Non-interactive, for CI: confirm by id.
 rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
+
+# Manual replacement (GitHub, npm) without a terminal: supply the new token.
+NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env NEW_TOKEN
 ```
 
 ## Exit codes
