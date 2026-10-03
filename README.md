@@ -98,6 +98,17 @@ What works now:
   credential revocation API, which needs no token of yours. Installation
   tokens (`ghs_`) are reported but not revoked: they expire within an hour.
   See [docs/permissions.md](docs/permissions.md).
+- npm access tokens (`npm_`, granular and `npm login` session tokens) are
+  identified by prefix and checked with `GET /-/whoami`; the plan shows the
+  npm user and, from your own token list, the token's type, access,
+  permissions, scopes, IP ranges and expiry. Set `ROTATE_NPM_TOKEN` (or
+  `NPM_TOKEN`) to an `npm login` session token of the same account; without
+  it the plan says the token is not visible to the operator account. Apply
+  asks for the new granular token in manual mode, checks it belongs to the
+  same user, and deletes the leaked one by its token id. An account that
+  asks for a one-time password to delete tokens makes the revoke fail
+  safely, naming the page to delete it on. See
+  [docs/permissions.md](docs/permissions.md).
 - `plan` and `apply` search two real consumers, using the targets in
   `rotate.yaml`: GitHub Actions secrets, matched by name in the
   `consumers.github_actions.targets` repos and orgs and written as sealed
@@ -110,8 +121,8 @@ What works now:
 
 Not done yet:
 
-- Rotating npm and OpenAI secrets: those providers do not exist yet, so a
-  release build reports them as unsupported. The AWS IAM provider
+- Rotating OpenAI secrets: that provider does not exist yet, so a release
+  build reports it as unsupported. The AWS IAM provider
   is complete: validity with the leaked key's one `sts:GetCallerIdentity`
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
