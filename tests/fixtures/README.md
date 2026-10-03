@@ -7,6 +7,11 @@ output from a scan of a real repository here.
   (`AKIAIOSFODNN7EXAMPLE`, `AKIAI44QH8DHBEXAMPLE` and their secret halves).
 - Other tokens contain `FAKE` and do not carry a valid provider checksum, so
   GitHub push protection and secret scanners do not treat them as real.
+- `trufflehog_aws_e2e.ndjson` (SHA-264) holds `@KEY_ID@` and `@SECRET@`
+  placeholders that `tests/e2e_aws.rs` fills with values built at runtime.
+  The end-to-end test needs a key id that is not a documentation example
+  (those are reported invalid without any call), and committing one would
+  trip secret scanners.
 - `trufflehog_malformed.ndjson` line 2 is deliberately truncated JSON. Its
   text is a canary that tests assert never appears in warnings or logs.
 
