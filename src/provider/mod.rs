@@ -20,7 +20,12 @@ use crate::secret::{Fingerprint, SecretPair, SecretValue};
 
 /// Trait method names that change state on the provider. The mock uses
 /// this list to flag calls; the engine uses it to describe the plan.
-pub const MUTATING: &[&str] = &["create_replacement", "revoke", "restore"];
+pub const MUTATING: &[&str] = &[
+    "create_replacement",
+    "revoke",
+    "restore",
+    "revoke_replacement",
+];
 
 /// True when the named trait method changes state on the provider.
 pub fn is_mutating(method: &str) -> bool {
@@ -235,6 +240,20 @@ pub trait Provider: Send + Sync {
     /// Mutating. Returns `Unsupported` rather than an error when the
     /// provider cannot.
     async fn restore(&self, restore_ref: &str) -> Result<RestoreOutcome, ProviderError>;
+
+    /// Revokes a replacement by the `replacement_ref` that
+    /// `create_replacement` returned, for `rotate rollback` (SHA-259):
+    /// rotate never stores the replacement's value, so [`revoke`](Self::revoke)
+    /// cannot be used. Mutating. Revoking one that is already revoked is
+    /// not an error. The default returns `Unsupported`; rollback then tells
+    /// the operator to revoke the replacement by hand.
+    async fn revoke_replacement(&self, replacement_ref: &str) -> Result<(), ProviderError> {
+        let _ = replacement_ref;
+        Err(ProviderError::Unsupported(format!(
+            "{} cannot revoke a credential by its reference",
+            self.name()
+        )))
+    }
 }
 
 /// A provider chosen for a finding.
@@ -443,6 +462,7 @@ mod tests {
         assert!(is_mutating("create_replacement"));
         assert!(is_mutating("revoke"));
         assert!(is_mutating("restore"));
+        assert!(is_mutating("revoke_replacement"));
         for read_only in ["identify", "check_valid", "describe_scope", "verify"] {
             assert!(!is_mutating(read_only), "{read_only}");
         }

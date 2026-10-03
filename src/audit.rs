@@ -67,6 +67,19 @@ pub enum AuditStep {
     Force,
 }
 
+/// Which undo a `rollback` entry records (SHA-259). The JSON field is
+/// `action`; it appears on `rollback` entries only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackAction {
+    /// The provider reactivated the old secret.
+    RestoreOld,
+    /// A consumer got the old value back; `consumer` names it.
+    RestoreConsumer,
+    /// The replacement was revoked.
+    RevokeReplacement,
+}
+
 /// How the step ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +158,8 @@ pub struct AuditEvent {
     pub consumer: Option<String>,
     /// How the replacement was obtained, on `create` entries (SHA-257).
     pub replacement_mode: Option<ReplacementMode>,
+    /// Which undo, on `rollback` entries (SHA-259).
+    pub action: Option<RollbackAction>,
     /// The step.
     pub step: AuditStep,
     /// How it ended.
@@ -169,6 +184,7 @@ impl AuditEvent {
             replacement_fingerprint: None,
             consumer: None,
             replacement_mode: None,
+            action: None,
             step,
             outcome,
             error: None,
@@ -190,6 +206,12 @@ impl AuditEvent {
     /// Sets how the replacement was obtained.
     pub fn with_mode(mut self, mode: ReplacementMode) -> Self {
         self.replacement_mode = Some(mode);
+        self
+    }
+
+    /// Sets the rollback action.
+    pub fn with_action(mut self, action: RollbackAction) -> Self {
+        self.action = Some(action);
         self
     }
 
@@ -226,6 +248,10 @@ pub struct AuditEntry {
     /// `automatic` or `manual`, on `create` entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_mode: Option<ReplacementMode>,
+    /// `restore_old`, `restore_consumer` or `revoke_replacement`, on
+    /// `rollback` entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<RollbackAction>,
     /// The step.
     pub step: AuditStep,
     /// How it ended.
@@ -364,6 +390,7 @@ impl AuditLog {
             replacement_fingerprint: event.replacement_fingerprint,
             consumer: event.consumer,
             replacement_mode: event.replacement_mode,
+            action: event.action,
             step: event.step,
             outcome: event.outcome,
             error: event.error,

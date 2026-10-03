@@ -125,6 +125,11 @@ pub fn finish() {
 /// prompt; `providers.<name>.foreign` lists fingerprints that `verify`
 /// reports as belonging to another identity.
 ///
+/// For rollback (SHA-259): `providers.<name>.restore` is `"unsupported"` to
+/// make `restore` return `Unsupported`; each call-log line also has
+/// `reference`, the consumer ref, restore handle or replacement ref the
+/// call targeted (null when none).
+///
 /// Every mock shares one `CallLog`. [`write_call_log`] writes it as JSON
 /// lines (`target`, `method`, `mutating`, `fingerprint`), so a CLI test can
 /// prove a run made no state-changing call. The file holds fingerprints
@@ -142,7 +147,9 @@ mod scenario {
     use rotate::consumer::mock::MockConsumer;
     use rotate::consumer::{ConsumerError, ConsumerMatch, ConsumerRegistry, Holds};
     use rotate::provider::mock::MockProvider;
-    use rotate::provider::{Identity, ProviderError, ProviderRegistry, ReplacementMode, Validity};
+    use rotate::provider::{
+        Identity, ProviderError, ProviderRegistry, ReplacementMode, RestoreOutcome, Validity,
+    };
     use rotate::secret::{Fingerprint, SecretValue};
 
     const ENV: &str = "ROTATE_TEST_SCENARIO";
@@ -168,6 +175,7 @@ mod scenario {
         fail: BTreeMap<String, String>,
         #[serde(default)]
         foreign: Vec<Fingerprint>,
+        restore: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -242,6 +250,11 @@ mod scenario {
                     None | Some("automatic") => mock,
                     Some("manual") => mock.mode(ReplacementMode::Manual),
                     Some(other) => panic!("{ENV}: unknown mode {other:?}"),
+                };
+                mock = match setup.restore.as_deref() {
+                    None | Some("restored") => mock,
+                    Some("unsupported") => mock.restore_outcome(RestoreOutcome::Unsupported),
+                    Some(other) => panic!("{ENV}: unknown restore outcome {other:?}"),
                 };
                 for fingerprint in &setup.foreign {
                     mock = mock.owner(fingerprint.clone(), Identity("someone-else".into()));
@@ -388,6 +401,7 @@ mod scenario {
                 "method": call.method,
                 "mutating": call.mutating,
                 "fingerprint": call.fingerprint.map(String::from),
+                "reference": call.reference,
             });
             text.push_str(&line.to_string());
             text.push('\n');

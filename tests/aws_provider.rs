@@ -1109,6 +1109,29 @@ async fn restore_bare_ref_reactivates_old_only() {
     assert_no_delete(&rec).await;
 }
 
+// SHA-259: rollback revokes the replacement by its key id, a deactivation.
+#[tokio::test]
+async fn revoke_replacement_deactivates_key_by_id() {
+    let rec = recorder().await;
+    let new_id = key_id("AKIA", "R1NEWKY");
+    mount_iam(&rec, "max").await;
+    mount_update(&rec).await;
+    provider(&rec).revoke_replacement(&new_id).await.unwrap();
+    assert_eq!(updates(&rec).await, [(new_id, "Inactive".to_owned())]);
+    assert_no_delete(&rec).await;
+
+    let rec = recorder().await;
+    let err = provider(&rec)
+        .revoke_replacement("manual")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not an AWS access key id"),
+        "{err}"
+    );
+    assert!(updates(&rec).await.is_empty());
+}
+
 /// A TRACE-level capture installed as this binary's global subscriber.
 ///
 /// Global rather than scoped: with a scoped subscriber, tests running on

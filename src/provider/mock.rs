@@ -46,6 +46,7 @@ pub struct MockProvider {
     revoked: Mutex<HashSet<Fingerprint>>,
     owners: HashMap<Fingerprint, Identity>,
     restore_refs: Mutex<HashMap<String, Fingerprint>>,
+    created: Mutex<HashMap<String, Fingerprint>>,
     late_failures: Mutex<HashMap<String, (usize, ProviderError)>>,
     call_counts: Mutex<HashMap<String, usize>>,
     mutates_in: HashSet<String>,
@@ -90,6 +91,7 @@ impl MockProvider {
             revoked: Mutex::new(HashSet::new()),
             owners: HashMap::new(),
             restore_refs: Mutex::new(HashMap::new()),
+            created: Mutex::new(HashMap::new()),
             late_failures: Mutex::new(HashMap::new()),
             call_counts: Mutex::new(HashMap::new()),
             mutates_in: HashSet::new(),
@@ -247,11 +249,22 @@ impl MockProvider {
     /// Records the call, then returns the injected failure for `method` if
     /// there is one.
     fn enter(&self, method: &str, fingerprint: Option<Fingerprint>) -> Result<(), ProviderError> {
+        self.enter_ref(method, fingerprint, None)
+    }
+
+    /// [`enter`](Self::enter) for a call that targets a reference.
+    fn enter_ref(
+        &self,
+        method: &str,
+        fingerprint: Option<Fingerprint>,
+        reference: Option<&str>,
+    ) -> Result<(), ProviderError> {
         self.log.record(Call {
             target: self.name.to_owned(),
             method: method.to_owned(),
             mutating: is_mutating(method),
             fingerprint: fingerprint.clone(),
+            reference: reference.map(str::to_owned),
         });
         if self.mutates_in.contains(method) {
             self.log.record(Call {
@@ -259,6 +272,7 @@ impl MockProvider {
                 method: "revoke".to_owned(),
                 mutating: true,
                 fingerprint,
+                reference: None,
             });
         }
         let count = {
@@ -366,9 +380,11 @@ impl Provider for MockProvider {
                 value,
             )),
         };
+        let replacement_ref = format!("{}-ref-{n}", self.name);
+        lock(&self.created).insert(replacement_ref.clone(), credential.fingerprint());
         Ok(Replacement {
             credential,
-            replacement_ref: format!("{}-ref-{n}", self.name),
+            replacement_ref,
         })
     }
 
@@ -404,13 +420,28 @@ impl Provider for MockProvider {
     }
 
     async fn restore(&self, restore_ref: &str) -> Result<RestoreOutcome, ProviderError> {
-        self.enter("restore", None)?;
+        self.enter_ref("restore", None, Some(restore_ref))?;
         if self.restore_outcome == RestoreOutcome::Restored {
             if let Some(fingerprint) = lock(&self.restore_refs).get(restore_ref) {
                 lock(&self.revoked).remove(fingerprint);
             }
         }
         Ok(self.restore_outcome)
+    }
+
+    /// Revokes a replacement this mock minted, by its ref. A ref it did not
+    /// mint (another process made it) is recorded and accepted.
+    async fn revoke_replacement(&self, replacement_ref: &str) -> Result<(), ProviderError> {
+        let fingerprint = lock(&self.created).get(replacement_ref).cloned();
+        self.enter_ref(
+            "revoke_replacement",
+            fingerprint.clone(),
+            Some(replacement_ref),
+        )?;
+        if let Some(fingerprint) = fingerprint {
+            lock(&self.revoked).insert(fingerprint);
+        }
+        Ok(())
     }
 }
 
@@ -575,6 +606,36 @@ mod tests {
             RestoreOutcome::Unsupported
         );
         assert_eq!(mock.call_log().mutating().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoke_replacement_by_ref() {
+        let mock = MockProvider::new("mock");
+        let replacement = mock.create_replacement(&token("mock_old")).await.unwrap();
+        mock.revoke_replacement(&replacement.replacement_ref)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.check_valid(&replacement.credential).await.unwrap(),
+            Validity::Invalid
+        );
+        mock.revoke_replacement("elsewhere-ref").await.unwrap();
+        let calls = mock.call_log().calls();
+        let revokes: Vec<_> = calls
+            .iter()
+            .filter(|c| c.method == "revoke_replacement")
+            .collect();
+        assert_eq!(revokes.len(), 2);
+        assert!(revokes.iter().all(|c| c.mutating));
+        assert_eq!(
+            revokes[0].reference.as_deref(),
+            Some(replacement.replacement_ref.as_str())
+        );
+        assert_eq!(
+            revokes[0].fingerprint,
+            Some(replacement.credential.fingerprint())
+        );
+        assert_eq!(revokes[1].fingerprint, None);
     }
 
     #[tokio::test]

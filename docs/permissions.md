@@ -16,12 +16,12 @@ reports validity and shows the scope as unavailable.
 
 | Action | Used by | Why |
 | --- | --- | --- |
-| `iam:GetAccessKeyLastUsed` | plan, apply, restore | owner of the leaked key and when each key was last used |
+| `iam:GetAccessKeyLastUsed` | plan, apply, rollback | owner of the leaked key (or of the replacement, on rollback) and when each key was last used |
 | `iam:GetUser` | plan | the owner's ARN, which the replacement must match |
 | `iam:ListAttachedUserPolicies`, `iam:ListUserPolicies`, `iam:ListGroupsForUser` | plan | scope lines; a denied read becomes a "not visible" line |
 | `iam:ListAccessKeys` | plan, apply | key slots: IAM allows two keys per user |
 | `iam:CreateAccessKey` | apply | the replacement key |
-| `iam:UpdateAccessKey` | apply, restore | deactivate the leaked key; reactivate it on rollback |
+| `iam:UpdateAccessKey` | apply, rollback | deactivate the leaked key; on rollback reactivate it and deactivate the replacement |
 
 rotate never calls `iam:DeleteAccessKey`. When the user already has two
 keys, the plan shows a warning and apply refuses to create a replacement:

@@ -71,8 +71,10 @@ pub enum MatchMethod {
     ByName,
 }
 
-/// Which part of a credential a consumer stores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which part of a credential a consumer stores. Recorded in the state
+/// file as `secret`, `key_id` or `key_pair` (SHA-259).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Holds {
     /// The secret half, or the whole token.
     Secret,

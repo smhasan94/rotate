@@ -456,6 +456,8 @@ pub enum Ineligible {
     InProgress(Step),
     /// The owner identity is unknown, so the replacement cannot be verified.
     NoScope,
+    /// `rotate rollback` started on it and has not finished (SHA-259).
+    RollingBack,
 }
 
 impl fmt::Display for Ineligible {
@@ -469,11 +471,28 @@ impl fmt::Display for Ineligible {
             Ineligible::NoScope => f.write_str(
                 "the owner identity is unknown, so the replacement could not be verified",
             ),
+            Ineligible::RollingBack => {
+                f.write_str("a rollback of it is in progress; finish it with rotate rollback")
+            }
         }
     }
 }
 
-/// Whether apply can run `rotation` now.
+/// [`eligibility`], and not while a rollback of the stored rotation is in
+/// progress (SHA-259): continuing it would revoke the old secret that the
+/// rollback put back.
+pub fn eligibility_in(rotation: &PlannedRotation, store: &StateStore) -> Result<(), Ineligible> {
+    if store
+        .get(&rotation.rotation_id)
+        .is_some_and(Rotation::is_rolling_back)
+    {
+        return Err(Ineligible::RollingBack);
+    }
+    eligibility(rotation)
+}
+
+/// Whether apply can run `rotation` now, from the plan alone. The binary
+/// uses [`eligibility_in`], which also reads the state file.
 pub fn eligibility(rotation: &PlannedRotation) -> Result<(), Ineligible> {
     if !matches!(rotation.step, Step::Planned | Step::Verified) {
         return Err(Ineligible::InProgress(rotation.step));
@@ -722,7 +741,7 @@ impl<'a> Executor<'a> {
     /// The caller checks [`eligibility`] first; an ineligible rotation is
     /// returned as skipped without a call.
     pub async fn run(&mut self, rotation: &PlannedRotation) -> Outcome {
-        if let Err(why) = eligibility(rotation) {
+        if let Err(why) = eligibility_in(rotation, self.store) {
             return Outcome::skipped(rotation, why);
         }
         let mut progress = Progress {
@@ -820,6 +839,7 @@ impl<'a> Executor<'a> {
                 consumer: planned.consumer.to_owned(),
                 consumer_ref: reference.clone(),
                 status,
+                holds: Some(planned.found.holds),
             };
             if let Err(blocked) = &planned.found.updatable {
                 progress
@@ -963,15 +983,22 @@ impl<'a> Executor<'a> {
                 return RunResult::PendingRevoke { not_before };
             }
         }
-        if let Err(err) = provider.revoke(&rotation.credential).await {
-            return self.fail(
-                progress,
-                AuditStep::Revoke,
-                &format!("{err}; the replacement is live and the old secret may still be valid"),
-                None,
-            );
-        }
+        let revoked = match provider.revoke(&rotation.credential).await {
+            Ok(revoked) => revoked,
+            Err(err) => {
+                return self.fail(
+                    progress,
+                    AuditStep::Revoke,
+                    &format!(
+                        "{err}; the replacement is live and the old secret may still be valid"
+                    ),
+                    None,
+                )
+            }
+        };
         progress.record.step = Step::Revoked;
+        // Kept for `rotate rollback` (SHA-259).
+        progress.record.restore_ref = revoked.restore_ref;
         if let Err(err) = self.checkpoint(progress, AuditStep::Revoke, None) {
             // The revoke happened; only the record is missing.
             return RunResult::Failed {
@@ -1214,6 +1241,7 @@ fn consumer_statuses(o: &Outcome) -> String {
                 ConsumerStatus::Updated => "updated",
                 ConsumerStatus::Failed => "failed",
                 ConsumerStatus::Skipped => "skipped",
+                ConsumerStatus::Restored => "restored",
             };
             format!("{} {status}", c.consumer_ref)
         })
@@ -1855,6 +1883,7 @@ mod tests {
             consumer: "c".into(),
             consumer_ref: "c:1".into(),
             status: s,
+            holds: None,
         };
         let rotation = PlannedRotation {
             rotation_id: "rot-1".into(),
