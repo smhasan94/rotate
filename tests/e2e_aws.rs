@@ -887,9 +887,8 @@ async fn t4_state_records_revoked() {
     assert_eq!(consumers[0]["status"], "updated");
 }
 
-// T4 (AC4): the command itself. `rotate status` is a stub until SHA-263.
+// T4 (AC4): the command itself.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs `rotate status` (SHA-263)"]
 async fn t4_status_all_shows_revoked() {
     let e2e = E2e::start().await;
     let (id, output) = e2e.apply();
