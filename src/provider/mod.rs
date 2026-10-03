@@ -7,6 +7,7 @@
 //! everything else is read-only and safe for a dry run.
 
 pub mod aws;
+pub mod github;
 pub mod mock;
 
 use std::fmt;
