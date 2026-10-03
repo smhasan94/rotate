@@ -9,6 +9,7 @@
 pub mod aws;
 pub mod github;
 pub mod mock;
+pub mod openai;
 
 use std::fmt;
 use std::sync::Arc;
@@ -208,6 +209,15 @@ pub trait Provider: Send + Sync {
             self.name(),
             scope.identity
         )
+    }
+
+    /// The revoke row the plan shows instead of the usual one when rotate
+    /// cannot revoke this credential itself, for example an OpenAI key the
+    /// Admin API cannot delete. Pure: no network. `None` (the default)
+    /// means `revoke` does it. Must not contain a value.
+    fn manual_revoke(&self, scope: Option<&Scope>) -> Option<&'static str> {
+        let _ = scope;
+        None
     }
 
     /// Whether the finding looks like one of this provider's credentials.

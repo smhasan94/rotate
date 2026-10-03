@@ -58,7 +58,8 @@ What works now:
   still be valid. With an overlap window above 0 the revoke is recorded as
   pending and apply exits 3.
 - Manual replacement mode, for providers whose API cannot mint a
-  replacement (GitHub and npm tokens). Apply prints what to create, then
+  replacement (GitHub and npm tokens, and OpenAI keys without an Admin API
+  key). Apply prints what to create, then
   asks you to paste the new secret with terminal echo turned off. It is
   accepted only once the provider confirms it belongs to the same account
   as the leaked one; a wrong paste is asked for again, up to three times,
@@ -98,6 +99,18 @@ What works now:
   credential revocation API, which needs no token of yours. Installation
   tokens (`ghs_`) are reported but not revoked: they expire within an hour.
   See [docs/permissions.md](docs/permissions.md).
+- OpenAI API keys (`sk-proj-`, `sk-svcacct-` and legacy `sk-` keys) are
+  identified by prefix and checked with `GET /v1/models`. With an Admin API
+  key in `OPENAI_ADMIN_KEY` (or the variable `providers.openai.admin_key_env`
+  names), the plan shows the key's project, name, owner, created and last
+  used times; apply creates a service account in the same project for the
+  replacement, checks the new key is listed there, and deletes the leaked
+  key (a user key by id; a service-account key by deleting its service
+  account when that is its only key). Rollback deletes the replacement's
+  service account. Without an admin key apply runs in manual mode and
+  cannot revoke: the plan says to delete the key on the OpenAI dashboard.
+  Admin keys (`sk-admin-`) are identified but not rotated. See
+  [docs/permissions.md](docs/permissions.md).
 - `plan` and `apply` search two real consumers, using the targets in
   `rotate.yaml`: GitHub Actions secrets, matched by name in the
   `consumers.github_actions.targets` repos and orgs and written as sealed
@@ -110,8 +123,8 @@ What works now:
 
 Not done yet:
 
-- Rotating npm and OpenAI secrets: those providers do not exist yet, so a
-  release build reports them as unsupported. The AWS IAM provider
+- Rotating npm secrets: that provider does not exist yet, so a release
+  build reports them as unsupported. The AWS IAM provider
   is complete: validity with the leaked key's one `sts:GetCallerIdentity`
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock

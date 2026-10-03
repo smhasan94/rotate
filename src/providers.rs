@@ -1,7 +1,8 @@
 //! The provider and consumer registries the CLI runs with.
 //!
 //! Real plugins register in builds without `test-providers`: the AWS
-//! provider (SHA-251), the GitHub token provider (SHA-260), the AWS Secrets
+//! provider (SHA-251), the GitHub token provider (SHA-260), the OpenAI API
+//! key provider (SHA-262), the AWS Secrets
 //! Manager consumer (SHA-252) and the GitHub Actions secrets consumer
 //! (SHA-253).
 //! Constructing one makes no call and loads no credentials; that happens on
@@ -37,6 +38,7 @@ pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
     {
         registry.register(std::sync::Arc::new(aws_provider(&config.aws)));
         registry.register(std::sync::Arc::new(github_provider(&config.github)));
+        registry.register(std::sync::Arc::new(openai_provider(&config.openai)));
     }
     registry
 }
@@ -45,6 +47,19 @@ pub fn registry_with(config: &ProvidersConfig) -> ProviderRegistry {
 #[cfg(any(test, not(feature = "test-providers")))]
 fn github_provider(config: &GithubConfig) -> rotate::provider::github::GithubProvider {
     rotate::provider::github::GithubProvider::new(config.api_url.as_str())
+}
+
+/// The OpenAI API key provider (SHA-262) for the configured API URL, with
+/// the Admin API key read from `providers.openai.admin_key_env` when a call
+/// needs it.
+#[cfg(any(test, not(feature = "test-providers")))]
+fn openai_provider(
+    config: &rotate::config::OpenAiConfig,
+) -> rotate::provider::openai::OpenAiProvider {
+    rotate::provider::openai::OpenAiProvider::new(
+        config.api_url.as_str(),
+        rotate::provider::openai::AdminKey::Env(config.admin_key_env.clone()),
+    )
 }
 
 /// The AWS provider with the configured region, if any.
@@ -454,6 +469,31 @@ mod tests {
     fn registry_with_registers_github() {
         assert!(registry_with(&ProvidersConfig::default())
             .get("github")
+            .is_some());
+    }
+
+    #[test]
+    fn openai_settings_come_from_config() {
+        use rotate::provider::Provider as _;
+        let mut config = rotate::config::OpenAiConfig::default();
+        let provider = openai_provider(&config);
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.base_url(), "https://api.openai.com");
+        config = serde_norway::from_str(
+            "api_url: https://openai.example.com/\nadmin_key_env: ROTATE_TEST_NO_SUCH_ADMIN_KEY\n",
+        )
+        .unwrap();
+        let provider = openai_provider(&config);
+        assert_eq!(provider.base_url(), "https://openai.example.com");
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("ROTATE_TEST_NO_SUCH_ADMIN_KEY"), "{debug}");
+        assert!(!provider.has_admin_key());
+    }
+
+    #[test]
+    fn registry_with_registers_openai() {
+        assert!(registry_with(&ProvidersConfig::default())
+            .get("openai")
             .is_some());
     }
 

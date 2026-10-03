@@ -315,12 +315,15 @@ impl Default for NpmConfig {
 pub struct OpenAiConfig {
     /// Name of the environment variable holding the Admin API key.
     pub admin_key_env: String,
+    /// API base URL, without `/v1`.
+    pub api_url: ApiUrl,
 }
 
 impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
             admin_key_env: "OPENAI_ADMIN_KEY".into(),
+            api_url: ApiUrl("https://api.openai.com".into()),
         }
     }
 }
@@ -630,6 +633,10 @@ mod tests {
             "https://registry.npmjs.org"
         );
         assert_eq!(config.providers.openai.admin_key_env, "OPENAI_ADMIN_KEY");
+        assert_eq!(
+            config.providers.openai.api_url.as_str(),
+            "https://api.openai.com"
+        );
         assert_eq!(config.providers.aws.region, None);
         assert_eq!(config.source, None);
     }
