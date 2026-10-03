@@ -9,6 +9,7 @@
 pub mod aws;
 pub mod github;
 pub mod mock;
+pub mod npm;
 pub mod openai;
 
 use std::fmt;

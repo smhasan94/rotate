@@ -180,7 +180,7 @@ pub fn consumer_names(provider: &str, config: &ConsumersConfig) -> ConsumerNames
 /// What revoke does at `provider`, as shown in the plan.
 pub fn revoke_action(provider: &str) -> &'static str {
     match provider {
-        "aws" => "deactivate the access key, then delete it",
+        "aws" => "deactivate the access key (not deleted; rollback can reactivate it)",
         "github" => "revoke the token (GitHub credential revocation API)",
         "npm" => "delete the access token",
         "openai" => "delete the API key (OpenAI Admin API)",

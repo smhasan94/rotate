@@ -66,6 +66,9 @@ providers:
     # Region for IAM, STS and Secrets Manager. Omit to use the AWS
     # environment (AWS_REGION and so on).
     region: us-east-1
+    # Send STS, IAM and Secrets Manager calls to this URL instead of AWS,
+    # for LocalStack or a local test server. Default: AWS's own endpoints.
+    # endpoint_url: http://localhost:4566
   github:
     # REST API base URL; change it for GitHub Enterprise Server.
     # Default: https://api.github.com

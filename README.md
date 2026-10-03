@@ -99,6 +99,17 @@ What works now:
   credential revocation API, which needs no token of yours. Installation
   tokens (`ghs_`) are reported but not revoked: they expire within an hour.
   See [docs/permissions.md](docs/permissions.md).
+- npm access tokens (`npm_`, granular and `npm login` session tokens) are
+  identified by prefix and checked with `GET /-/whoami`; the plan shows the
+  npm user and, from your own token list, the token's type, access,
+  permissions, scopes, IP ranges and expiry. Set `ROTATE_NPM_TOKEN` (or
+  `NPM_TOKEN`) to an `npm login` session token of the same account; without
+  it the plan says the token is not visible to the operator account. Apply
+  asks for the new granular token in manual mode, checks it belongs to the
+  same user, and deletes the leaked one by its token id. An account that
+  asks for a one-time password to delete tokens makes the revoke fail
+  safely, naming the page to delete it on. See
+  [docs/permissions.md](docs/permissions.md).
 - OpenAI API keys (`sk-proj-`, `sk-svcacct-` and legacy `sk-` keys) are
   identified by prefix and checked with `GET /v1/models`. With an Admin API
   key in `OPENAI_ADMIN_KEY` (or the variable `providers.openai.admin_key_env`
@@ -121,14 +132,14 @@ What works now:
   standard AWS credentials. With those sections empty, neither makes a
   call.
 
-Not done yet:
-
-- Rotating npm secrets: that provider does not exist yet, so a release
-  build reports them as unsupported. The AWS IAM provider
+- All four MVP providers register in release builds. The AWS IAM provider
   is complete: validity with the leaked key's one `sts:GetCallerIdentity`
   call, and scope, key creation, deactivation and reactivation with your
   own AWS credentials (see [docs/permissions.md](docs/permissions.md)). Mock
   providers exist only behind the `test-providers` cargo feature, for tests.
+
+Not done yet:
+
 - `rotate apply`: resuming an interrupted, failed or pending rotation (only
   a rotation held at `verified` can be re-run, to finish it with `--force`),
   and `--json`.

@@ -275,6 +275,9 @@ pub struct AwsConfig {
     /// Region for IAM, STS and Secrets Manager calls. `None` falls back to
     /// the AWS environment.
     pub region: Option<String>,
+    /// Sends STS, IAM and Secrets Manager calls to this URL instead of AWS,
+    /// for LocalStack or a test server (SHA-264). `None` uses AWS.
+    pub endpoint_url: Option<ApiUrl>,
 }
 
 /// `providers.github`.
@@ -704,6 +707,22 @@ mod tests {
         assert_eq!(providers.openai.admin_key_env, "ROTATE_OPENAI_ADMIN");
     }
 
+    #[test]
+    fn aws_endpoint_url_parses_and_is_checked() {
+        let file = parse(
+            "providers:\n  aws:\n    endpoint_url: http://127.0.0.1:4566\n",
+            Path::new("rotate.yaml"),
+        )
+        .unwrap();
+        assert_eq!(
+            file.providers.aws.endpoint_url.as_ref().map(ApiUrl::as_str),
+            Some("http://127.0.0.1:4566")
+        );
+        assert_eq!(FileConfig::default().providers.aws.endpoint_url, None);
+        let (field, _, _) = invalid("providers:\n  aws:\n    endpoint_url: localhost\n");
+        assert!(field.contains("endpoint_url"), "{field}");
+    }
+
     // T3 (AC3)
     #[test]
     fn bad_duration_names_field_and_line() {
@@ -796,7 +815,7 @@ mod tests {
         assert!(!sm.tag_filters.is_empty());
         assert!(sm.json_keys.is_some());
         assert!(file.providers.aws.region.is_some());
-        for key in ["api_url:", "registry:", "admin_key_env:"] {
+        for key in ["api_url:", "registry:", "admin_key_env:", "endpoint_url:"] {
             assert!(EXAMPLE.contains(key), "example is missing {key}");
         }
     }
