@@ -67,6 +67,24 @@ What works now:
   readable by its owner only, `chmod 600`) supply the value instead, for
   one rotation and one attempt. The value is never printed or stored; the
   state file records `replacement_ref: manual` and its fingerprint.
+- `rotate rollback` undoes a rotation. rotate never stores the old value,
+  so pass the same report or `--stdin` secret again; it is matched to the
+  rotations in `.rotate/state.json` by fingerprint (`--rotation <id>` picks
+  one). A secret that matches no rotation exits 2 with "no rotation found
+  for fingerprint" having made no call. Rollback prints its plan and asks
+  for the rotation id (or takes `--confirm <id>`), then, in this order:
+  reactivates the old secret where the provider can (AWS reactivates the
+  deactivated key), restores the old value in every consumer apply
+  updated (consumers whose update failed or was skipped are left alone),
+  and revokes the replacement. If the provider cannot reactivate the old
+  secret, consumers are still restored and a warning says the old secret
+  stays revoked; a pasted (manual) replacement has to be revoked by hand.
+  Any error stops the rollback at that step, before the replacement is
+  revoked, and exits 1; re-running continues from where it stopped without
+  repeating a step, and a finished rollback (`rolled_back`) makes no call.
+  Every action is saved to the state file and appended to the audit log
+  with step `rollback`. Rolling back without the state file written by
+  apply is not supported.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 - AWS access keys are identified and checked with STS, signed with the
@@ -92,7 +110,7 @@ Not done yet:
 - `rotate apply`: resuming an interrupted, failed or pending rotation (only
   a rotation held at `verified` can be re-run, to finish it with `--force`),
   and `--json`.
-- `rotate rollback` and `rotate status`. These are stubs.
+- `rotate status`. It is a stub. `rotate rollback` has no `--json` yet.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
 

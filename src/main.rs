@@ -24,10 +24,11 @@ use rotate::finding::Finding;
 use rotate::plan;
 use rotate::provider::{ProviderRegistry, ReplacementMode};
 use rotate::report::{read_report, ReportError};
+use rotate::rollback;
 use rotate::secret::SecretValue;
 use rotate::state::{StateError, StateStore};
 
-use crate::cli::{ApplyArgs, Cli, Command, InputArgs};
+use crate::cli::{ApplyArgs, Cli, Command, InputArgs, RollbackArgs};
 use crate::exit::Exit;
 
 fn main() -> ExitCode {
@@ -107,10 +108,11 @@ fn run(
     config: &Config,
     json: bool,
 ) -> Result<Exit, rotate::error::Error> {
-    if let (Command::Apply(_), true) = (&command, json) {
+    if let (Command::Apply(_) | Command::Rollback(_), true) = (&command, json) {
         let _ = writeln!(
             console.err(),
-            "error: rotate apply does not support --json yet"
+            "error: rotate {} does not support --json yet",
+            command.name()
         );
         return Ok(Exit::Usage);
     }
@@ -122,11 +124,11 @@ fn run(
         match &command {
             Command::Plan(_) => return Ok(plan(console, findings, input, config, json)),
             Command::Apply(args) => return Ok(apply(console, findings, args, config)),
+            Command::Rollback(args) => return Ok(rollback(console, findings, args, config)),
             _ => {}
         }
     }
-    // Still stubs until their tickets land (SHA-259 rollback, SHA-263
-    // status).
+    // Still a stub until its ticket lands (SHA-263 status).
     let _ = writeln!(console.err(), "rotate {}: not implemented", command.name());
     Ok(Exit::Usage)
 }
@@ -288,7 +290,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     let all_ids = apply::rotation_ids(&plan);
     let mut askable = Vec::new();
     for rotation in &plan.rotations {
-        match apply::eligibility(rotation) {
+        match apply::eligibility_in(rotation, &store) {
             Ok(()) => askable.push(rotation.rotation_id.as_str()),
             Err(why) => {
                 let _ = writeln!(
@@ -327,14 +329,17 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         .iter()
         .filter(|r| match request {
             Confirmation::Ids(_) => confirmed.contains(&r.rotation_id),
-            _ => confirmed.contains(&r.rotation_id) || apply::eligibility(r).is_err(),
+            _ => confirmed.contains(&r.rotation_id) || apply::eligibility_in(r, &store).is_err(),
         })
         .collect();
 
     // A supplied replacement is one value: it can serve one manual rotation.
     let manual = requested
         .iter()
-        .filter(|r| r.replacement_mode == ReplacementMode::Manual && apply::eligibility(r).is_ok())
+        .filter(|r| {
+            r.replacement_mode == ReplacementMode::Manual
+                && apply::eligibility_in(r, &store).is_ok()
+        })
         .count();
     if supplied.is_some() {
         if manual > 1 {
@@ -354,7 +359,10 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     }
 
     let mut outcomes = Vec::new();
-    if requested.iter().any(|r| apply::eligibility(r).is_ok()) {
+    if requested
+        .iter()
+        .any(|r| apply::eligibility_in(r, &store).is_ok())
+    {
         let mut audit = match AuditLog::open(&config.audit_log) {
             Ok(audit) => audit,
             Err(err) => {
@@ -380,7 +388,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         });
     } else {
         outcomes.extend(requested.iter().filter_map(|r| {
-            apply::eligibility(r)
+            apply::eligibility_in(r, &store)
                 .err()
                 .map(|why| apply::Outcome::skipped(r, why))
         }));
@@ -392,6 +400,121 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         RunStatus::Failed => Exit::RotationFailed,
         RunStatus::Pending => Exit::Pending,
         RunStatus::Unsupported => Exit::Usage,
+    }
+}
+
+/// `rotate rollback` (SHA-259): matches the input secrets to rotations in
+/// the state file by fingerprint, prints the rollback plan, asks for
+/// confirmation (or takes `--confirm`), then for each confirmed rotation
+/// restores the old secret at the provider, restores every updated
+/// consumer and revokes the replacement. The state lock is held for the
+/// whole run. Nothing is called before the match and every confirmation;
+/// no match exits 2 having made no call. The input credentials live until
+/// the summary is printed, so they stay registered with the redactor.
+fn rollback(
+    console: &mut Console,
+    findings: Vec<Finding>,
+    args: &RollbackArgs,
+    config: &Config,
+) -> Exit {
+    let inputs = rollback::inputs(findings);
+    let mut store = match StateStore::open(&config.state_file) {
+        Ok(store) => store,
+        Err(err) => return state_error(console, err),
+    };
+    let selected = match rollback::select(store.rotations(), &inputs, args.rotation.as_deref()) {
+        Ok(selected) => selected,
+        Err(err) => {
+            let _ = writeln!(console.err(), "error: {err}");
+            return Exit::Usage;
+        }
+    };
+    let plans: Vec<(rollback::RollbackPlan, usize)> = selected
+        .iter()
+        .map(|s| (rollback::RollbackPlan::of(&s.rotation), s.input))
+        .collect();
+    let all: Vec<rollback::RollbackPlan> = plans.iter().map(|(p, _)| p.clone()).collect();
+    print_out(console, &rollback::render_plan(&all));
+    let ids: Vec<&str> = plans
+        .iter()
+        .filter(|(p, _)| p.has_work())
+        .map(|(p, _)| p.rotation_id.as_str())
+        .collect();
+    if ids.is_empty() {
+        let _ = writeln!(console.err(), "Nothing to roll back.");
+        return Exit::Ok;
+    }
+
+    let request = if args.confirm.is_empty() {
+        Confirmation::Interactive
+    } else {
+        Confirmation::Ids(args.confirm.clone())
+    };
+    let mut prompt = providers::prompt().unwrap_or_else(|| Box::new(TtyPrompt::new()));
+    let confirmed = {
+        let mut err = QuestionWriter::new(&mut *console);
+        let result = apply::confirm(&ids, &ids, &request, prompt.as_mut(), &mut err);
+        drop(err);
+        match result {
+            Ok(confirmed) => confirmed,
+            Err(err) => {
+                let _ = writeln!(console.err(), "error: {err}");
+                return Exit::Usage;
+            }
+        }
+    };
+    if confirmed.is_empty() {
+        let _ = writeln!(console.err(), "Nothing was confirmed; nothing was changed.");
+        return Exit::Ok;
+    }
+
+    let mut audit = match AuditLog::open(&config.audit_log) {
+        Ok(audit) => audit,
+        Err(err) => {
+            let _ = writeln!(console.err(), "error: {err}");
+            return if err.is_usage() {
+                Exit::Usage
+            } else {
+                Exit::RotationFailed
+            };
+        }
+    };
+    let registry = providers::registry_with(&config.providers);
+    let consumers = providers::consumers_with(
+        &config.consumers,
+        &config.providers.github,
+        &config.providers.aws,
+    );
+    let runtime = match runtime(console) {
+        Ok(runtime) => runtime,
+        Err(exit) => return exit,
+    };
+    let mut outcomes = Vec::new();
+    {
+        let mut executor =
+            rollback::RollbackExecutor::new(&registry, &consumers, &mut store, &mut audit);
+        runtime.block_on(async {
+            for (plan, input) in &plans {
+                if confirmed.contains(&plan.rotation_id) {
+                    outcomes.push(executor.run(plan, &inputs[*input].credential).await);
+                }
+            }
+        });
+    }
+    drop(store);
+    for outcome in &outcomes {
+        for warning in &outcome.warnings {
+            let _ = writeln!(console.err(), "warning: {}: {warning}", outcome.rotation_id);
+        }
+    }
+    print_out(
+        console,
+        &format!("\n{}", rollback::render_summary(&outcomes)),
+    );
+    if rollback::any_failed(&outcomes) {
+        Exit::RotationFailed
+    } else {
+        Exit::Ok
     }
 }
 
