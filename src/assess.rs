@@ -282,16 +282,23 @@ async fn check_all(assessed: &mut [Assessed], registry: &ProviderRegistry, opts:
                 .acquire_owned()
                 .await
                 .expect("the semaphore is never closed");
+            // Error text is redacted here, while the credential is alive and
+            // registered: the plan prints it after a skipped finding's
+            // credential has dropped, when the redactor no longer knows the
+            // value an upstream may have echoed (SHA-265).
             let validity = match with_retry(opts, || provider.check_valid(&credential)).await {
                 Ok(validity) => validity,
                 Err(err) => Validity::Unknown {
-                    reason: err.to_string(),
+                    reason: crate::redact::redact(&err.to_string()).into_owned(),
                 },
             };
             let (scope, scope_error) = if validity == Validity::Valid {
                 match with_retry(opts, || provider.describe_scope(&credential)).await {
                     Ok(scope) => (Some(scope), None),
-                    Err(err) => (None, Some(err.to_string())),
+                    Err(err) => (
+                        None,
+                        Some(crate::redact::redact(&err.to_string()).into_owned()),
+                    ),
                 }
             } else {
                 (None, None)
@@ -711,6 +718,35 @@ mod tests {
         assert_eq!(assessed[1].validity, Some(Validity::Valid));
         assert_eq!(calls_to(&log, "check_valid"), 3 + 1);
         log.assert_no_mutations();
+    }
+
+    /// SHA-265: an error that echoes the secret is redacted while the
+    /// credential is alive; the reason outlives it and is printed later.
+    #[tokio::test]
+    async fn echoed_secret_in_check_or_scope_error_is_redacted() {
+        for method in ["check_valid", "describe_scope"] {
+            let value = format!("echo_{method}_value_7f3a91c2");
+            let mock = Arc::new(
+                MockProvider::new("echo")
+                    .identify_prefix("echo_")
+                    .leak_secret_in_errors(method),
+            );
+            let assessed = assess(
+                vec![finding(&value, "Mock", "a.env")],
+                &registry(vec![mock]),
+                &opts(),
+            )
+            .await;
+            let item = assessed.into_iter().next().unwrap();
+            let reason = match (method, &item.validity, &item.scope_error) {
+                ("check_valid", Some(Validity::Unknown { reason }), _) => reason.clone(),
+                ("describe_scope", _, Some(reason)) => reason.clone(),
+                other => panic!("{method}: unexpected {other:?}"),
+            };
+            drop(item);
+            assert!(reason.contains("[REDACTED"), "{method}: {reason}");
+            assert!(!reason.contains(&value), "{method}: the secret leaked");
+        }
     }
 
     #[tokio::test]
