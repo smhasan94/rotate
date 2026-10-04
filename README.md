@@ -105,6 +105,23 @@ What works now:
   Every action is saved to the state file and appended to the audit log
   with step `rollback`. Rolling back without the state file written by
   apply is not supported.
+- `rotate status` shows what is in progress without touching any provider:
+  it reads `.rotate/state.json` (without taking its lock) and
+  `.rotate/audit.jsonl`, makes no network call and writes nothing. Each row
+  has the rotation id, provider, fingerprint, step, time since the last
+  update, consumers updated out of all recorded, the revoke time and time
+  left for a `pending_revoke`, and a one-line hint ("re-run `rotate apply`
+  after 07:12:00 UTC to revoke the old secret", "run `rotate rollback` with
+  the same input, then `rotate apply` again", "consumer <ref> failed: see
+  the audit log, ..."). When a rotation's last audit entry has an error,
+  the redacted error is printed under its row. Finished rotations
+  (`revoked`, `rolled_back`) are hidden unless you pass `--all`; a rollback
+  still in progress is always shown. `--json` prints the same rows as an
+  array described by [docs/status-schema.json](docs/status-schema.json).
+  It exits 3 when any rotation is pending (`created`, `consumers_updated`,
+  `verified`, `pending_revoke`, `failed`, `needs_rollback`, or being rolled
+  back) and 0 otherwise, including when there is no state file ("no
+  rotations"). `planned` rotations are listed but are not pending.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 - AWS access keys are identified and checked with STS, signed with the
@@ -161,7 +178,7 @@ Not done yet:
 - `rotate apply --json`. Resuming a manual-mode rotation after the process
   exited by pasting the same replacement again (such a rotation is marked
   `needs_rollback`).
-- `rotate status`. It is a stub. `rotate rollback` has no `--json` yet.
+- `rotate rollback` has no `--json` yet.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
 
@@ -209,6 +226,9 @@ pbpaste | rotate plan --stdin
 # Apply the plan: type each rotation id when asked.
 rotate apply trufflehog-report.json
 
+# What is in progress or waiting for its overlap window; exits 3 if any.
+rotate status
+
 # Non-interactive, for CI: confirm by id.
 rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
 
@@ -223,7 +243,7 @@ NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env
 | 0 | Everything requested was done. |
 | 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. |
 | 2 | Bad arguments, bad configuration, or a subcommand that is not implemented yet. |
-| 3 | Work is pending, for example a revoke waiting for its overlap window (`rotate status`). |
+| 3 | Work is pending: `rotate apply` recorded a revoke waiting for its overlap window, or `rotate status` found a rotation that is pending, failed or needs rollback. |
 | 101 | rotate panicked. This is a bug; the message is redacted like all other output. |
 
 ## Documentation

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/smhasan94/rotate/blob/main/docs/status-schema.json",
+  "title": "rotate status --json",
+  "description": "The rows printed by `rotate status --json` (SHA-263): one object per rotation in progress, or per rotation with `--all`, sorted by rotation_id. Read from the state file and audit log only. Holds fingerprints, references and redacted errors only, never a secret value. The exit code is 3 when any rotation in the state file is pending (shown or not), otherwise 0.",
+  "type": "array",
+  "items": { "$ref": "#/$defs/row" },
+  "$defs": {
+    "fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{16}$" },
+    "time": { "type": "string", "format": "date-time" },
+    "step": {
+      "enum": [
+        "planned", "created", "consumers_updated", "verified",
+        "pending_revoke", "revoked", "failed", "needs_rollback", "rolled_back"
+      ]
+    },
+    "audit_step": {
+      "enum": [
+        "identify", "check", "plan", "create", "update", "verify",
+        "revoke", "rollback", "force"
+      ]
+    },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rotation_id", "provider", "fingerprint", "step",
+        "rollback_in_progress", "updated_at", "updated_seconds_ago",
+        "consumers_updated", "consumers_total", "revoke_not_before",
+        "revoke_remaining_seconds", "failed_step", "pending", "hint", "error"
+      ],
+      "properties": {
+        "rotation_id": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "step": { "$ref": "#/$defs/step" },
+        "rollback_in_progress": {
+          "description": "A rollback has started and not finished; the table shows the step as `rolling_back (<step>)`.",
+          "type": "boolean"
+        },
+        "updated_at": { "$ref": "#/$defs/time" },
+        "updated_seconds_ago": {
+          "description": "Seconds from updated_at to now by the clock status ran with; the table shows it as relative time.",
+          "type": "integer", "minimum": 0
+        },
+        "consumers_updated": {
+          "description": "Consumers with status `updated`.",
+          "type": "integer", "minimum": 0
+        },
+        "consumers_total": { "type": "integer", "minimum": 0 },
+        "revoke_not_before": {
+          "description": "Earliest time the old secret may be revoked, as recorded.",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/time" }]
+        },
+        "revoke_remaining_seconds": {
+          "description": "Seconds until revoke_not_before, 0 once it has passed. Null unless step is pending_revoke.",
+          "type": ["integer", "null"], "minimum": 0
+        },
+        "failed_step": {
+          "description": "The step that failed (step failed) or could not continue (step needs_rollback).",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/audit_step" }]
+        },
+        "pending": {
+          "description": "True at created, consumers_updated, verified, pending_revoke, failed or needs_rollback, or while a rollback is in progress. Any pending rotation makes the exit code 3.",
+          "type": "boolean"
+        },
+        "hint": { "description": "What to do next, one line.", "type": "string" },
+        "error": {
+          "description": "The error of the rotation's last audit entry, when that entry has one.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["step", "at", "text"],
+              "properties": {
+                "step": { "$ref": "#/$defs/audit_step" },
+                "at": { "$ref": "#/$defs/time" },
+                "text": { "description": "Redacted.", "type": "string" }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
