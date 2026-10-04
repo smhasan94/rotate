@@ -58,6 +58,11 @@ pub enum Step {
     /// (SHA-258). The old secret is still valid. Only `rollback` moves it
     /// on; apply leaves it alone.
     NeedsRollback,
+    /// The replacement is live and verified, but rotate cannot revoke the
+    /// old secret (SHA-289): the operator has to delete it by hand, as
+    /// [`Rotation::revoke_instructions`] says. Not terminal: a later apply
+    /// checks the old secret and records `revoked` once it no longer works.
+    RevokeManual,
     /// Rolled back; the rotation is finished.
     RolledBack,
 }
@@ -166,6 +171,11 @@ pub struct Rotation {
     /// Rollback progress (SHA-259); absent until a rollback starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackProgress>,
+    /// How to revoke the old secret by hand, from the provider, while
+    /// `step` is `revoke_manual` (SHA-289). Text only, never a value.
+    /// Absent otherwise, and in files written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke_instructions: Option<String>,
 }
 
 impl Rotation {
@@ -191,6 +201,7 @@ impl Rotation {
             failed_step: None,
             restore_ref: None,
             rollback: None,
+            revoke_instructions: None,
         }
     }
 

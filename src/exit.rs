@@ -19,6 +19,10 @@ pub enum Exit {
     Usage = 2,
     /// Work is pending, for example a revoke waiting for its overlap window.
     Pending = 3,
+    /// The replacement is live and verified, but rotate cannot revoke the
+    /// old secret: the operator has to delete it by hand (SHA-289). Re-run
+    /// `rotate apply` afterwards to record it revoked.
+    RevokeManual = 4,
 }
 
 impl From<Exit> for ExitCode {
@@ -37,5 +41,6 @@ mod tests {
         assert_eq!(Exit::RotationFailed as u8, 1);
         assert_eq!(Exit::Usage as u8, 2);
         assert_eq!(Exit::Pending as u8, 3);
+        assert_eq!(Exit::RevokeManual as u8, 4);
     }
 }

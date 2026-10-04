@@ -230,6 +230,7 @@ fn build_plan(
         .await
     });
     plan.skipped.extend(already_rotated);
+    plan::mark_revoked_by_hand(&mut plan, store.rotations());
     if let Err(err) = plan::assign_ids(&mut plan, store) {
         return Err(state_error(console, err));
     }
@@ -349,12 +350,21 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         Err(exit) => return exit,
     };
     print_out(console, &plan::render_apply_table(&plan));
-    if plan.rotations.is_empty() {
+    // Old secrets deleted by hand since an earlier run (SHA-289): recorded
+    // revoked with no further call and no question.
+    let by_hand: Vec<&plan::Skipped> = plan
+        .skipped
+        .iter()
+        .filter(|s| s.reason == plan::REVOKED_BY_HAND)
+        .collect();
+    if plan.rotations.is_empty() && by_hand.is_empty() {
         let _ = writeln!(console.err(), "Nothing to apply.");
         return Exit::Ok;
     }
 
-    let all_ids = apply::rotation_ids(&plan);
+    // A --confirm naming a rotation deleted by hand is not an unknown id.
+    let mut all_ids = apply::rotation_ids(&plan);
+    all_ids.extend(by_hand.iter().filter_map(|s| s.rotation_id.as_deref()));
     let mut askable = Vec::new();
     for rotation in &plan.rotations {
         match apply::eligibility_in(rotation, &store) {
@@ -426,9 +436,10 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     }
 
     let mut outcomes = Vec::new();
-    if requested
-        .iter()
-        .any(|r| apply::eligibility_in(r, &store).is_ok())
+    if !by_hand.is_empty()
+        || requested
+            .iter()
+            .any(|r| apply::eligibility_in(r, &store).is_ok())
     {
         let mut audit = match AuditLog::open(&config.audit_log) {
             Ok(audit) => audit,
@@ -452,6 +463,11 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         if let Some(clock) = providers::clock() {
             executor = executor.with_clock(clock);
         }
+        outcomes.extend(
+            by_hand
+                .iter()
+                .filter_map(|s| executor.confirm_revoked_by_hand(s)),
+        );
         runtime.block_on(async {
             for rotation in &requested {
                 outcomes.push(executor.run(rotation).await);
@@ -469,6 +485,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     match apply::run_status(&outcomes) {
         RunStatus::Done => Exit::Ok,
         RunStatus::Failed => Exit::RotationFailed,
+        RunStatus::RevokeManual => Exit::RevokeManual,
         RunStatus::Pending => Exit::Pending,
         RunStatus::Unsupported => Exit::Usage,
     }

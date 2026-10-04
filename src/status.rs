@@ -9,12 +9,15 @@
 //! A row is shown by default while the rotation is unfinished (any step but
 //! `revoked` and `rolled_back`) or while a rollback of it is in progress;
 //! `--all` adds the finished ones. A rotation is *pending* (exit 3) at
-//! `created`, `consumers_updated`, `verified`, `pending_revoke`, `failed` or
-//! `needs_rollback`, or while it is being rolled back. `planned` is listed
+//! `created`, `consumers_updated`, `verified`, `pending_revoke`, `failed`,
+//! `needs_rollback` or `revoke_manual` (SHA-289), or while it is being
+//! rolled back. `planned` is listed
 //! but not pending: nothing has changed for it yet.
 //!
 //! The only free text printed is the error of a rotation's last audit
-//! entry, a [`RedactedText`] that was redacted again when it was read back.
+//! entry, a [`RedactedText`] that was redacted again when it was read back,
+//! and the revoke-by-hand instructions the provider gave (SHA-289), which
+//! were redacted before they were stored.
 
 #![cfg(unix)]
 
@@ -41,8 +44,10 @@ pub struct LastError {
     pub text: RedactedText,
 }
 
-/// The last audit entry of each rotation, kept only when it has an error,
-/// plus one warning per kind of unreadable line. A bad line never stops
+/// The last audit entry of each rotation, kept only when it has an error
+/// and its outcome is not `ok` (an `ok` entry's text is a detail, such as
+/// a revoke by hand being confirmed), plus one warning per kind of
+/// unreadable line. A bad line never stops
 /// status; it is skipped and reported.
 pub fn last_errors(
     entries: impl IntoIterator<Item = Result<AuditEntry, AuditError>>,
@@ -63,6 +68,7 @@ pub fn last_errors(
     }
     let errors = last
         .into_iter()
+        .filter(|(_, entry)| entry.outcome != crate::audit::Outcome::Ok)
         .filter_map(|(id, entry)| {
             entry.error.map(|text| {
                 (
@@ -135,6 +141,7 @@ pub fn is_pending(rotation: &Rotation) -> bool {
                 | Step::PendingRevoke
                 | Step::Failed
                 | Step::NeedsRollback
+                | Step::RevokeManual
         )
 }
 
@@ -225,6 +232,15 @@ pub fn hint(rotation: &Rotation, now: OffsetDateTime) -> String {
         Step::NeedsRollback => {
             "run `rotate rollback` with the same input, then `rotate apply` again".to_owned()
         }
+        Step::RevokeManual => format!(
+            "revoke by hand: {}; then re-run `rotate apply` to record it",
+            crate::apply::by_hand_text(
+                rotation
+                    .revoke_instructions
+                    .as_deref()
+                    .unwrap_or("delete the old secret at the provider")
+            )
+        ),
         Step::Revoked => "done".to_owned(),
         Step::RolledBack => "rolled back".to_owned(),
     }
@@ -580,5 +596,42 @@ mod tests {
         assert_eq!(duration_text(3900), "1h 5m");
         assert_eq!(duration_text(3 * 86_400 + 4 * 3600), "3d 4h");
         assert_eq!(duration_text(-5), "0s");
+    }
+
+    // SHA-289 T10 (AC10)
+    #[test]
+    fn revoke_manual_is_pending_with_the_instructions_as_hint() {
+        let mut r = rotation("rot-m", Step::RevokeManual);
+        r.revoke_instructions = Some(crate::provider::openai::REVOKE_NEEDS_ADMIN.into());
+        assert!(is_pending(&r));
+        assert!(is_shown_by_default(&r));
+        assert!(any_pending(&snapshot(vec![r.clone()])));
+        assert_eq!(
+            hint(&r, now()),
+            "revoke by hand: without an Admin API key rotate cannot delete OpenAI keys; delete it at https://platform.openai.com/api-keys; then re-run `rotate apply` to record it"
+        );
+        let row = super::row(&r, None, now());
+        let table = render_table(std::slice::from_ref(&row), 1, now());
+        assert!(table.contains("revoke_manual"), "{table}");
+        let json: serde_json::Value = serde_json::from_str(&render_json(&[row])).unwrap();
+        assert_eq!(json[0]["step"], "revoke_manual");
+        assert_eq!(json[0]["pending"], true);
+
+        r.revoke_instructions = None;
+        assert!(hint(&r, now()).starts_with("revoke by hand: delete the old secret"));
+    }
+
+    // An ok entry's text (a revoke by hand confirmed) is not an error.
+    #[test]
+    fn ok_entry_text_is_not_an_error() {
+        let mut confirmed = entry("rot-1", AuditStep::Revoke, None);
+        confirmed.error = Some(RedactedText::new(
+            "revoked by hand, confirmed by check_valid",
+        ));
+        let (errors, _) = last_errors(vec![
+            Ok(entry("rot-1", AuditStep::Revoke, Some("old"))),
+            Ok(confirmed),
+        ]);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

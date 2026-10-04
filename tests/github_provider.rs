@@ -21,16 +21,19 @@ use rotate::audit::AuditLog;
 use rotate::config::ConsumersConfig;
 use rotate::conformance::{provider_suite, MutationProbe, Outcome, ProviderFixture};
 use rotate::consumer::mock::MockConsumer;
+use rotate::consumer::Holds;
 use rotate::consumer::{ConsumerMatch, ConsumerRegistry};
 use rotate::finding::{Finding, SourceLocation};
 use rotate::plan;
-use rotate::provider::github::{GithubProvider, FINE_GRAINED_NOTE, REVOKE_BATCH};
+use rotate::provider::github::{
+    GithubProvider, FINE_GRAINED_NOTE, INSTALLATION_UNSUPPORTED, REVOKE_BATCH,
+};
 use rotate::provider::{
     Credential, Identity, Provider, ProviderError, ProviderRegistry, ReplacementMode,
     RestoreOutcome, Validity,
 };
 use rotate::secret::SecretValue;
-use rotate::state::StateStore;
+use rotate::state::{ConsumerState, ConsumerStatus, StateStore, Step};
 
 use common::CallRecorder;
 
@@ -744,6 +747,119 @@ async fn token_never_in_output_logs_audit_or_state() {
         if auth.contains(&replacement) {
             assert_eq!(target, "GET /user", "new token signed {target}");
         }
+    }
+}
+
+/// `GET /installation/repositories` signed with `value` answers 3 repos.
+async fn mount_installation(rec: &CallRecorder, value: &str) {
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .and(header("authorization", bearer(value).as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "total_count": 3, "repositories": [] })),
+        )
+        .with_priority(2)
+        .mount(rec.server())
+        .await;
+}
+
+// SHA-289 T9 (AC9): plan shows the manual revoke row and blocker for an
+// installation token, with zero state-changing calls.
+#[tokio::test]
+async fn installation_token_plan_shows_manual_revoke() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let leaked = token(["gh", "s_"], "t9Inst");
+    mount_installation(&rec, &leaked).await;
+    let p = pipeline(&rec, &leaked).await;
+    let rotation = &p.plan.rotations[0];
+    assert_eq!(rotation.revoke_action, INSTALLATION_UNSUPPORTED);
+    assert!(
+        rotation
+            .blockers
+            .contains(&plan::MANUAL_REVOKE_BLOCKER.to_owned()),
+        "{:?}",
+        rotation.blockers
+    );
+    let table = plan::render_table(&p.plan);
+    assert!(table.contains(plan::MANUAL_REVOKE_BLOCKER), "{table}");
+    let json = plan::render_json(&p.plan);
+    assert!(json.contains("regenerate via the app"), "{json}");
+    assert!(!table.contains(&leaked) && !json.contains(&leaked));
+    rec.assert_no_mutations().await;
+    assert!(revokes(&rec).await.is_empty());
+}
+
+// SHA-289 T2 (AC2), T11 (AC2): apply reaching revoke for an installation
+// token (state seeded at verified: no replacement for one can be verified)
+// records revoke_manual with the provider's text and never posts to
+// /credentials/revoke. The token is in no output, log, audit entry or
+// state file.
+#[tokio::test]
+async fn installation_token_apply_stops_at_revoke_manual() {
+    let capture = trace_capture();
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let leaked = token(["gh", "s_"], "t2Inst");
+    mount_installation(&rec, &leaked).await;
+    let mut p = pipeline(&rec, &leaked).await;
+    let id = p.plan.rotations[0].rotation_id.clone();
+    let mut record = p.store.get(&id).unwrap().clone();
+    record.step = Step::Verified;
+    record.replacement_ref = Some(apply::MANUAL_REF.into());
+    record.replacement_fingerprint = Some(SecretValue::from("replacement-t2").fingerprint());
+    record.consumers = vec![ConsumerState {
+        consumer: "github-actions".into(),
+        consumer_ref: "gha:acme/app:GH_TOKEN".into(),
+        status: ConsumerStatus::Updated,
+        holds: Some(Holds::Secret),
+    }];
+    p.store.upsert(record).unwrap();
+    let mut term = Term::default();
+
+    let outcome = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+        .with_manual(ReplacementSource::Supplied(None), &mut term)
+        .run(&p.plan.rotations[0])
+        .await;
+    match &outcome.result {
+        RunResult::RevokeManual { instructions } => {
+            assert_eq!(instructions.as_str(), INSTALLATION_UNSUPPORTED);
+        }
+        other => panic!("expected revoke by hand, got {other:?}"),
+    }
+    assert_eq!(
+        apply::run_status(std::slice::from_ref(&outcome)),
+        apply::RunStatus::RevokeManual
+    );
+    let stored = p.store.get(&id).unwrap();
+    assert_eq!(stored.step, Step::RevokeManual);
+    assert_eq!(
+        stored.revoke_instructions.as_deref(),
+        Some(INSTALLATION_UNSUPPORTED)
+    );
+    assert!(revokes(&rec).await.is_empty(), "revoke was posted");
+    rec.assert_no_mutations().await;
+
+    let summary = apply::render_summary(std::slice::from_ref(&outcome));
+    assert!(
+        summary.contains(&format!("{id}: revoke by hand: regenerate via the app.")),
+        "{summary}"
+    );
+    let audit = std::fs::read_to_string(p.dir.path().join("audit.jsonl")).unwrap();
+    let state = std::fs::read_to_string(p.dir.path().join("state.json")).unwrap();
+    assert!(state.contains("revoke_manual"), "{state}");
+    let logs = capture.contents();
+    for (label, text) in [
+        ("summary", &summary),
+        ("stdout", &term.out),
+        ("stderr", &term.err),
+        ("audit log", &audit),
+        ("state file", &state),
+        ("logs", &logs),
+        ("outcome", &format!("{outcome:?}")),
+    ] {
+        assert!(!text.contains(leaked.as_str()), "token in {label}");
     }
 }
 

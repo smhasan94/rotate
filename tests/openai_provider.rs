@@ -708,16 +708,21 @@ async fn undeletable_key_plan_row_and_no_delete_after_apply() {
     let outcome = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
         .run(&p.plan.rotations[0])
         .await;
+    // SHA-289: a revoke rotate cannot do ends at revoke_manual, not failed.
     match &outcome.result {
-        RunResult::Failed { step, error } => {
-            assert_eq!(*step, rotate::audit::AuditStep::Revoke);
-            assert!(
-                error.to_string().contains("platform.openai.com/api-keys"),
-                "{error}"
-            );
+        RunResult::RevokeManual { instructions } => {
+            assert_eq!(instructions.as_str(), REVOKE_UNDELETABLE);
         }
-        other => panic!("expected the revoke step to stop, got {other:?}"),
+        other => panic!("expected a revoke by hand, got {other:?}"),
     }
+    assert_eq!(
+        p.store
+            .get(&p.plan.rotations[0].rotation_id)
+            .unwrap()
+            .revoke_instructions
+            .as_deref(),
+        Some(REVOKE_UNDELETABLE)
+    );
     assert_eq!(
         p.gha.current("gha:acme/app:OPENAI_API_KEY"),
         Some(SecretValue::from(fresh.as_str()).fingerprint()),

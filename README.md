@@ -83,6 +83,20 @@ What works now:
   and tells you to run `rotate rollback` with the same input, then apply
   again. A secret whose rotation finished is listed by `plan` and `apply`
   as "already rotated on <date>" and no call is made for it.
+- Revoke by hand: when rotate cannot revoke the old secret itself (an
+  OpenAI key without an Admin API key or one the Admin API cannot delete,
+  a GitHub App installation token, a legacy-format GitHub token), `plan`
+  shows the manual revoke row and a blocker, and `apply` updates the
+  consumers, verifies the replacement, waits out the overlap window, then
+  stops at step `revoke_manual` with the provider's instructions ("rot-3:
+  revoke by hand: ... delete it at https://platform.openai.com/api-keys;
+  the replacement is live and verified") and exits 4. The audit log gets a
+  `revoke` entry with outcome `skipped` and the instructions. Once you have
+  deleted the old secret, re-run `rotate apply` with the same input: a
+  read-only check finds it no longer works and records the rotation
+  `revoked` (a `revoke` entry with outcome `ok`, "revoked by hand,
+  confirmed by check_valid"), with no state-changing call. While it still
+  works the re-run makes only that check and exits 4 again.
 - Manual replacement mode, for providers whose API cannot mint a
   replacement (GitHub and npm tokens, and OpenAI keys without an Admin API
   key). Apply prints what to create, then
@@ -126,8 +140,8 @@ What works now:
   still in progress is always shown. `--json` prints the same rows as an
   array described by [docs/status-schema.json](docs/status-schema.json).
   It exits 3 when any rotation is pending (`created`, `consumers_updated`,
-  `verified`, `pending_revoke`, `failed`, `needs_rollback`, or being rolled
-  back) and 0 otherwise, including when there is no state file ("no
+  `verified`, `pending_revoke`, `failed`, `needs_rollback`, `revoke_manual`
+  (the hint is the provider's instructions), or being rolled back) and 0 otherwise, including when there is no state file ("no
   rotations"). `planned` rotations are listed but are not pending.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
@@ -270,7 +284,8 @@ NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env
 | 0 | Everything requested was done. |
 | 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. |
 | 2 | Bad arguments, bad configuration, or a subcommand that is not implemented yet. |
-| 3 | Work is pending: `rotate apply` recorded a revoke waiting for its overlap window, or `rotate status` found a rotation that is pending, failed or needs rollback. |
+| 3 | Work is pending: `rotate apply` recorded a revoke waiting for its overlap window, or `rotate status` found a rotation that is pending, failed, needs rollback or waits for a revoke by hand. |
+| 4 | `rotate apply`: the replacement is live and verified, but rotate cannot revoke the old secret; delete it by hand as the summary says, then re-run `rotate apply` to record it. When several rotations end differently, 1 wins over 4, 4 over 3 and 3 over 2. |
 | 101 | rotate panicked. This is a bug; the message is redacted like all other output. |
 
 ## Documentation
@@ -281,6 +296,9 @@ NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env
   gitleaks fields rotate reads.
 - [docs/rotate.example.yaml](docs/rotate.example.yaml): every config option
   with its default.
+- [docs/providers.md](docs/providers.md): what rotate automates for each
+  provider and consumer, what is manual or unsupported, and what to prepare
+  before an incident.
 - [docs/permissions.md](docs/permissions.md): the operator permissions each
   provider needs.
 - [CONTRIBUTING.md](CONTRIBUTING.md): checks, branches, commits and pull
