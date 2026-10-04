@@ -143,6 +143,17 @@ the closure that uses it.
   reaches stdout, stderr, tracing output or the audit log. `tests/secret_leak.rs`
   shows the pattern: format into an in-memory writer, capture tracing with a
   subscriber writing to a shared buffer, and assert the plaintext is absent.
+- `tests/leakage.rs` (SHA-265) is the whole-tool audit: it runs every
+  command and mode with canary secrets at `-vvv`/`RUST_LOG=trace`, then
+  sweeps stdout, stderr and every file under the working directory and
+  `TMPDIR` for each canary raw, URL-encoded, hex and base64. A new command,
+  mode or failure path gets a run there. Its sweep is proven against a
+  planted leak through the `leak-canary-test` feature (on with
+  `--all-features`, never in releases), which makes the binary write the
+  input secret raw when `ROTATE_TEST_PLANT_LEAK` is set.
+- Redact a provider error's text while the credential is still alive if the
+  text outlives it (as the plan's skipped rows do): the redactor only knows
+  values that are registered at the moment it runs.
 
 ## Adding a provider
 

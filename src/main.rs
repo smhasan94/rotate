@@ -121,6 +121,8 @@ fn run(
             Ok(findings) => findings,
             Err(exit) => return Ok(exit),
         };
+        #[cfg(feature = "leak-canary-test")]
+        plant_leak(&findings);
         match &command {
             Command::Plan(args) => {
                 let check = args.check_permissions;
@@ -744,4 +746,25 @@ fn test_console(
             Ok(Exit::Ok)
         }
     }
+}
+
+/// The deliberate leak of the `leak-canary-test` feature (SHA-265): when
+/// `ROTATE_TEST_PLANT_LEAK` is `stdout`, `stderr` or a relative file name,
+/// writes the first input secret there once, raw, past the console's
+/// redaction. `tests/leakage.rs` uses it to prove its sweep fails on a leak.
+#[cfg(feature = "leak-canary-test")]
+fn plant_leak(findings: &[Finding]) {
+    let Some(target) = std::env::var_os("ROTATE_TEST_PLANT_LEAK") else {
+        return;
+    };
+    let Some(finding) = findings.first() else {
+        return;
+    };
+    let mut bytes = finding.raw.expose_secret(<[u8]>::to_vec);
+    bytes.push(b'\n');
+    let _ = match target.to_str() {
+        Some("stdout") => std::io::stdout().write_all(&bytes),
+        Some("stderr") => std::io::stderr().write_all(&bytes),
+        _ => std::fs::write(&target, &bytes),
+    };
 }

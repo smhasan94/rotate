@@ -683,6 +683,34 @@ impl GithubModel {
 /// Calls that change state. Everything else the model answers is a read.
 pub const MUTATING: &[&str] = &["CreateAccessKey", "UpdateAccessKey", "PutSecretValue"];
 
+/// The secret values an [`E2e`] run uses. AWS secret access keys must be
+/// 40 chars of `[A-Za-z0-9/+]`.
+pub struct E2eValues {
+    /// The operator's own AWS secret access key (the credential chain).
+    pub operator_secret: String,
+    pub leaked_secret: String,
+    /// What the first `CreateAccessKey` mints.
+    pub new_secret: String,
+    /// What a second `CreateAccessKey` mints, after
+    /// [`E2e::next_replacement`].
+    pub second_secret: String,
+    /// The operator's GitHub token.
+    pub github_token: String,
+}
+
+impl E2eValues {
+    /// The fixed values of SHA-264 and SHA-267.
+    pub fn fixed() -> Self {
+        Self {
+            operator_secret: ["operatorSecretFromTheChain", "0000000000000x"].concat(),
+            leaked_secret: secret("e2eLeak1"),
+            new_secret: secret("e2eNewK1"),
+            second_secret: secret("e2e2ndK1"),
+            github_token: ["e2e-operator-gh-token-", "7c41d0"].concat(),
+        }
+    }
+}
+
 pub struct E2e {
     pub rec: CallRecorder,
     pub model: AwsModel,
@@ -706,13 +734,19 @@ pub struct E2e {
 impl E2e {
     /// A user holding only the leaked key, referenced by `prod/app`.
     pub async fn start() -> Self {
-        Self::start_inner(false).await
+        Self::start_inner(false, E2eValues::fixed()).await
     }
 
     /// As [`E2e::start`], and the leaked pair is also held by the Actions
     /// secrets of `acme/api`, which `rotate.yaml` lists.
     pub async fn start_with_github() -> Self {
-        Self::start_inner(true).await
+        Self::start_inner(true, E2eValues::fixed()).await
+    }
+
+    /// As [`E2e::start_with_github`], with the secrets and operator
+    /// credentials a test chooses (the leakage canaries of SHA-265).
+    pub async fn start_with_github_values(values: E2eValues) -> Self {
+        Self::start_inner(true, values).await
     }
 
     /// The `GithubModel`; panics without one.
@@ -725,17 +759,22 @@ impl E2e {
         self.model.state().next_key = (self.second_id.clone(), self.second_secret.clone());
     }
 
-    async fn start_inner(with_github: bool) -> Self {
+    async fn start_inner(with_github: bool, values: E2eValues) -> Self {
         let operator_id = key_id("OPERATR");
-        let operator_secret = ["operatorSecretFromTheChain", "0000000000000x"].concat();
+        let E2eValues {
+            operator_secret,
+            leaked_secret,
+            new_secret,
+            second_secret,
+            github_token,
+        } = values;
         let leaked = Key {
             id: key_id("E2ELEAK"),
-            secret: secret("e2eLeak1"),
+            secret: leaked_secret,
             status: "Active",
         };
-        let (new_id, new_secret) = (key_id("E2ENEWK"), secret("e2eNewK1"));
+        let new_id = key_id("E2ENEWK");
         let model = AwsModel::new(&operator_id, &leaked, (new_id.clone(), new_secret.clone()));
-        let github_token = ["e2e-operator-gh-token-", "7c41d0"].concat();
         let mut rec = CallRecorder::start().await;
         // Priority 1 is wiremock's highest: the GitHub routes answer ahead
         // of the AWS model, which takes everything else.
@@ -779,7 +818,7 @@ impl E2e {
             new_id,
             new_secret,
             second_id: key_id("E2E2NDK"),
-            second_secret: secret("e2e2ndK1"),
+            second_secret,
             token_var: Mutex::new("ROTATE_GITHUB_TOKEN"),
         };
         e2e.write_inputs();
@@ -830,6 +869,9 @@ impl E2e {
         for name in ["aws-config", "aws-credentials"] {
             std::fs::write(home.join(name), "").unwrap();
         }
+        // A temp directory of the run's own, so a test can sweep it.
+        let tmp = self.file("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("rotate"));
         command.env_clear();
         if self.github.is_some() {
@@ -848,6 +890,7 @@ impl E2e {
             .env("ROTATE_ACTOR", "e2e@runner")
             .env("ROTATE_TEST_SCENARIO", self.file("scenario.json"))
             .env("RUST_LOG", "trace")
+            .env("TMPDIR", &tmp)
             .arg("-vvv")
             .args(args)
             .stdin(std::process::Stdio::null())
