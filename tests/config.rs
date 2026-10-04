@@ -59,11 +59,37 @@ fn bad_overlap_env_exits_2() {
 #[test]
 fn valid_config_reaches_the_subcommand() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("rotate.yaml"), "overlap_window: 30m\n").unwrap();
-    // `status` is still a stub (SHA-263) and needs no input; reaching it
-    // proves the config loaded.
+    std::fs::write(
+        dir.path().join("rotate.yaml"),
+        "overlap_window: 30m\nstate_file: elsewhere/state.json\n",
+    )
+    .unwrap();
+    // `status` needs no input. It reports the state file the config names,
+    // which proves the config loaded: an empty one is "no rotations", and
+    // one with a wide mode is refused by that path.
     rotate_in(dir.path())
         .arg("status")
         .assert()
-        .stderr(predicate::str::contains("rotate status: not implemented"));
+        .code(0)
+        .stdout("no rotations\n");
+    std::fs::create_dir(dir.path().join("elsewhere")).unwrap();
+    std::fs::write(
+        dir.path().join("elsewhere/state.json"),
+        r#"{"version": 1, "rotations": []}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.path().join("elsewhere/state.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
+    rotate_in(dir.path())
+        .arg("status")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("elsewhere/state.json"));
 }

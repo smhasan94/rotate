@@ -163,6 +163,14 @@ pub struct RollbackArgs {
     pub confirm: Vec<String>,
 }
 
+/// Arguments of `rotate status` (SHA-263).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct StatusArgs {
+    /// Also list finished rotations (`revoked` and `rolled_back`).
+    #[arg(long)]
+    pub all: bool,
+}
+
 /// The four workflow commands.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -173,8 +181,9 @@ pub enum Command {
     /// Restore consumers to the old secret, reactivate it where the
     /// provider allows, and revoke the replacement.
     Rollback(RollbackArgs),
-    /// Show in-progress rotations.
-    Status,
+    /// Show in-progress and pending rotations. Reads the state file and
+    /// audit log only; exits 3 when any rotation is pending.
+    Status(StatusArgs),
     /// Test only (`test-commands` feature): prints, fails or panics with
     /// the secret read from stdin, to prove those paths are redacted.
     #[cfg(feature = "test-commands")]
@@ -207,7 +216,7 @@ impl Command {
             Command::Plan(_) => "plan",
             Command::Apply(_) => "apply",
             Command::Rollback(_) => "rollback",
-            Command::Status => "status",
+            Command::Status(_) => "status",
             #[cfg(feature = "test-commands")]
             Command::TestConsole { .. } => "__test-console",
         }
@@ -219,7 +228,7 @@ impl Command {
             Command::Plan(input) => Some(input),
             Command::Apply(args) => Some(&args.input),
             Command::Rollback(args) => Some(&args.input),
-            Command::Status => None,
+            Command::Status(_) => None,
             #[cfg(feature = "test-commands")]
             Command::TestConsole { .. } => None,
         }
@@ -256,7 +265,7 @@ mod tests {
     #[test]
     fn global_flags_parse_after_subcommand() {
         let cli = Cli::parse_from(["rotate", "status", "--json", "--config", "x.yaml"]);
-        assert_eq!(cli.subcommand(), Command::Status);
+        assert_eq!(cli.subcommand(), Command::Status(StatusArgs::default()));
         assert!(cli.global.json);
         assert_eq!(
             cli.global.config.as_deref(),
@@ -413,6 +422,15 @@ mod tests {
         assert_eq!(args.confirm, ["rot-1"]);
         assert!(Cli::try_parse_from(["rotate", "rollback", "r.json", "--stdin"]).is_err());
         assert!(Cli::try_parse_from(["rotate", "plan", "r.json", "--rotation", "rot-1"]).is_err());
+    }
+
+    #[test]
+    fn status_flags() {
+        let cli = Cli::parse_from(["rotate", "status", "--all", "--json"]);
+        assert_eq!(cli.subcommand(), Command::Status(StatusArgs { all: true }));
+        assert!(cli.global.json);
+        assert!(Cli::try_parse_from(["rotate", "status", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["rotate", "status", "report.json"]).is_err());
     }
 
     #[test]

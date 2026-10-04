@@ -50,11 +50,14 @@ run plan-stdin 0 "smoke-test-value-not-a-secret
 run plan-json 0 "smoke-test-value-not-a-secret
 " --json plan --stdin
 run apply-no-input 2 "" apply
-run status 2 "" status
+run status 0 "" status
+run status-json 0 "" --json status --all
 
 grep -q '^rotate ' version.out || { echo "FAIL version: unexpected output"; failures=$((failures + 1)); }
 grep -q 'no input' no-input.err || { echo "FAIL no-input: message missing"; failures=$((failures + 1)); }
 grep -q 'no input' apply-no-input.err || { echo "FAIL apply-no-input: message missing"; failures=$((failures + 1)); }
+grep -qx 'no rotations' status.out || { echo "FAIL status: unexpected output"; failures=$((failures + 1)); }
+grep -qx '\[\]' status-json.out || { echo "FAIL status-json: unexpected output"; failures=$((failures + 1)); }
 grep -q 'unsupported' plan-stdin.out || { echo "FAIL plan-stdin: table missing"; failures=$((failures + 1)); }
 grep -q 'smoke-test-value' plan-stdin.out plan-stdin.err plan-json.out plan-json.err \
   && { echo "FAIL: input value echoed"; failures=$((failures + 1)); }
