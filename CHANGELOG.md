@@ -6,6 +6,15 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- npm accounts that ask for a one-time password to delete tokens: at the
+  delete, rotate takes a code from `ROTATE_NPM_OTP` (one delete per run) or
+  a hidden prompt on the terminal naming the npm user, and retries once
+  with the `npm-otp` header. Rollback's delete of a replacement does the
+  same. Without a code, or with one npm rejects, the revoke still fails
+  safely, naming the page to delete the token on.
+
 ### Security
 
 - Endpoint URLs in `rotate.yaml` (`providers.aws.endpoint_url`,

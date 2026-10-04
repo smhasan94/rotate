@@ -170,8 +170,9 @@ What works now:
   blocker. Apply
   asks for the new granular token in manual mode, checks it belongs to the
   same user, and deletes the leaked one by its token id. An account that
-  asks for a one-time password to delete tokens makes the revoke fail
-  safely, naming the page to delete it on. See
+  asks for a one-time password to delete tokens gets a hidden prompt at
+  that moment (or the code from `ROTATE_NPM_OTP`); without a code the
+  revoke fails safely, naming the page to delete it on. See
   [docs/permissions.md](docs/permissions.md).
 - OpenAI API keys (`sk-proj-`, `sk-svcacct-` and legacy `sk-` keys) are
   identified by prefix and checked with `GET /v1/models`. With an Admin API
