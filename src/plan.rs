@@ -35,6 +35,11 @@ pub const MANUAL_REPLACEMENT: &str = "manual: you will be asked to paste the new
 /// Skip reason for a secret whose rotation already finished (SHA-258).
 pub const ALREADY_ROTATED: &str = "already rotated";
 
+/// Skip reason for a secret that no longer works and whose rotation in the
+/// state file waits at `revoke_manual` (SHA-289): the operator deleted it by
+/// hand. Apply records that rotation `revoked`.
+pub const REVOKED_BY_HAND: &str = "revoked by hand";
+
 /// Blocker for a credential the provider cannot revoke (see
 /// [`Provider::manual_revoke`](crate::provider::Provider::manual_revoke)).
 pub const MANUAL_REVOKE_BLOCKER: &str =
@@ -113,12 +118,15 @@ pub struct Skipped {
     /// Owning provider, when one was identified.
     pub provider: Option<&'static str>,
     /// One of `invalid`, `unsupported`, `not rotatable`, `unknown`,
-    /// `unchecked`, `already rotated`.
+    /// `unchecked`, `already rotated`, `revoked by hand`.
     pub reason: &'static str,
     /// More detail, for example why validity is unknown.
     pub detail: Option<String>,
     /// Every location that held the secret.
     pub sources: Vec<SourceLocation>,
+    /// The rotation in the state file this secret belongs to, for reason
+    /// `revoked by hand` (SHA-289). Not part of the plan JSON.
+    pub rotation_id: Option<String>,
 }
 
 /// Actions secret names for a provider (decision D4), split by which half
@@ -223,6 +231,7 @@ fn skipped(item: Assessed, reason: &'static str, detail: Option<String>) -> Skip
         reason,
         detail,
         sources: item.sources,
+        rotation_id: None,
     }
 }
 
@@ -420,6 +429,7 @@ fn step_name(step: Step) -> &'static str {
         Step::Revoked => "revoked",
         Step::Failed => "failed",
         Step::NeedsRollback => "needs_rollback",
+        Step::RevokeManual => "revoke_manual",
         Step::RolledBack => "rolled_back",
     }
 }
@@ -437,7 +447,40 @@ fn resume_text(step: Step) -> &'static str {
         Step::PendingRevoke => "rotate apply revokes once the overlap window has passed",
         Step::Failed => "rotate apply resumes it where it can",
         Step::NeedsRollback => "run rotate rollback with the same input",
+        Step::RevokeManual => {
+            "the old secret must be deleted by hand; rotate apply records it revoked once it no longer works"
+        }
         Step::Revoked | Step::RolledBack => "a rollback of it is in progress",
+    }
+}
+
+/// Marks every secret skipped as `invalid` whose latest rotation in
+/// `rotations` (same provider and fingerprint) waits at `revoke_manual`,
+/// with no rollback of it in progress (SHA-289): its reason becomes
+/// [`REVOKED_BY_HAND`] and its detail names the rotation. Assessment's
+/// read-only `check_valid` found the old secret no longer works, so the
+/// operator deleted it as asked. Local and pure: `apply` records the
+/// rotation `revoked`; `plan` only shows the row.
+#[cfg(unix)]
+pub fn mark_revoked_by_hand(plan: &mut Plan, rotations: &[Rotation]) {
+    for skipped in plan.skipped.iter_mut().filter(|s| s.reason == "invalid") {
+        let Some(provider) = skipped.provider else {
+            continue;
+        };
+        let latest = rotations
+            .iter()
+            .filter(|r| r.provider == provider && r.fingerprint == skipped.fingerprint)
+            .max_by_key(|r| r.updated_at);
+        if let Some(waiting) =
+            latest.filter(|r| r.step == Step::RevokeManual && !r.is_rolling_back())
+        {
+            skipped.reason = REVOKED_BY_HAND;
+            skipped.rotation_id = Some(waiting.rotation_id.clone());
+            skipped.detail = Some(format!(
+                "rotation {} waited for the old secret to be deleted by hand; it no longer works, so rotate apply records it revoked",
+                waiting.rotation_id
+            ));
+        }
     }
 }
 
@@ -483,6 +526,7 @@ pub fn split_already_rotated(
                 done.rotation_id
             )),
             sources: vec![finding.source.clone()],
+            rotation_id: None,
         });
     }
     (kept, skipped)
@@ -1083,5 +1127,53 @@ mod tests {
             skipped[0].detail.as_deref(),
             Some("rotation rot-1 already rotated on 1970-01-01T00:00:01Z; nothing to do")
         );
+    }
+
+    // SHA-289: a secret skipped as invalid whose rotation waits for a
+    // revoke by hand is marked, with the rotation's id; others are not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_secret_of_a_revoke_manual_rotation_is_revoked_by_hand() {
+        let log = CallLog::new();
+        let waiting = "npm_plan_unit_by_hand";
+        let other = "npm_plan_unit_plain_invalid";
+        let mut by_hand = Rotation::new("rot-11111111", "npm", fp(waiting));
+        by_hand.step = Step::RevokeManual;
+        let mut rolling = Rotation::new("rot-22222222", "npm", fp(other));
+        rolling.step = Step::RevokeManual;
+        rolling.rollback = Some(crate::state::RollbackProgress::default());
+
+        let provider = MockProvider::new("npm")
+            .identify_prefix("npm_")
+            .validity(Validity::Invalid);
+        let mut plan = plan_for(&[waiting, other], provider, vec![], &log).await;
+        mark_revoked_by_hand(&mut plan, &[by_hand, rolling]);
+        let first = plan
+            .skipped
+            .iter()
+            .find(|s| s.fingerprint == fp(waiting))
+            .unwrap();
+        assert_eq!(first.reason, REVOKED_BY_HAND);
+        assert_eq!(first.rotation_id.as_deref(), Some("rot-11111111"));
+        assert!(first.detail.as_deref().unwrap().contains("rot-11111111"));
+        let second = plan
+            .skipped
+            .iter()
+            .find(|s| s.fingerprint == fp(other))
+            .unwrap();
+        assert_eq!(second.reason, "invalid");
+        assert_eq!(second.rotation_id, None);
+        let json: serde_json::Value = serde_json::from_str(&render_json(&plan)).unwrap();
+        assert!(json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["reason"] == "revoked by hand"));
+        assert!(render_table(&plan).contains("revoked by hand"));
+        assert_eq!(
+            resume_text(Step::RevokeManual),
+            "the old secret must be deleted by hand; rotate apply records it revoked once it no longer works"
+        );
+        log.assert_no_mutations();
     }
 }

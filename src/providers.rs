@@ -180,6 +180,10 @@ pub fn finish() {
 /// For end-to-end tests of the real plugins (SHA-264): `real_plugins:
 /// true` registers them instead of mocks; only `prompt` applies then.
 ///
+/// For revoke by hand (SHA-289): `providers.<name>.manual_revoke` is the
+/// text `manual_revoke` returns; `providers.<name>.unsupported` maps a
+/// method name to the text of an `Unsupported` error every call returns.
+///
 /// For rollback (SHA-259): `providers.<name>.restore` is `"unsupported"` to
 /// make `restore` return `Unsupported`; each call-log line also has
 /// `reference`, the consumer ref, restore handle or replacement ref the
@@ -236,6 +240,9 @@ mod scenario {
         #[serde(default)]
         foreign: Vec<Fingerprint>,
         restore: Option<String>,
+        manual_revoke: Option<String>,
+        #[serde(default)]
+        unsupported: BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -324,8 +331,15 @@ mod scenario {
                 for fingerprint in &setup.foreign {
                     mock = mock.owner(fingerprint.clone(), Identity("someone-else".into()));
                 }
+                if let Some(text) = &setup.manual_revoke {
+                    // Instructions are `&'static str`; a test binary runs once.
+                    mock = mock.manual_revoke(Box::leak(text.clone().into_boxed_str()));
+                }
                 for (method, error) in &setup.fail {
                     mock.fail_always(method, ProviderError::Permanent(error.clone()));
+                }
+                for (method, error) in &setup.unsupported {
+                    mock.fail_always(method, ProviderError::Unsupported(error.clone()));
                 }
             }
             registry.register(Arc::new(mock));
