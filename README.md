@@ -15,8 +15,9 @@ OpenAI API keys.
 
 ## Status
 
-Pre-release: no version is published yet. The MVP flow works end to end
-from source (see [Quick start](#quick-start)); the first release is v0.1.0.
+v0.1.0 is the first release: the MVP flow end to end, with prebuilt Linux
+and macOS binaries (see [Install](#install)). What changed in each version
+is in [CHANGELOG.md](CHANGELOG.md).
 
 What works now:
 
@@ -248,7 +249,37 @@ It also covers a denied Actions write: the old key stays active, and the
 rotation is recovered with `rotate rollback` and a fresh apply. CI runs it
 on every pull request.
 
-## Build from source
+## Install
+
+Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are attached to
+each [GitHub Release](https://github.com/smhasan94/rotate/releases), with a
+`SHA256SUMS` file. This downloads the one for your machine, checks its
+checksum and installs it in `~/.local/bin`:
+
+<!-- install:start -->
+```sh
+VERSION=0.1.0
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) TARGET=x86_64-unknown-linux-gnu ;;
+  Linux-aarch64) TARGET=aarch64-unknown-linux-gnu ;;
+  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
+  Darwin-arm64) TARGET=aarch64-apple-darwin ;;
+esac
+NAME="rotate-$VERSION-$TARGET"
+curl -fsSLO "https://github.com/smhasan94/rotate/releases/download/v$VERSION/$NAME.tar.gz"
+curl -fsSLO "https://github.com/smhasan94/rotate/releases/download/v$VERSION/SHA256SUMS"
+grep " $NAME.tar.gz\$" SHA256SUMS | { sha256sum -c - 2>/dev/null || shasum -a 256 -c -; }
+tar -xzf "$NAME.tar.gz" rotate
+mkdir -p ~/.local/bin && install -m 0755 rotate ~/.local/bin/rotate
+~/.local/bin/rotate --version
+```
+<!-- install:end -->
+
+Add `~/.local/bin` to your `PATH` if it is not there already. The Linux
+binaries need glibc 2.35 or newer (Ubuntu 22.04, Debian 12). There is no
+Windows build and no crates.io package.
+
+### Build from source
 
 Needs Rust stable (1.94.1 or newer).
 
@@ -258,9 +289,6 @@ cd rotate
 cargo build --release
 ./target/release/rotate --help
 ```
-
-Prebuilt Linux and macOS binaries will be attached to GitHub Releases from
-the first tagged version.
 
 ## Quick start
 

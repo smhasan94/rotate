@@ -26,12 +26,15 @@ does.
 
 ## 1. Install
 
-Prebuilt Linux and macOS binaries are attached to GitHub Releases from the
-first tagged version. Until then, build from source with Rust stable 1.94.1
-or newer:
+Prebuilt Linux and macOS binaries (x86_64 and aarch64) are attached to each
+[GitHub Release](https://github.com/smhasan94/rotate/releases) with a
+`SHA256SUMS` file. The [README](../README.md#install) has a copy-paste block
+that downloads the one for your machine, checks its checksum and installs it.
+
+Or build from source with Rust stable 1.94.1 or newer:
 
 ```sh
-cargo install --git https://github.com/smhasan94/rotate --locked
+cargo install --git https://github.com/smhasan94/rotate --tag v0.1.0 --locked
 rotate --version
 rotate --help
 ```

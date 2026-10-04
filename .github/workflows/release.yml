@@ -1,8 +1,11 @@
 # Release binaries for Linux and macOS (SHA-215).
 #
 # A tag push `v*` builds four targets, checks the tag matches Cargo.toml,
-# and publishes a GitHub Release with four tarballs and SHA256SUMS, then
-# downloads them back and verifies them.
+# and publishes a GitHub Release with four tarballs and SHA256SUMS and the
+# CHANGELOG.md section as its notes. Then it downloads them back and
+# verifies them on Linux and macOS (scripts/verify-release.sh), and runs
+# the README install block on a clean Linux container and on macOS
+# (SHA-271).
 #
 # A pull request that changes this workflow, or a manual run, does the same
 # build, smoke test, packaging and checksums but never publishes.
@@ -15,6 +18,9 @@ on:
     paths:
       - .github/workflows/release.yml
       - ci/release-version.sh
+      - ci/changelog-section.sh
+      - scripts/**
+      - CHANGELOG.md
   workflow_dispatch:
 
 permissions:
@@ -133,17 +139,45 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
+  notes:
+    # SHA-271: the release notes are the CHANGELOG.md section for this
+    # version. Runs on pull requests too, so a missing section fails early.
+    name: release notes
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: changelog section
+        shell: bash
+        run: |
+          ci/changelog-section.sh "$VERSION" > notes.md
+          cat notes.md
+      - name: README install block
+        shell: bash
+        run: |
+          scripts/readme-install.sh --print | tee install.sh
+          grep -qx "VERSION=$VERSION" install.sh
+          bash -n install.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes.md
+          if-no-files-found: error
+
   publish:
     # AC1. The only job with write access, and the only one that runs on a
     # tag alone. No third-party actions here.
     name: publish
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, build, checksums]
+    needs: [version, build, checksums, notes]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # Every artifact of this run: the four tarballs and SHA256SUMS.
+      # Every artifact of this run: the four tarballs, SHA256SUMS and the
+      # notes.
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -160,20 +194,26 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$TAG" \
-            --generate-notes \
+            --notes-file notes.md \
             rotate-*.tar.gz SHA256SUMS
 
   verify:
-    # T1 to T3 against the published release.
-    name: verify release
+    # SHA-271 T1 to T3 against the published release, on Linux x86_64 and
+    # macOS aarch64.
+    name: verify release (${{ matrix.os }})
     needs: [version, publish]
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - name: five assets (T1)
+      - uses: actions/checkout@v4
+      - name: five assets and the changelog notes (T1)
         shell: bash
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | tee assets.txt
@@ -181,20 +221,47 @@ jobs:
             echo "expected 5 assets"
             exit 1
           fi
-      - name: checksum (T2)
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > body.md
+          ci/changelog-section.sh "$VERSION" > notes.md
+          # Trailing spaces, CRs and blank lines at the end do not count.
+          norm() { sed -e 's/[[:space:]]*$//' "$1" | awk 'NF { for (; b > 0; b--) print ""; print; next } { b++ }'; }
+          diff <(norm notes.md) <(norm body.md)
+      - name: checksums, --version and the plan smoke check (T2, T3)
+        shell: bash
+        run: scripts/verify-release.sh "$TAG"
+
+  install-linux:
+    # SHA-271 T4: the README install block, as written, in a clean
+    # container with only curl added.
+    name: README install (debian)
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    container: debian:bookworm-slim
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: curl
+        run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+      - uses: actions/checkout@v4
+      - name: run the block
         shell: bash
         run: |
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "rotate-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
-            --pattern SHA256SUMS
-          sha256sum -c --ignore-missing SHA256SUMS
-      - name: --version (T3)
-        shell: bash
-        run: |
-          tar -xzf "rotate-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
-          out=$(./rotate --version)
+          out=$(scripts/readme-install.sh README.md)
           echo "$out"
-          if [[ "$out" != *" $VERSION" ]]; then
-            echo "expected --version to end with $VERSION"
-            exit 1
-          fi
+          echo "$out" | grep -qx "rotate $VERSION"
+
+  install-macos:
+    # SHA-271 T4 on macOS.
+    name: README install (macos)
+    needs: [version, publish]
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: run the block
+        shell: bash
+        run: |
+          out=$(scripts/readme-install.sh README.md)
+          echo "$out"
+          echo "$out" | grep -qx "rotate $VERSION"

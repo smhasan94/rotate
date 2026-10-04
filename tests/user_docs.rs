@@ -628,3 +628,46 @@ fn t4_name_convention_table_matches_the_code() {
     }
     assert_eq!(rows, 4, "one row per provider");
 }
+
+/// SHA-271: the changelog, the README install block and the usage guide
+/// name the version in `Cargo.toml`, so a release cannot ship with stale
+/// install steps or no notes (the release workflow uses the changelog
+/// section as its notes).
+#[test]
+fn release_docs_name_the_cargo_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    let changelog = include_str!("../CHANGELOG.md");
+    let heading = format!("\n## [{version}] - ");
+    let start = changelog
+        .find(&heading)
+        .unwrap_or_else(|| panic!("CHANGELOG.md has no section for {version}"));
+    let section = &changelog[start + heading.len()..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    for part in ["### Added", "### Known limits"] {
+        assert!(
+            section.contains(part),
+            "the {version} section has no {part}"
+        );
+    }
+    assert!(
+        changelog.contains(&format!(
+            "[{version}]: https://github.com/smhasan94/rotate/releases/tag/v{version}"
+        )),
+        "CHANGELOG.md has no link for {version}"
+    );
+
+    let readme = include_str!("../README.md");
+    let block = readme
+        .split("<!-- install:start -->")
+        .nth(1)
+        .and_then(|rest| rest.split("<!-- install:end -->").next())
+        .expect("README.md has an install block");
+    assert!(
+        block.contains(&format!("\nVERSION={version}\n")),
+        "the README install block does not install {version}"
+    );
+    assert!(
+        USAGE.contains(&format!("--tag v{version} ")),
+        "docs/usage.md does not build v{version} from source"
+    );
+}
