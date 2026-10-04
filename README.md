@@ -105,6 +105,23 @@ What works now:
   Every action is saved to the state file and appended to the audit log
   with step `rollback`. Rolling back without the state file written by
   apply is not supported.
+- `rotate status` shows what is in progress without touching any provider:
+  it reads `.rotate/state.json` (without taking its lock) and
+  `.rotate/audit.jsonl`, makes no network call and writes nothing. Each row
+  has the rotation id, provider, fingerprint, step, time since the last
+  update, consumers updated out of all recorded, the revoke time and time
+  left for a `pending_revoke`, and a one-line hint ("re-run `rotate apply`
+  after 07:12:00 UTC to revoke the old secret", "run `rotate rollback` with
+  the same input, then `rotate apply` again", "consumer <ref> failed: see
+  the audit log, ..."). When a rotation's last audit entry has an error,
+  the redacted error is printed under its row. Finished rotations
+  (`revoked`, `rolled_back`) are hidden unless you pass `--all`; a rollback
+  still in progress is always shown. `--json` prints the same rows as an
+  array described by [docs/status-schema.json](docs/status-schema.json).
+  It exits 3 when any rotation is pending (`created`, `consumers_updated`,
+  `verified`, `pending_revoke`, `failed`, `needs_rollback`, or being rolled
+  back) and 0 otherwise, including when there is no state file ("no
+  rotations"). `planned` rotations are listed but are not pending.
 - `rotate.yaml` is loaded and validated (see
   [docs/rotate.example.yaml](docs/rotate.example.yaml)).
 - AWS access keys are identified and checked with STS, signed with the
@@ -161,7 +178,7 @@ Not done yet:
 - `rotate apply --json`. Resuming a manual-mode rotation after the process
   exited by pasting the same replacement again (such a rotation is marked
   `needs_rollback`).
-- `rotate status`. It is a stub. `rotate rollback` has no `--json` yet.
+- `rotate rollback` has no `--json` yet.
 
 Progress is tracked in [docs/backlog.md](docs/backlog.md).
 
@@ -180,6 +197,26 @@ These hold for every change; a pull request that breaks one is not merged.
 4. **No revoke while a consumer still holds the old secret.** rotate refuses
    to revoke a secret whose consumers could not all be updated, unless
    `--force` is given, and records the use of `--force` in the audit log.
+
+### How the acceptance test proves the MVP
+
+`tests/acceptance_mvp.rs` runs the release code path of the `rotate` binary
+(the real AWS provider, Secrets Manager consumer and GitHub Actions
+consumer) against one local wiremock server that models an AWS account and
+the Actions secrets of a repository. A TruffleHog report leaks an AWS key
+that one Secrets Manager entry and the repository's `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` secrets hold. The test shows that `rotate plan`
+lists the IAM user, all three consumer matches and the deactivate step
+while no state-changing request reaches the server; that `rotate apply`
+creates a new key, writes it to Secrets Manager and to both Actions
+secrets (the test decrypts each sealed `PUT` with the repository's private
+key), verifies it and then deactivates the old key; that the audit log has
+an `ok` entry for every step; and that neither secret access key nor the
+GitHub token appears in stdout, stderr, the trace log at `-vvv`, the audit
+log, the state file or any request other than the one that must carry it.
+It also covers a denied Actions write: the old key stays active, and the
+rotation is recovered with `rotate rollback` and a fresh apply. CI runs it
+on every pull request.
 
 ## Build from source
 
@@ -209,6 +246,9 @@ pbpaste | rotate plan --stdin
 # Apply the plan: type each rotation id when asked.
 rotate apply trufflehog-report.json
 
+# What is in progress or waiting for its overlap window; exits 3 if any.
+rotate status
+
 # Non-interactive, for CI: confirm by id.
 rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
 
@@ -223,7 +263,7 @@ NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env
 | 0 | Everything requested was done. |
 | 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. |
 | 2 | Bad arguments, bad configuration, or a subcommand that is not implemented yet. |
-| 3 | Work is pending, for example a revoke waiting for its overlap window (`rotate status`). |
+| 3 | Work is pending: `rotate apply` recorded a revoke waiting for its overlap window, or `rotate status` found a rotation that is pending, failed or needs rollback. |
 | 101 | rotate panicked. This is a bug; the message is redacted like all other output. |
 
 ## Documentation

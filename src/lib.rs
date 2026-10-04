@@ -27,3 +27,4 @@ pub mod report;
 pub mod rollback;
 pub mod secret;
 pub mod state;
+pub mod status;
