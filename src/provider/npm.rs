@@ -81,6 +81,28 @@ pub const LIST_REFUSED: &str = "listing tokens needs an `npm login` session toke
 const SESSION_EXPIRY: &str = "session tokens expire after two hours, so an unattended run needs a \
      fresh `npm login` shortly before it";
 
+/// Revoke guidance (SHA-298): rotate's own advice, kept when a resumed
+/// revoke summarizes npm's text. Constants, never a value.
+pub const GUIDE_NO_OPERATOR: &str = "set ROTATE_NPM_TOKEN (or NPM_TOKEN) to an `npm login` \
+     session token for the same npm user as the leaked token, then re-run rotate apply";
+
+/// Revoke guidance when the operator token is the leaked token.
+pub const GUIDE_OPERATOR_IS_LEAKED: &str = "set ROTATE_NPM_TOKEN to another `npm login` session \
+     token for the same npm user; rotate never uses the leaked token to revoke itself";
+
+/// Revoke guidance when npm refused the operator token.
+pub const GUIDE_SESSION_TOKEN: &str = "use a fresh `npm login` session token as \
+     ROTATE_NPM_TOKEN, or delete the leaked token on the Access Tokens page of the npm website";
+
+/// Revoke guidance when npm asked for a one-time password.
+pub const GUIDE_OTP: &str = "npm requires a one-time password to delete tokens for this account \
+     and rotate does not send one; delete the leaked token on the Access Tokens page of the npm \
+     website";
+
+/// Revoke guidance when the leaked token belongs to another npm user.
+pub const GUIDE_OTHER_USER: &str = "the leaked token belongs to another npm user; delete it on \
+     that user's Access Tokens page of the npm website";
+
 /// End of every revoke blocker.
 const REVOKE_FAILS: &str = "without it apply stops at revoke and the leaked token stays valid";
 
@@ -661,20 +683,23 @@ impl NpmProvider {
                 "{DELETE}: npm requires a one-time password to delete tokens for this account; \
                  rotate does not send one. Delete the token at {}",
                 self.tokens_page(user)
-            ))),
+            ))
+            .with_guidance(GUIDE_OTP)),
             Err(err @ NpmError::Status { status: 403, .. }) if bypass_refusal(&err) => {
                 Err(ProviderError::Permanent(format!(
                     "{DELETE}: {err}. A granular token that bypasses 2FA cannot delete tokens; use \
                      an npm login session token as ROTATE_NPM_TOKEN, or delete the token at {}",
                     self.tokens_page(user)
-                )))
+                ))
+                .with_guidance(GUIDE_SESSION_TOKEN))
             }
             Err(err @ NpmError::Status { status: 403, .. }) => {
                 Err(ProviderError::Permanent(format!(
                     "{DELETE}: {err}. The operator token may not delete tokens; use an npm login \
                      session token as ROTATE_NPM_TOKEN, or delete the token at {}",
                     self.tokens_page(user)
-                )))
+                ))
+                .with_guidance(GUIDE_SESSION_TOKEN))
             }
             Err(err) => Err(op_error(DELETE, err)),
         }
@@ -947,16 +972,32 @@ impl Provider for NpmProvider {
                 "no npm operator token: set ROTATE_NPM_TOKEN or NPM_TOKEN to an npm login session \
                  token to delete the leaked token"
                     .into(),
-            ));
+            )
+            .with_guidance(GUIDE_NO_OPERATOR));
         };
         if operator == token {
             return Err(ProviderError::Permanent(
                 "the npm operator token is the leaked token; rotate never uses the leaked token \
                  to revoke itself (decision D3). Set ROTATE_NPM_TOKEN to another session token"
                     .into(),
-            ));
+            )
+            .with_guidance(GUIDE_OPERATOR_IS_LEAKED));
         }
-        let entries = self.list(operator).await.map_err(|e| op_error(LIST, e))?;
+        let entries = self.list(operator).await.map_err(|e| {
+            let refused = matches!(
+                e,
+                NpmError::Status {
+                    status: 401 | 403,
+                    ..
+                }
+            );
+            let err = op_error(LIST, e);
+            if refused {
+                err.with_guidance(GUIDE_SESSION_TOKEN)
+            } else {
+                err
+            }
+        })?;
         match find_entry(&entries, token) {
             Lookup::Found(entry, _) if entry.revoked.is_some() => {}
             Lookup::Found(entry, _) => {
@@ -970,7 +1011,8 @@ impl Provider for NpmProvider {
                         "{NOT_VISIBLE} ({why}); the token belongs to npm user {user}: delete it \
                          at {}",
                         self.tokens_page(Some(&user))
-                    )))
+                    ))
+                    .with_guidance(GUIDE_OTHER_USER))
                 }
                 Err(err) => return Err(op_error(WHOAMI, err)),
             },
@@ -1370,10 +1412,13 @@ mod tests {
         }
         // No operator token: revoke refuses before any call.
         let live = Credential::Token(SecretValue::from(tok(BODY)));
+        let err = p.revoke(&live).await.unwrap_err();
         assert!(matches!(
-            p.revoke(&live).await,
-            Err(ProviderError::Permanent(text)) if text.contains("ROTATE_NPM_TOKEN")
+            err.base(),
+            ProviderError::Permanent(text) if text.contains("ROTATE_NPM_TOKEN")
         ));
+        // SHA-298 T5: the guidance survives a resumed revoke's summary.
+        assert_eq!(err.guidance(), Some(GUIDE_NO_OPERATOR));
     }
 
     #[test]

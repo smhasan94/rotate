@@ -98,6 +98,21 @@ pub const REVOKE_NEEDS_ADMIN: &str = "manual: without an Admin API key rotate ca
 pub const REVOKE_UNDELETABLE: &str = "manual: the Admin API cannot delete this key (its \
      service account holds other keys); delete it at https://platform.openai.com/api-keys";
 
+/// Revoke guidance without an Admin API key (SHA-298): rotate's own
+/// advice, kept when a resumed revoke summarizes the error. A constant.
+pub const GUIDE_NEEDS_ADMIN: &str = "set OPENAI_ADMIN_KEY (or the variable named by \
+     providers.openai.admin_key_env) to an OpenAI Admin API key and re-run rotate apply, or delete \
+     the leaked key at https://platform.openai.com/api-keys";
+
+/// Revoke guidance when the Admin API key is the leaked key.
+pub const GUIDE_ADMIN_IS_LEAKED: &str = "set OPENAI_ADMIN_KEY (or the variable named by \
+     providers.openai.admin_key_env) to a different Admin API key; rotate never uses a leaked key \
+     as its operator credential";
+
+/// Revoke guidance for a key the Admin API cannot delete.
+pub const GUIDE_UNDELETABLE: &str = "the Admin API cannot delete this key because its service \
+     account holds other keys; delete it at https://platform.openai.com/api-keys";
+
 /// Scope line about permissions, which the Admin API does not expose.
 pub const PERMISSIONS_NOTE: &str = "permissions: not readable through the Admin API; an \
      automatic replacement is a service account with the member role and all permissions";
@@ -486,7 +501,8 @@ impl OpenAiProvider {
                 "the Admin API key is the key being rotated; rotate never uses a leaked key as \
                  its operator credential"
                     .into(),
-            ));
+            )
+            .with_guidance(GUIDE_ADMIN_IS_LEAKED));
         }
         Ok(admin)
     }
@@ -1138,7 +1154,8 @@ impl Provider for OpenAiProvider {
         let key = token(credential)?;
         rotatable(key)?;
         if !self.has_admin_key() {
-            return Err(ProviderError::Unsupported(REVOKE_NEEDS_ADMIN.into()));
+            return Err(ProviderError::Unsupported(REVOKE_NEEDS_ADMIN.into())
+                .with_guidance(GUIDE_NEEDS_ADMIN));
         }
         let admin = self.admin_key(&[key])?;
         let found = match self.find(key, &admin).await {
@@ -1170,7 +1187,10 @@ impl Provider for OpenAiProvider {
                 )
                 .await?
             }
-            Target::Manual => return Err(ProviderError::Unsupported(REVOKE_UNDELETABLE.into())),
+            Target::Manual => {
+                return Err(ProviderError::Unsupported(REVOKE_UNDELETABLE.into())
+                    .with_guidance(GUIDE_UNDELETABLE))
+            }
         }
         Ok(Revoked { restore_ref: None })
     }
@@ -1380,7 +1400,7 @@ mod tests {
         let project = Credential::Token(SecretValue::from(key(["sk-", "proj-"], 60)));
         assert_eq!(
             p.revoke(&project).await.unwrap_err(),
-            ProviderError::Unsupported(REVOKE_NEEDS_ADMIN.into())
+            ProviderError::Unsupported(REVOKE_NEEDS_ADMIN.into()).with_guidance(GUIDE_NEEDS_ADMIN)
         );
         assert!(matches!(
             p.create_replacement(&project).await,

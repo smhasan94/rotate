@@ -1247,7 +1247,8 @@ impl<'a> Executor<'a> {
         drop(held);
         match checked {
             Ok(()) => {}
-            Err(ProviderError::Unsupported(why)) => {
+            Err(err) if err.unsupported().is_some() => {
+                let why = err.unsupported().unwrap_or_default();
                 let reason = format!(
                     "the replacement value from the earlier run is gone and it cannot be verified without it ({why}); run rotate rollback with the same input to restore the updated consumers and revoke the replacement, then run rotate apply again"
                 );
@@ -1346,20 +1347,29 @@ impl<'a> Executor<'a> {
         }
         let revoked = match provider.revoke(&rotation.credential).await {
             Ok(revoked) => revoked,
-            Err(ProviderError::Unsupported(instructions)) if upstream == UpstreamText::Redacted => {
-                return self.revoke_by_hand(progress, &instructions);
-            }
-            Err(err @ ProviderError::Unsupported(_)) => {
-                let instructions = format!(
-                    "{REVOKE_BY_HAND_FALLBACK} ({})",
-                    revoke_error_summary(progress.provider, &err)
-                );
+            Err(err) if err.unsupported().is_some() => {
+                let instructions = match upstream {
+                    UpstreamText::Redacted => err.unsupported().unwrap_or_default().to_owned(),
+                    // SHA-298: rotate's own guidance, when the provider gave
+                    // one, says more than the generic fallback.
+                    UpstreamText::Summary => format!(
+                        "{} ({})",
+                        err.guidance().unwrap_or(REVOKE_BY_HAND_FALLBACK),
+                        revoke_error_summary(progress.provider, &err)
+                    ),
+                };
                 return self.revoke_by_hand(progress, &instructions);
             }
             Err(err) => {
                 let text = match upstream {
                     UpstreamText::Redacted => err.to_string(),
-                    UpstreamText::Summary => revoke_error_summary(progress.provider, &err),
+                    UpstreamText::Summary => match err.guidance() {
+                        Some(guidance) => format!(
+                            "{}. {guidance}",
+                            revoke_error_summary(progress.provider, &err)
+                        ),
+                        None => revoke_error_summary(progress.provider, &err),
+                    },
                 };
                 return self.fail(
                     progress,
@@ -1714,7 +1724,9 @@ pub fn revoke_error_summary(provider: &str, err: &ProviderError) -> String {
         regex::Regex::new(&format!(r"\b({})\b", SAFE_ERROR_CODES.join("|"))).expect("valid regex")
     });
 
-    let (kind, text) = match err {
+    let (kind, text) = match err.base() {
+        // `base()` never returns one; kept total without a panic.
+        ProviderError::Guided { .. } => ("failed", ""),
         ProviderError::RateLimited { .. } => ("rate limited", ""),
         ProviderError::Transient(text) => ("transient failure", text.as_str()),
         ProviderError::Permanent(text) => ("failed", text.as_str()),
@@ -3171,6 +3183,93 @@ mod tests {
                     assert!(text.contains(&summary), "{kind} {i}: {text}");
                 }
             }
+        }
+    }
+
+    /// SHA-298 T3 (AC3): rotate's own guidance on a provider error survives
+    /// a resumed revoke's summary; the upstream text still does not.
+    #[tokio::test]
+    async fn resumed_revoke_keeps_guidance() {
+        const GUIDANCE: &str = "set ROTATE_TEST_OPERATOR to a session token";
+        let cases = [
+            ("unsupported", "sha298unsupported", Step::RevokeManual),
+            ("permanent", "sha298permanent", Step::Failed),
+        ];
+        for (kind, name, step) in cases {
+            let value = format!("npm_apply_unit_guided_{kind}");
+            let replacement = format!("npm_{name}-replacement-1");
+            let mut f = fixture(&value, MockProvider::new(name));
+            let plan = plan(&mut f, &value, "1h").await;
+            let first = run(&mut f, &plan).await;
+            assert!(
+                matches!(first.result, RunResult::PendingRevoke { .. }),
+                "{kind}: {first:?}"
+            );
+            let echo = format!("npm returned 403: the new key {replacement} stays live");
+            let error = match kind {
+                "unsupported" => ProviderError::Unsupported(echo),
+                _ => ProviderError::Permanent(echo),
+            };
+            f.provider
+                .fail_always("revoke", error.with_guidance(GUIDANCE));
+            let outcome = {
+                let mut executor =
+                    Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit)
+                        .with_clock(two_hours_later);
+                executor.run(&plan.rotations[0]).await
+            };
+            let stored = f.store.get(&outcome.rotation_id).unwrap().clone();
+            assert_eq!(stored.step, step, "{kind}");
+            let audit = last_audit(&f);
+            let mut texts = vec![
+                format!("{:?}", outcome.result),
+                audit.error.as_ref().unwrap().as_str().to_owned(),
+                serde_json::to_string(&stored).unwrap(),
+            ];
+            if step == Step::RevokeManual {
+                let instructions = stored.revoke_instructions.clone().unwrap_or_default();
+                // The guidance replaces the generic fallback.
+                assert!(instructions.starts_with(GUIDANCE), "{instructions}");
+                assert!(!instructions.contains(REVOKE_BY_HAND_FALLBACK));
+                texts.push(instructions);
+            }
+            for (i, text) in texts.iter().enumerate() {
+                assert!(
+                    !text.contains(&replacement),
+                    "{kind} {i}: the replacement leaked"
+                );
+                assert!(
+                    !text.contains("stays live"),
+                    "{kind} {i}: upstream text kept"
+                );
+                // The state record (2) keeps text only as revoke_instructions.
+                if i != 2 || step == Step::RevokeManual {
+                    assert!(text.contains("provider message not kept"), "{kind} {i}");
+                    assert!(text.contains(GUIDANCE), "{kind} {i}: {text}");
+                }
+            }
+        }
+    }
+
+    /// SHA-298 T4 (AC4): in the process that holds the replacement, a
+    /// guided `Unsupported` revoke is still a revoke by hand with the
+    /// provider's (redacted) instructions.
+    #[tokio::test]
+    async fn guided_unsupported_revoke_in_process_is_by_hand() {
+        let value = "npm_apply_unit_guided_inprocess";
+        let mut f = fixture(value, MockProvider::new("sha298inproc"));
+        f.provider.fail_always(
+            "revoke",
+            ProviderError::Unsupported("delete it at https://example.test".into())
+                .with_guidance("guidance"),
+        );
+        let plan = plan(&mut f, value, "0s").await;
+        let outcome = run(&mut f, &plan).await;
+        match &outcome.result {
+            RunResult::RevokeManual { instructions } => {
+                assert_eq!(instructions.as_str(), "delete it at https://example.test");
+            }
+            other => panic!("expected a revoke by hand, got {other:?}"),
         }
     }
 

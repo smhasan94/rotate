@@ -24,7 +24,10 @@ use rotate::consumer::mock::MockConsumer;
 use rotate::consumer::{ConsumerMatch, ConsumerRegistry};
 use rotate::finding::{Finding, SourceLocation};
 use rotate::plan;
-use rotate::provider::npm::{token_key, NpmProvider, NOT_VISIBLE};
+use rotate::provider::npm::{
+    token_key, NpmProvider, GUIDE_NO_OPERATOR, GUIDE_OPERATOR_IS_LEAKED, GUIDE_OTHER_USER,
+    GUIDE_OTP, GUIDE_SESSION_TOKEN, NOT_VISIBLE,
+};
 use rotate::provider::{
     Credential, Identity, Provider, ProviderError, ProviderRegistry, ReplacementMode,
     RestoreOutcome, Validity,
@@ -585,6 +588,7 @@ async fn revoke_not_visible_names_the_user() {
     let text = err.to_string();
     assert!(text.starts_with(NOT_VISIBLE), "{text}");
     assert!(text.contains("bob"), "{text}");
+    assert_eq!(err.guidance(), Some(GUIDE_OTHER_USER));
     assert!(deletes(&rec).await.is_empty());
 }
 
@@ -614,8 +618,10 @@ async fn revoke_otp_and_bypass_refusals_fail_clearly() {
         .revoke(&cred(&leaked))
         .await
         .unwrap_err();
-    assert!(matches!(err, ProviderError::Permanent(_)), "{err:?}");
+    assert!(matches!(err.base(), ProviderError::Permanent(_)), "{err:?}");
     assert!(err.to_string().contains("one-time password"), "{err}");
+    // SHA-298 T5.
+    assert_eq!(err.guidance(), Some(GUIDE_OTP));
 
     let rec = CallRecorder::start().await;
     mount_list(
@@ -638,6 +644,7 @@ async fn revoke_otp_and_bypass_refusals_fail_clearly() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("bypasses 2FA"), "{err}");
+    assert_eq!(err.guidance(), Some(GUIDE_SESSION_TOKEN));
 }
 
 // Decision D3: the leaked token never deletes itself.
@@ -650,6 +657,7 @@ async fn revoke_refuses_leaked_operator_token() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("D3"), "{err}");
+    assert_eq!(err.guidance(), Some(GUIDE_OPERATOR_IS_LEAKED));
     assert!(rec.calls().await.is_empty(), "revoke made a call");
 }
 
@@ -759,6 +767,16 @@ struct Pipeline {
 }
 
 async fn pipeline(rec: &CallRecorder, leaked: &str, operator: &str) -> Pipeline {
+    pipeline_with(rec, leaked, operator, "0s").await
+}
+
+/// [`pipeline`] with an overlap window.
+async fn pipeline_with(
+    rec: &CallRecorder,
+    leaked: &str,
+    operator: &str,
+    overlap: &str,
+) -> Pipeline {
     let dir = tempfile::tempdir().unwrap();
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(provider(rec, Some(operator))));
@@ -778,7 +796,7 @@ async fn pipeline(rec: &CallRecorder, leaked: &str, operator: &str) -> Pipeline 
         assessed,
         &providers,
         &consumers,
-        "0s".parse().unwrap(),
+        overlap.parse().unwrap(),
         &ConsumersConfig::default(),
     )
     .await;
@@ -866,6 +884,84 @@ async fn executor_wrong_user_never_revokes() {
         Some(SecretValue::from(leaked.as_str()).fingerprint()),
         "the consumer still holds the old token"
     );
+}
+
+fn two_hours_later() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::hours(2)
+}
+
+// SHA-298 T2 (AC2), T3 (AC3): a revoke resumed by a new executor (which
+// never held the replacement) after the overlap window, with no operator
+// token set. The failure keeps the safe summary of npm's error plus
+// rotate's own guidance; no value reaches the result, the audit log or the
+// state file, and nothing is deleted.
+#[tokio::test]
+async fn sha298_t2_resumed_revoke_without_operator_keeps_guidance() {
+    let rec = CallRecorder::start().await;
+    mount_delete(&rec, 204).await;
+    let leaked = npm_token("g2Leakd");
+    let operator = npm_token("g2Oper");
+    let replacement = npm_token("g2Repl");
+    mount_whoami(&rec, &leaked, "alice").await;
+    mount_whoami(&rec, &replacement, "alice").await;
+    mount_list(
+        &rec,
+        &operator,
+        serde_json::json!([granular_entry(&leaked)]),
+    )
+    .await;
+    let mut p = pipeline_with(&rec, &leaked, &operator, "1h").await;
+    let mut term = Term::default();
+    let first = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+        .with_manual(
+            ReplacementSource::Supplied(Some(SecretValue::from(replacement.as_str()))),
+            &mut term,
+        )
+        .run(&p.plan.rotations[0])
+        .await;
+    assert!(
+        matches!(first.result, RunResult::PendingRevoke { .. }),
+        "{:?}",
+        first.result
+    );
+
+    // The later run: a new process, so a new registry, with no operator.
+    let mut resumed = ProviderRegistry::new();
+    resumed.register(Arc::new(provider(&rec, None)));
+    let outcome = Executor::new(&resumed, &p.consumers, &mut p.store, &mut p.audit)
+        .with_clock(two_hours_later)
+        .run(&p.plan.rotations[0])
+        .await;
+    let error = match &outcome.result {
+        RunResult::Failed { error, .. } => error.to_string(),
+        other => panic!("expected a failed revoke, got {other:?}"),
+    };
+    for needle in [
+        "npm revoke failed",
+        "provider message not kept",
+        GUIDE_NO_OPERATOR,
+    ] {
+        assert!(error.contains(needle), "{needle} not in: {error}");
+    }
+    let audit = std::fs::read_to_string(p.dir.path().join("audit.jsonl")).unwrap();
+    let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(last["step"], "revoke", "{last}");
+    assert!(
+        last["error"].as_str().unwrap().contains(GUIDE_NO_OPERATOR),
+        "{last}"
+    );
+    let state = std::fs::read_to_string(p.dir.path().join("state.json")).unwrap();
+    for value in [&leaked, &replacement, &operator] {
+        for (place, text) in [
+            ("result", format!("{:?}", outcome.result)),
+            ("audit", audit.clone()),
+            ("state", state.clone()),
+            ("terminal", format!("{}{}", term.out, term.err)),
+        ] {
+            assert!(!text.contains(value.as_str()), "a value in the {place}");
+        }
+    }
+    assert!(deletes(&rec).await.is_empty(), "revoke deleted a token");
 }
 
 /// A TRACE-level capture installed as this binary's global subscriber

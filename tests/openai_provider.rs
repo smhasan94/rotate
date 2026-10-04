@@ -24,8 +24,9 @@ use rotate::consumer::{ConsumerMatch, ConsumerRegistry};
 use rotate::finding::{Finding, SourceLocation};
 use rotate::plan::{self, MANUAL_REVOKE_BLOCKER};
 use rotate::provider::openai::{
-    AdminKey, OpenAiProvider, KEYS_PAGE, PERMISSIONS_NOTE, REVOKE_NEEDS_ADMIN, REVOKE_UNDELETABLE,
-    SCOPE_WIDENING_NOTE, UNDELETABLE_WARNING,
+    AdminKey, OpenAiProvider, GUIDE_ADMIN_IS_LEAKED, GUIDE_NEEDS_ADMIN, KEYS_PAGE,
+    PERMISSIONS_NOTE, REVOKE_NEEDS_ADMIN, REVOKE_UNDELETABLE, SCOPE_WIDENING_NOTE,
+    UNDELETABLE_WARNING,
 };
 use rotate::provider::{
     Credential, Identity, Provider, ProviderError, ProviderRegistry, ReplacementMode,
@@ -394,7 +395,8 @@ async fn manual_scope_reads_org_header() {
     assert_eq!(p.manual_revoke(Some(&scope)), Some(REVOKE_NEEDS_ADMIN));
     assert_eq!(
         p.revoke(&cred(&leaked)).await.unwrap_err(),
-        ProviderError::Unsupported(REVOKE_NEEDS_ADMIN.into())
+        // SHA-298 T5.
+        ProviderError::Unsupported(REVOKE_NEEDS_ADMIN.into()).with_guidance(GUIDE_NEEDS_ADMIN)
     );
     // A pasted key from another organization fails verify.
     let other = key(PROJ, "t4othr");
@@ -596,6 +598,11 @@ struct Pipeline {
 }
 
 async fn pipeline(p: OpenAiProvider, leaked: &str) -> Pipeline {
+    pipeline_with(p, leaked, "0s").await
+}
+
+/// [`pipeline`] with an overlap window.
+async fn pipeline_with(p: OpenAiProvider, leaked: &str, overlap: &str) -> Pipeline {
     let dir = tempfile::tempdir().unwrap();
     let mut providers = ProviderRegistry::new();
     providers.register(Arc::new(p));
@@ -610,7 +617,7 @@ async fn pipeline(p: OpenAiProvider, leaked: &str) -> Pipeline {
         assessed,
         &providers,
         &consumers,
-        "0s".parse().unwrap(),
+        overlap.parse().unwrap(),
         &ConsumersConfig::default(),
     )
     .await;
@@ -1515,4 +1522,104 @@ async fn sha291_t2_opt_in_by_config_and_by_flag_through_the_binary() {
         "the plans listed projects: {calls:?}"
     );
     rec.assert_no_mutations().await;
+}
+
+fn two_hours_later() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::hours(2)
+}
+
+// SHA-298 T1 (AC1), T3 (AC3): a manual rotation planned and applied with
+// an Admin API key reaches pending_revoke; a new executor (which never
+// held the replacement) resumes it after the window with a different
+// operator setup. Without an Admin API key it is a revoke by hand naming
+// the key and the keys page; with the leaked key as the Admin API key it
+// fails with the safe summary plus rotate's guidance. No value reaches the
+// result, the audit log, the state file or the terminal, and nothing is
+// deleted.
+#[tokio::test]
+async fn sha298_t1_resumed_revoke_keeps_admin_key_guidance() {
+    for case in ["no admin key", "admin key is the leaked key"] {
+        let rec = CallRecorder::start().await;
+        let admin = admin_key();
+        let leaked = key(PROJ, "g1leak");
+        let fresh = key(PROJ, "g1new0");
+        manual_with_admin(&rec, &admin, &leaked, &fresh).await;
+        let mut p = pipeline_with(admin_only(&rec, &admin), &leaked, "1h").await;
+        let mut term = Term::default();
+        let first = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_manual(
+                ReplacementSource::Supplied(Some(SecretValue::from(fresh.as_str()))),
+                &mut term,
+            )
+            .run(&p.plan.rotations[0])
+            .await;
+        assert!(
+            matches!(first.result, RunResult::PendingRevoke { .. }),
+            "{case}: {:?}",
+            first.result
+        );
+
+        let later = match case {
+            "no admin key" => manual(&rec),
+            _ => OpenAiProvider::new(
+                &rec.uri(),
+                AdminKey::Value(SecretValue::from(leaked.as_str())),
+            )
+            .with_verify_delay(Duration::ZERO),
+        };
+        let mut resumed = ProviderRegistry::new();
+        resumed.register(Arc::new(later));
+        let outcome = Executor::new(&resumed, &p.consumers, &mut p.store, &mut p.audit)
+            .with_clock(two_hours_later)
+            .run(&p.plan.rotations[0])
+            .await;
+        let stored = p.store.get(&outcome.rotation_id).unwrap().clone();
+        let text = match (&outcome.result, case) {
+            (RunResult::RevokeManual { instructions }, "no admin key") => {
+                assert_eq!(
+                    stored.revoke_instructions.as_deref(),
+                    Some(instructions.as_str())
+                );
+                instructions.as_str().to_owned()
+            }
+            (RunResult::Failed { error, .. }, "admin key is the leaked key") => {
+                let error = error.to_string();
+                assert!(error.contains("provider message not kept"), "{error}");
+                error
+            }
+            (other, _) => panic!("{case}: unexpected {other:?}"),
+        };
+        let guidance = match case {
+            "no admin key" => REVOKE_NEEDS_ADMIN,
+            _ => GUIDE_ADMIN_IS_LEAKED,
+        };
+        assert!(text.contains(guidance), "{case}: {text}");
+        assert!(text.contains("Admin API key"), "{case}: {text}");
+        let audit = std::fs::read_to_string(p.dir.path().join("audit.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(last["step"], "revoke", "{case}: {last}");
+        assert!(
+            audit.lines().last().unwrap().contains(guidance),
+            "{case}: {last}"
+        );
+        let state = std::fs::read_to_string(p.dir.path().join("state.json")).unwrap();
+        for value in [&leaked, &fresh, &admin] {
+            for (place, text) in [
+                ("result", format!("{:?}", outcome.result)),
+                ("audit", audit.clone()),
+                ("state", state.clone()),
+                ("terminal", format!("{}{}", term.out, term.err)),
+            ] {
+                assert!(
+                    !text.contains(value.as_str()),
+                    "{case}: a value in the {place}"
+                );
+            }
+        }
+        let calls = rec.calls().await;
+        assert!(
+            !calls.iter().any(|c| c.method == "DELETE"),
+            "{case}: {calls:?}"
+        );
+    }
 }

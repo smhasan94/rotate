@@ -40,7 +40,7 @@ use crate::audit::{
 };
 use crate::consumer::{ConsumerMatch, ConsumerRegistry, MatchMethod};
 use crate::finding::{Finding, ACCESS_KEY_ID};
-use crate::provider::{Credential, ProviderError, ProviderRegistry, RestoreOutcome};
+use crate::provider::{Credential, ProviderRegistry, RestoreOutcome};
 use crate::secret::Fingerprint;
 use crate::state::{
     ConsumerState, ConsumerStatus, RollbackProgress, Rotation, StateError, StateStore, Step,
@@ -666,7 +666,8 @@ impl<'a> RollbackExecutor<'a> {
                             return self.fail(progress, action, &err.to_string(), None);
                         }
                     }
-                    Err(ProviderError::Unsupported(why)) => {
+                    Err(err) if err.unsupported().is_some() => {
+                        let why = err.unsupported().unwrap_or_default();
                         let reason = format!("revoke the replacement {reference} by hand: {why}");
                         if let Err(err) = self.by_hand(progress, &reason) {
                             return self.fail(progress, action, &err.to_string(), None);
@@ -905,6 +906,7 @@ mod tests {
     use crate::consumer::{ConsumerError, Holds};
     use crate::finding::SourceLocation;
     use crate::provider::mock::MockProvider;
+    use crate::provider::ProviderError;
     use crate::secret::{SecretPair, SecretValue};
 
     const OLD: &str = "npm_rollback-unit-old";
