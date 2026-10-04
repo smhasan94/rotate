@@ -16,6 +16,11 @@ test-providers = []
 # with a secret read from stdin, so CLI tests can prove the console, error
 # and panic paths are redacted (SHA-246). Never enabled for releases.
 test-commands = []
+# Plants one deliberate leak: when ROTATE_TEST_PLANT_LEAK is `stdout`,
+# `stderr` or a relative file name, the binary writes the first input
+# secret there raw, so tests/leakage.rs can prove its sweep catches a leak
+# (SHA-265). Never enabled for releases.
+leak-canary-test = []
 
 [dependencies]
 async-trait = "0.1"
