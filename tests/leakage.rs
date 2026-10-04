@@ -17,6 +17,10 @@
 //! Every run is `-vvv` with `RUST_LOG=trace` (one plan run is `-v` with no
 //! `RUST_LOG`), so stderr is the full log capture. After each run the files
 //! under `.rotate/` must be 0600 and the directory 0700 (AC3).
+//!
+//! SHA-293 adds the revoke-by-hand runs (`revoke_manual`, its `status`
+//! hint and the re-runs) and `plan --check-permissions` with probe errors
+//! that echo the operator's AWS secret and GitHub token.
 
 #![cfg(all(unix, feature = "test-providers", feature = "test-commands"))]
 
@@ -719,6 +723,122 @@ fn t1_panic_and_error_paths() {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-293 T1 (AC1): revoke by hand (SHA-289)
+// ---------------------------------------------------------------------------
+
+/// The two ways a provider asks for a revoke by hand: `manual_revoke`
+/// says so before any call, `unsupported.revoke` refuses the call. Either
+/// way the text is printed, stored as `revoke_instructions`, written to
+/// the skipped `revoke` audit entry and shown as the `status` hint.
+const BY_HAND: [&str; 2] = ["manual_revoke", "unsupported"];
+
+/// Instructions that quote the old secret, as an upstream that echoes the
+/// key it refused would. A refused revoke (`unsupported`) runs after the
+/// replacement exists, so its text quotes that too; `manual_revoke` is
+/// known before apply (the plan prints it as a blocker), when there is no
+/// replacement to quote.
+fn echoing_instructions(run: &MockRun, how: &str) -> String {
+    let mut said = format!("delete {} by hand at https://example.test/tokens", run.old);
+    if how == "unsupported" {
+        said.push_str(&format!("; keep {MOCK_REPLACEMENT}"));
+    }
+    said
+}
+
+/// apply stops at `revoke_manual` (exit 4); `status` in every format; a
+/// re-apply while the old secret is still valid (exit 4 again); then the
+/// operator deletes it: plan skips it as revoked by hand and apply records
+/// it revoked.
+#[test]
+fn sha293_t1_revoke_manual_status_and_reruns() {
+    for how in BY_HAND {
+        let mut run = MockRun::new();
+        let said = echoing_instructions(&run, how);
+        run.set(|s| {
+            s["providers"] = match how {
+                "manual_revoke" => json!({ "npm": { "manual_revoke": said } }),
+                _ => json!({ "npm": { "unsupported": { "revoke": said } } }),
+            };
+        });
+        run.expect(0, &["plan", "--stdin"]);
+        let id = run.planned_id();
+        let output = run.expect(
+            4,
+            &["--overlap", "0s", "apply", "--stdin", "--confirm", &id],
+        );
+        assert_eq!(run.step(&id), "revoke_manual", "{how}");
+        assert!(
+            text(&output.stdout).contains("revoke by hand"),
+            "{how}: {}",
+            shown(&output)
+        );
+        // The echoed instructions reached stdout, redacted.
+        assert!(
+            text(&output.stdout).contains("[REDACTED"),
+            "{how}: {}",
+            shown(&output)
+        );
+
+        run.expect(3, &["status"]);
+        run.expect(3, &["status", "--all"]);
+        let status = run.expect(3, &["--json", "status"]);
+        let rows: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(rows[0]["step"], "revoke_manual", "{how}: {rows}");
+        run.expect(3, &["--json", "status", "--all"]);
+
+        // Still valid: only the read-only check, and exit 4 again.
+        run.expect(
+            4,
+            &["--overlap", "0s", "apply", "--stdin", "--confirm", &id],
+        );
+        assert_eq!(run.step(&id), "revoke_manual", "{how}");
+        run.expect(3, &["status"]);
+
+        // Deleted by hand: the plan skips it, apply records it revoked.
+        run.set(|s| s["providers"]["npm"]["validity"] = json!("invalid"));
+        run.expect(0, &["plan", "--stdin"]);
+        let plan = run.expect(0, &["--json", "plan", "--stdin"]);
+        let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+        assert_eq!(
+            plan["skipped"][0]["reason"], "revoked by hand",
+            "{how}: {plan}"
+        );
+        run.expect(0, &["apply", "--stdin", "--confirm", &id]);
+        assert_eq!(run.step(&id), "revoked", "{how}");
+        run.expect(0, &["status", "--all"]);
+        run.expect(0, &["--json", "status", "--all"]);
+        run.expect(0, &["apply", "--stdin", "--all"]);
+    }
+}
+
+/// A revoke by hand the operator then rolls back: rollback treats the old
+/// secret as never revoked.
+#[test]
+fn sha293_t1_revoke_manual_then_rollback() {
+    for how in BY_HAND {
+        let mut run = MockRun::new();
+        let said = echoing_instructions(&run, how);
+        run.set(|s| {
+            s["providers"] = match how {
+                "manual_revoke" => json!({ "npm": { "manual_revoke": said } }),
+                _ => json!({ "npm": { "unsupported": { "revoke": said } } }),
+            };
+        });
+        let id = run.planned_id();
+        run.expect(
+            4,
+            &["--overlap", "0s", "apply", "--stdin", "--confirm", &id],
+        );
+        let providers = run.scenario["providers"].clone();
+        run.consumers_hold(MOCK_REPLACEMENT);
+        run.set(|s| s["providers"] = providers);
+        run.expect(0, &["rollback", "--stdin", "--confirm", &id]);
+        assert_eq!(run.step(&id), "rolled_back", "{how}");
+        run.expect(0, &["--json", "status", "--all"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Real plugins (tests/e2e)
 // ---------------------------------------------------------------------------
 
@@ -888,6 +1008,128 @@ async fn t1_real_plugins_failed_update_then_rollback() {
         run.e2e.model.state().deny_put = false;
         run.expect(0, &["rollback", "report.ndjson", "--confirm", &id]);
         run.expect(0, &["--json", "status", "--all"]);
+        run.assert_requests_clean().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-293 T2 (AC2): plan --check-permissions (SHA-270)
+// ---------------------------------------------------------------------------
+
+/// The actions of the minimal IAM policy in `docs/permissions.md`.
+fn documented_policy() -> std::collections::BTreeSet<String> {
+    const DOC: &str = include_str!("../docs/permissions.md");
+    let start = DOC.find("### Minimal IAM policy").unwrap();
+    let rest = &DOC[start..];
+    let open = rest.find("```json\n").unwrap() + "```json\n".len();
+    let close = rest[open..].find("```").unwrap();
+    let policy: Value = serde_json::from_str(&rest[open..open + close]).unwrap();
+    let mut actions = std::collections::BTreeSet::new();
+    for statement in policy["Statement"].as_array().unwrap() {
+        match &statement["Action"] {
+            Value::String(a) => {
+                actions.insert(a.clone());
+            }
+            Value::Array(list) => {
+                actions.extend(list.iter().map(|a| a.as_str().unwrap().to_owned()));
+            }
+            other => panic!("unexpected Action {other}"),
+        }
+    }
+    actions
+}
+
+impl RealRun {
+    /// `plan --check-permissions` as a table and as JSON, both swept;
+    /// returns the stderr of the table run and the JSON plan. Both exit 0.
+    fn check_permissions(&self) -> (String, Value) {
+        let table = self.expect(0, &["plan", "report.ndjson", "--check-permissions"]);
+        let json = self.expect(
+            0,
+            &["--json", "plan", "report.ndjson", "--check-permissions"],
+        );
+        (
+            text(&table.stderr),
+            serde_json::from_slice(&json.stdout).unwrap(),
+        )
+    }
+}
+
+/// All allowed, then one action denied: the denial is a blocker.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha293_t2_check_permissions_allowed_and_denied() {
+    let run = RealRun::start().await;
+    run.e2e.model.state().policy = Some(documented_policy());
+    let (_, plan) = run.check_permissions();
+    assert_eq!(plan["rotations"][0]["blockers"], json!([]), "{plan}");
+    assert_eq!(run.e2e.model.state().simulations.len(), 2);
+
+    let mut policy = documented_policy();
+    policy.remove("iam:CreateAccessKey");
+    run.e2e.model.state().policy = Some(policy);
+    let (_, plan) = run.check_permissions();
+    let blockers = plan["rotations"][0]["blockers"].to_string();
+    assert!(
+        blockers.contains("operator lacks iam:CreateAccessKey"),
+        "{plan}"
+    );
+    run.e2e.rec.assert_no_mutations().await;
+    run.assert_requests_clean().await;
+}
+
+/// The simulation fails with an error that echoes the operator's AWS
+/// secret access key (and the other secrets): a warning, swept.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha293_t2_check_permissions_simulate_error_echoes_operator_secret() {
+    for status in [400, 500] {
+        let run = RealRun::start().await;
+        run.e2e.model.state().policy = Some(documented_policy());
+        let echo = format!(
+            "signature for {} with {} failed; old {} new {}",
+            run.e2e.operator_id, run.e2e.operator_secret, run.e2e.leaked.secret, run.e2e.new_secret
+        );
+        run.e2e.model.state().simulate_error = Some((status, echo));
+        let (stderr, plan) = run.check_permissions();
+        assert!(
+            stderr.contains("warning: AWS permissions not checked"),
+            "{status}: {stderr}"
+        );
+        // The echoed message reached the warning, redacted.
+        assert!(stderr.contains("[REDACTED"), "{status}: {stderr}");
+        assert_eq!(plan["rotations"][0]["blockers"], json!([]), "{plan}");
+        run.e2e.rec.assert_no_mutations().await;
+        run.assert_requests_clean().await;
+    }
+}
+
+/// The GitHub public-key read answers 403 or 500 with the operator token
+/// (and the leaked secret) in its body.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha293_t2_check_permissions_public_key_error_echoes_token() {
+    for status in [403, 500] {
+        let run = RealRun::start().await;
+        run.e2e.model.state().policy = Some(documented_policy());
+        let echo = format!(
+            "token {} may not read this key (Bearer {}); secret {}",
+            run.e2e.github_token, run.e2e.github_token, run.e2e.leaked.secret
+        );
+        run.e2e.gh().state().public_key_error = Some((status, echo));
+        let (stderr, plan) = run.check_permissions();
+        let consumers = plan["rotations"][0]["consumers"].to_string();
+        match status {
+            403 => assert!(
+                consumers.contains(rotate::consumer::github_actions::LACKS_SECRETS_WRITE),
+                "{plan}"
+            ),
+            _ => {
+                assert!(
+                    stderr.contains("write permission not checked"),
+                    "{status}: {stderr}"
+                );
+                assert!(stderr.contains("[REDACTED"), "{status}: {stderr}");
+            }
+        }
+        run.e2e.rec.assert_no_mutations().await;
         run.assert_requests_clean().await;
     }
 }
