@@ -11,7 +11,8 @@
     "step": {
       "enum": [
         "planned", "created", "consumers_updated", "verified",
-        "pending_revoke", "revoked", "failed", "needs_rollback", "rolled_back"
+        "pending_revoke", "revoked", "failed", "needs_rollback", "revoke_manual",
+        "rolled_back"
       ]
     },
     "audit_step": {
@@ -61,12 +62,12 @@
           "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/audit_step" }]
         },
         "pending": {
-          "description": "True at created, consumers_updated, verified, pending_revoke, failed or needs_rollback, or while a rollback is in progress. Any pending rotation makes the exit code 3.",
+          "description": "True at created, consumers_updated, verified, pending_revoke, failed, needs_rollback or revoke_manual, or while a rollback is in progress. Any pending rotation makes the exit code 3.",
           "type": "boolean"
         },
-        "hint": { "description": "What to do next, one line.", "type": "string" },
+        "hint": { "description": "What to do next, one line. At revoke_manual it holds the provider's instructions for deleting the old secret by hand.", "type": "string" },
         "error": {
-          "description": "The error of the rotation's last audit entry, when that entry has one.",
+          "description": "The error of the rotation's last audit entry, when that entry has one and its outcome is not ok.",
           "oneOf": [
             { "type": "null" },
             {

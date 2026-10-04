@@ -32,7 +32,7 @@
         "state": {
           "enum": [
             "planned", "created", "consumers_updated", "verified",
-            "pending_revoke", "failed", "needs_rollback", "revoked"
+            "pending_revoke", "failed", "needs_rollback", "revoke_manual", "revoked"
           ]
         },
         "scope": {
@@ -100,7 +100,7 @@
       "properties": {
         "provider": { "type": ["string", "null"] },
         "fingerprint": { "$ref": "#/$defs/fingerprint" },
-        "reason": { "enum": ["invalid", "unsupported", "not rotatable", "unknown", "unchecked", "already rotated"] },
+        "reason": { "enum": ["invalid", "unsupported", "not rotatable", "unknown", "unchecked", "already rotated", "revoked by hand"] },
         "detail": { "type": ["string", "null"] },
         "sources": { "$ref": "#/$defs/sources" }
       }
