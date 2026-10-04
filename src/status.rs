@@ -42,6 +42,21 @@ pub struct LastError {
     pub at: OffsetDateTime,
     /// The error, redacted.
     pub text: RedactedText,
+    /// The entry's outcome (`failed` or `skipped`). Not in the JSON.
+    #[serde(skip)]
+    pub outcome: crate::audit::Outcome,
+}
+
+impl LastError {
+    /// True for the `skipped` revoke entry apply writes when it records
+    /// a pending revoke (SHA-294): it means waiting for the overlap
+    /// window, not a failure. Only meaningful while the rotation is at
+    /// `pending_revoke`; the row's hint says when the revoke is due.
+    fn is_waiting(&self, rotation: &Rotation) -> bool {
+        rotation.step == Step::PendingRevoke
+            && self.step == AuditStep::Revoke
+            && self.outcome == crate::audit::Outcome::Skipped
+    }
 }
 
 /// The last audit entry of each rotation, kept only when it has an error
@@ -77,6 +92,7 @@ pub fn last_errors(
                         step: entry.step,
                         at: entry.ts,
                         text,
+                        outcome: entry.outcome,
                     },
                 )
             })
@@ -167,7 +183,13 @@ pub fn rows(
         .rotations()
         .iter()
         .filter(|r| all || is_shown_by_default(r))
-        .map(|r| row(r, errors.get(&r.rotation_id).cloned(), now))
+        .map(|r| {
+            let error = errors
+                .get(&r.rotation_id)
+                .filter(|e| !e.is_waiting(r))
+                .cloned();
+            row(r, error, now)
+        })
         .collect()
 }
 
@@ -634,5 +656,56 @@ mod tests {
             Ok(confirmed),
         ]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+    /// SHA-294 T3 (AC3): the skipped revoke entry that records an open
+    /// overlap window is not a last error at `pending_revoke`; the hint
+    /// says when the revoke is due. A revoke that failed still shows.
+    #[test]
+    fn waiting_revoke_is_a_hint_not_a_last_error() {
+        let mut waiting = entry("rot-w", AuditStep::Revoke, None);
+        waiting.outcome = crate::audit::Outcome::Skipped;
+        waiting.error = Some(RedactedText::new(
+            "overlap window open until 2026-10-02T07:12:00Z",
+        ));
+        let failed = entry("rot-f", AuditStep::Revoke, Some("revoke refused"));
+        let (errors, _) = last_errors(vec![Ok(waiting), Ok(failed)]);
+        assert_eq!(errors.len(), 2, "last_errors itself keeps both");
+
+        let mut pending = rotation("rot-w", Step::PendingRevoke);
+        pending.revoke_not_before = Some(now() + Duration::minutes(5));
+        let mut broken = rotation("rot-f", Step::Failed);
+        broken.failed_step = Some(AuditStep::Revoke);
+        let snap = snapshot(vec![pending, broken]);
+        let shown = rows(&snap, &errors, now(), false);
+        let by_id = |id: &str| shown.iter().find(|r| r.rotation_id == id).unwrap();
+        assert_eq!(by_id("rot-w").error, None);
+        assert!(
+            by_id("rot-w").hint.contains("after 07:12:00 UTC"),
+            "{:?}",
+            by_id("rot-w")
+        );
+        assert_eq!(
+            by_id("rot-f").error.as_ref().unwrap().text.as_str(),
+            "revoke refused"
+        );
+        let table = render_table(&shown, 2, now());
+        assert!(!table.contains("overlap window open"), "{table}");
+        assert!(
+            table.contains("last error (revoke, 2026-10-02T07:07:00Z): revoke refused"),
+            "{table}"
+        );
+        let json = render_json(&shown);
+        assert!(!json.contains("overlap window open"), "{json}");
+
+        // The same skipped entry on a rotation no longer pending revoke
+        // (a hold, say) is still shown.
+        let mut held = entry("rot-h", AuditStep::Revoke, None);
+        held.outcome = crate::audit::Outcome::Skipped;
+        held.error = Some(RedactedText::new(
+            "consumer x does not hold the replacement",
+        ));
+        let (errors, _) = last_errors(vec![Ok(held)]);
+        let snap = snapshot(vec![rotation("rot-h", Step::Verified)]);
+        assert!(rows(&snap, &errors, now(), false)[0].error.is_some());
     }
 }

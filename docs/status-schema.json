@@ -67,7 +67,7 @@
         },
         "hint": { "description": "What to do next, one line. At revoke_manual it holds the provider's instructions for deleting the old secret by hand.", "type": "string" },
         "error": {
-          "description": "The error of the rotation's last audit entry, when that entry has one and its outcome is not ok.",
+          "description": "The error of the rotation's last audit entry, when that entry has one and its outcome is not ok. Null at pending_revoke when that entry is the skipped revoke that records the open overlap window: waiting is not an error, and hint and revoke_not_before say when the revoke is due (SHA-294).",
           "oneOf": [
             { "type": "null" },
             {
