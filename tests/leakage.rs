@@ -1174,7 +1174,12 @@ async fn sha294_t2_reapply_during_the_overlap_window() {
             !table.contains("will not create a replacement"),
             "{label}: {table}"
         );
-        assert!(!table.contains("warning:"), "{label}: {table}");
+        // No scope warning in the rotation block; the run-level endpoint
+        // warnings under the header (SHA-287) are expected here.
+        assert!(
+            !table.lines().any(|l| l.starts_with("  warning:")),
+            "{label}: {table}"
+        );
         for consumer_ref in &refs {
             let row = table
                 .lines()
@@ -1573,4 +1578,56 @@ fn sweep_finds_every_encoding_at_every_alignment() {
     assert!(sweep.scan("s", b"nothing to see").is_empty());
     let hit = &sweep.scan("place", value.as_bytes())[0];
     assert!(!hit.to_string().contains(&value));
+}
+
+// ---------------------------------------------------------------------------
+// SHA-287 T8 (AC3): a credential in an endpoint URL's user info
+// ---------------------------------------------------------------------------
+
+/// A canary as the password (and user name) in each endpoint field's URL:
+/// the config is refused (exit 2) and the canary appears nowhere, in
+/// stdout, stderr at `-vvv` with `RUST_LOG=trace`, or any file rotate
+/// wrote. The config sits under `inputs/`, which the sweep skips.
+#[test]
+fn sha287_t8_userinfo_canary_stays_out_of_every_output() {
+    // URL-safe canaries, so they really are the URL's user info: `/` or
+    // `+` would end the authority and make them part of the path.
+    let url_safe =
+        |c: String| -> String { c.chars().filter(char::is_ascii_alphanumeric).collect() };
+    let password = url_safe(canary());
+    let user = url_safe(canary());
+    assert!(password.len() >= 16 && user.len() >= 16);
+    let sweep = Sweep::new(&[
+        Canary::new("URL password", &password),
+        Canary::new("URL user name", &user),
+    ]);
+    let urls = [
+        format!("https://{user}:{password}@api.example.com"),
+        format!("http://{user}:{password}@localhost:4873"),
+        format!("https://:{password}@api.example.com"),
+    ];
+    let templates = [
+        "providers:\n  aws:\n    endpoint_url: \"{}\"\n",
+        "providers:\n  github:\n    api_url: \"{}\"\n",
+        "providers:\n  npm:\n    registry: \"{}\"\n",
+        "providers:\n  openai:\n    api_url: \"{}\"\n",
+    ];
+    for template in templates {
+        for url in &urls {
+            let run = MockRun::new();
+            let config = run.path("inputs/rotate.yaml");
+            std::fs::write(&config, template.replace("{}", url)).unwrap();
+            let config = config.to_str().unwrap();
+            let output = run.expect(2, &["--config", config, "plan", "--stdin"]);
+            assert!(
+                text(&output.stderr).contains("must not embed credentials"),
+                "{}",
+                shown(&output)
+            );
+            let mut hits = sweep.scan("stdout", &output.stdout);
+            hits.extend(sweep.scan("stderr", &output.stderr));
+            hits.extend(sweep.scan_dir(run.root.path(), &[run.path("inputs")]));
+            assert_no_hits("a config with credentials in a URL", &hits);
+        }
+    }
 }

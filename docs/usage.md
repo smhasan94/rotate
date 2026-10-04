@@ -157,6 +157,13 @@ Rotation rot-5f36d3cd  aws  sha256:8088a3c392bc0b3e
 - **Skipped**: secrets that are invalid, unsupported, unknown or already
   rotated, with the reason. Nothing happens to them.
 
+Right under the header, a `warning:` line names each endpoint in
+`rotate.yaml` that differs from its default, such as
+`providers.npm.registry is https://npm.example.com (default
+https://registry.npmjs.org)`. Check it is a server you trust: new secrets
+and your operator credentials go there. See
+[config.md](config.md#endpoint-urls).
+
 `plan` exits 0 even when it lists blockers. Its only write is local: each
 new rotation is recorded at step `planned` in the state file.
 

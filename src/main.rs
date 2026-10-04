@@ -245,6 +245,8 @@ fn build_plan(
         .await
     });
     plan.skipped.extend(already_rotated);
+    // SHA-287: plan and apply both show where secrets are being sent.
+    plan.warnings = config.providers.endpoint_warnings();
     plan::mark_revoked_by_hand(&mut plan, store.rotations());
     if let Err(err) = plan::assign_ids(&mut plan, store) {
         return Err(state_error(console, err));

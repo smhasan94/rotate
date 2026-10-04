@@ -114,6 +114,31 @@ providers:
 [rotate.example.yaml](rotate.example.yaml) is the same file with a comment
 on every field.
 
+## Endpoint URLs
+
+`providers.aws.endpoint_url`, `providers.github.api_url`,
+`providers.npm.registry` and `providers.openai.api_url` decide where rotate
+sends new secrets and your operator credentials, so they follow one rule:
+
+- Only `https://` is accepted, except `http://` to a loopback host
+  (`127.0.0.1` or any other `127.x.x.x` address, `::1`, or `localhost`) for
+  LocalStack and local test servers. `http://api.example.com` is refused.
+- The host is read from the parsed URL, so `http://127.0.0.1.evil.example`,
+  `http://localhost@evil.example` and `http://evil.example/127.0.0.1` are
+  refused too.
+- A URL must not carry a user name or password
+  (`https://user:token@host`); give credentials through the environment.
+  The error does not repeat the URL.
+
+A refused URL stops every command with exit 2 and an error naming the
+field, before any call is made.
+
+`rotate plan` and `rotate apply` print one `warning:` line per endpoint
+that differs from its default, right after the plan header and before apply
+asks for confirmation, and `plan --json` lists them in `warnings`. Any
+`providers.aws.endpoint_url` warns, LocalStack included, because by default
+rotate uses AWS's own endpoints.
+
 ## Fields
 
 ### `overlap_window`
@@ -261,7 +286,7 @@ Region for IAM, STS and Secrets Manager calls.
 
 ### `providers.aws.endpoint_url`
 
-Type: URL (`https://` or `http://`).
+Type: URL (see [Endpoint URLs](#endpoint-urls)).
 Default: unset: AWS's own endpoints.
 
 Sends STS, IAM and Secrets Manager calls to this URL instead, for
@@ -269,7 +294,7 @@ LocalStack or a test server.
 
 ### `providers.github.api_url`
 
-Type: URL.
+Type: URL (see [Endpoint URLs](#endpoint-urls)).
 Default: `https://api.github.com`
 
 GitHub REST API base URL, used by the GitHub provider and the Actions
@@ -277,7 +302,7 @@ consumer. Change it for GitHub Enterprise Server.
 
 ### `providers.npm.registry`
 
-Type: URL.
+Type: URL (see [Endpoint URLs](#endpoint-urls)).
 Default: `https://registry.npmjs.org`
 
 npm registry base URL.
@@ -294,7 +319,7 @@ mode: it checks keys, asks for the replacement and cannot revoke. See
 
 ### `providers.openai.api_url`
 
-Type: URL, without `/v1`.
+Type: URL, without `/v1` (see [Endpoint URLs](#endpoint-urls)).
 Default: `https://api.openai.com`
 
 OpenAI API base URL.
