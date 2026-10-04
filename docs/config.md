@@ -60,9 +60,13 @@ and org listed in `consumers.github_actions.targets`.
 | Provider | Secret names (the token or secret half) | Key id names |
 | --- | --- | --- |
 | `aws` | `AWS_SECRET_ACCESS_KEY` | `AWS_ACCESS_KEY_ID` |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN`, `GH_PAT` | none |
+| `github` | `GH_TOKEN`, `GH_PAT` | none |
 | `npm` | `NPM_TOKEN` | none |
 | `openai` | `OPENAI_API_KEY` | none |
+
+`GITHUB_TOKEN` is not a convention name: GitHub rejects Actions secret
+names that start with `GITHUB_`. (It is still read as the operator token,
+above.)
 
 AWS Secrets Manager entries are matched by value instead: rotate reads each
 entry listed under `consumers.aws_secrets_manager` and compares its value

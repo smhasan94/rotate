@@ -63,8 +63,8 @@ impl GlobalArgs {
     }
 }
 
-/// Where the leaked secrets come from (SHA-247): a scanner report, or a
-/// single secret on stdin. Secrets are never accepted as arguments.
+/// Where the leaked secrets come from: a scanner report, or a single
+/// secret on stdin. Secrets are never accepted as arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InputArgs {
     /// TruffleHog (JSON lines) or gitleaks (JSON) report to read.
@@ -84,7 +84,7 @@ pub struct InputArgs {
     #[arg(long, value_name = "NAME", requires = "stdin")]
     pub provider: Option<String>,
 
-    /// Most provider checks in flight at once (SHA-248).
+    /// Most provider checks in flight at once.
     #[arg(long, value_name = "N", default_value_t = DEFAULT_CONCURRENCY,
           value_parser = clap::value_parser!(u16).range(1..=64))]
     pub concurrency: u16,
@@ -113,20 +113,19 @@ pub struct PlanArgs {
 
     /// Also probe the operator's own permissions, read-only, and report
     /// what is missing before apply: an IAM policy simulation for AWS and a
-    /// public-key read per GitHub Actions target (SHA-270). See
-    /// docs/permissions.md.
+    /// public-key read per GitHub Actions target. See docs/permissions.md.
     #[arg(long)]
     pub check_permissions: bool,
 
     /// Let rotate create OpenAI replacements as service accounts, which get
     /// all permissions in the project and may be broader than the leaked
-    /// key (SHA-291). Without it, or providers.openai.allow_broader_replacement
-    /// in rotate.yaml, you paste a restricted key instead.
+    /// key. Without it, or providers.openai.allow_broader_replacement in
+    /// rotate.yaml, you paste a restricted key instead.
     #[arg(long)]
     pub allow_broader_replacement: bool,
 }
 
-/// Arguments of `rotate apply` (SHA-254).
+/// Arguments of `rotate apply`.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ApplyArgs {
     #[command(flatten)]
@@ -166,13 +165,13 @@ pub struct ApplyArgs {
 
     /// Let rotate create OpenAI replacements as service accounts, which get
     /// all permissions in the project and may be broader than the leaked
-    /// key (SHA-291). Without it, or providers.openai.allow_broader_replacement
-    /// in rotate.yaml, you paste a restricted key instead.
+    /// key. Without it, or providers.openai.allow_broader_replacement in
+    /// rotate.yaml, you paste a restricted key instead.
     #[arg(long)]
     pub allow_broader_replacement: bool,
 }
 
-/// Arguments of `rotate rollback` (SHA-259).
+/// Arguments of `rotate rollback`.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct RollbackArgs {
     /// The report or stdin secret that was rotated. rotate never stores
@@ -191,7 +190,7 @@ pub struct RollbackArgs {
     pub confirm: Vec<String>,
 }
 
-/// Arguments of `rotate status` (SHA-263).
+/// Arguments of `rotate status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
 pub struct StatusArgs {
     /// Also list finished rotations (`revoked` and `rolled_back`).

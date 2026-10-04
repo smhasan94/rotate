@@ -992,7 +992,7 @@ impl<'a> Executor<'a> {
         // registered with the redactor, until revoke is over: a revoke error
         // or revoke-by-hand text that echoes it is printed and stored after
         // this point (SHA-293).
-        let _verified = if from <= Resume::Verify {
+        let verified = if from <= Resume::Verify {
             progress.record.failed_step = None;
             if let Err(result) = self.verify(rotation, provider.as_ref(), progress).await {
                 return result;
@@ -1001,7 +1001,18 @@ impl<'a> Executor<'a> {
         } else {
             None
         };
-        self.finish(rotation, provider.as_ref(), progress).await
+        // SHA-294: a revoke resumed in a process that never held the
+        // replacement (after the overlap window, or `--wait` in a new
+        // process) cannot redact it, so it keeps only a safe summary.
+        let upstream = match verified {
+            Some(_) => UpstreamText::Redacted,
+            None => UpstreamText::Summary,
+        };
+        let result = self
+            .finish(rotation, provider.as_ref(), progress, upstream)
+            .await;
+        drop(verified);
+        result
     }
 
     /// One `skipped` audit entry for every step an earlier run finished
@@ -1261,6 +1272,7 @@ impl<'a> Executor<'a> {
         rotation: &PlannedRotation,
         provider: &dyn Provider,
         progress: &mut Progress,
+        upstream: UpstreamText,
     ) -> RunResult {
         if progress.record.step == Step::RevokeManual {
             return self.recheck_by_hand(rotation, provider, progress).await;
@@ -1334,18 +1346,29 @@ impl<'a> Executor<'a> {
         }
         let revoked = match provider.revoke(&rotation.credential).await {
             Ok(revoked) => revoked,
-            Err(ProviderError::Unsupported(instructions)) => {
+            Err(ProviderError::Unsupported(instructions)) if upstream == UpstreamText::Redacted => {
+                return self.revoke_by_hand(progress, &instructions);
+            }
+            Err(err @ ProviderError::Unsupported(_)) => {
+                let instructions = format!(
+                    "{REVOKE_BY_HAND_FALLBACK} ({})",
+                    revoke_error_summary(progress.provider, &err)
+                );
                 return self.revoke_by_hand(progress, &instructions);
             }
             Err(err) => {
+                let text = match upstream {
+                    UpstreamText::Redacted => err.to_string(),
+                    UpstreamText::Summary => revoke_error_summary(progress.provider, &err),
+                };
                 return self.fail(
                     progress,
                     AuditStep::Revoke,
                     &format!(
-                        "{err}; the replacement is live and the old secret may still be valid"
+                        "{text}; the replacement is live and the old secret may still be valid"
                     ),
                     None,
-                )
+                );
             }
         };
         progress.record.step = Step::Revoked;
@@ -1624,6 +1647,94 @@ impl<'a> Executor<'a> {
         RunResult::NeedsRollback {
             reason: RedactedText::new(reason),
         }
+    }
+}
+
+/// What a failed revoke may keep of the provider's error text (SHA-294).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamText {
+    /// This process holds the verified replacement, registered with the
+    /// redactor: the text is kept, redacted (SHA-293).
+    Redacted,
+    /// This process never held the replacement, so the redactor cannot
+    /// find it in the text: only [`revoke_error_summary`] is kept.
+    Summary,
+}
+
+/// Longest [`revoke_error_summary`], in characters.
+pub const SUMMARY_MAX: usize = 200;
+
+/// Provider error codes a summary may name: fixed identifiers that never
+/// carry a value. AWS IAM and STS, OpenAI and npm.
+const SAFE_ERROR_CODES: &[&str] = &[
+    "AccessDenied",
+    "AccessDeniedException",
+    "ConcurrentModification",
+    "EntityTemporarilyUnmodifiable",
+    "ExpiredToken",
+    "InvalidClientTokenId",
+    "InvalidInput",
+    "LimitExceeded",
+    "NoSuchEntity",
+    "ServiceFailure",
+    "SignatureDoesNotMatch",
+    "Throttling",
+    "UnrecognizedClientException",
+    "insufficient_permissions",
+    "invalid_api_key",
+    "invalid_request_error",
+    "not_found",
+    "rate_limit_exceeded",
+    "server_error",
+    "E401",
+    "E403",
+    "E404",
+    "EOTP",
+];
+
+/// The safe summary of a revoke error (SHA-294) for a process that never
+/// held the replacement: the provider and the kind of failure, then, when
+/// the error text has them, the operation rotate named (`iam:...` or
+/// `METHOD /path`), the HTTP status and an allowlisted provider error code.
+/// Nothing else of the upstream text is kept. Redacted, and at most
+/// [`SUMMARY_MAX`] characters.
+pub fn revoke_error_summary(provider: &str, err: &ProviderError) -> String {
+    use std::sync::LazyLock;
+
+    static OPERATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"^((?:[a-z0-9-]+:[A-Za-z]+)|(?:(?:GET|POST|PUT|PATCH|DELETE) /[A-Za-z0-9_{}./-]{0,80})): ",
+        )
+        .expect("valid regex")
+    });
+    static STATUS: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:HTTP|returned) ([1-5][0-9]{2})\b").expect("valid regex")
+    });
+    static CODE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(&format!(r"\b({})\b", SAFE_ERROR_CODES.join("|"))).expect("valid regex")
+    });
+
+    let (kind, text) = match err {
+        ProviderError::RateLimited { .. } => ("rate limited", ""),
+        ProviderError::Transient(text) => ("transient failure", text.as_str()),
+        ProviderError::Permanent(text) => ("failed", text.as_str()),
+        ProviderError::Unsupported(text) => ("not supported by the provider", text.as_str()),
+    };
+    let mut summary = format!("{provider} revoke {kind}");
+    if let Some(op) = OPERATION.captures(text) {
+        let _ = write!(summary, "; operation {}", &op[1]);
+    }
+    if let Some(status) = STATUS.captures(text) {
+        let _ = write!(summary, "; HTTP {}", &status[1]);
+    }
+    if let Some(code) = CODE.captures(text) {
+        let _ = write!(summary, "; code {}", &code[1]);
+    }
+    summary.push_str("; provider message not kept: this run did not hold the replacement");
+    let summary = crate::redact::redact(&summary).into_owned();
+    match summary.char_indices().nth(SUMMARY_MAX) {
+        Some((end, _)) => summary[..end].to_owned(),
+        None => summary,
     }
 }
 
@@ -2604,6 +2715,7 @@ mod tests {
             blockers: Vec::new(),
             step: Step::Planned,
             sources: Vec::new(),
+            recorded: None,
         }
     }
 
@@ -2990,6 +3102,122 @@ mod tests {
             }
             assert!(!state.contains(&replacement), "{kind}: in the state record");
         }
+    }
+
+    fn two_hours_later() -> OffsetDateTime {
+        OffsetDateTime::now_utc() + time::Duration::hours(2)
+    }
+
+    /// SHA-294 T5 (AC5): a revoke resumed by a new executor after the
+    /// overlap window, which never held the replacement, keeps only the
+    /// safe summary of an error that echoes it, in the result, the audit
+    /// entry and `revoke_instructions`.
+    #[tokio::test]
+    async fn resumed_revoke_keeps_only_a_safe_summary() {
+        let cases = [
+            ("unsupported", "sha294unsupported", Step::RevokeManual),
+            ("permanent", "sha294permanent", Step::Failed),
+        ];
+        for (kind, name, step) in cases {
+            let value = format!("npm_apply_unit_resume_{kind}");
+            let replacement = format!("npm_{name}-replacement-1");
+            let mut f = fixture(&value, MockProvider::new(name));
+            let plan = plan(&mut f, &value, "1h").await;
+            let first = run(&mut f, &plan).await;
+            assert!(
+                matches!(first.result, RunResult::PendingRevoke { .. }),
+                "{kind}: {first:?}"
+            );
+            let echo = format!(
+                "DELETE /-/npm/v1/tokens/token: npm returned 403: E403 the new key {replacement} stays live"
+            );
+            let error = match kind {
+                "unsupported" => ProviderError::Unsupported(echo),
+                _ => ProviderError::Permanent(echo),
+            };
+            f.provider.fail_always("revoke", error);
+            let outcome = {
+                let mut executor =
+                    Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit)
+                        .with_clock(two_hours_later);
+                executor.run(&plan.rotations[0]).await
+            };
+            let stored = f.store.get(&outcome.rotation_id).unwrap().clone();
+            assert_eq!(stored.step, step, "{kind}");
+            let summary = format!(
+                "{name} revoke {}; operation DELETE /-/npm/v1/tokens/token; HTTP 403; code E403; provider message not kept",
+                match kind {
+                    "unsupported" => "not supported by the provider",
+                    _ => "failed",
+                }
+            );
+            let audit = last_audit(&f);
+            let texts = [
+                format!("{:?}", outcome.result),
+                audit.error.as_ref().unwrap().as_str().to_owned(),
+                stored.revoke_instructions.clone().unwrap_or_default(),
+                serde_json::to_string(&stored).unwrap(),
+            ];
+            for (i, text) in texts.iter().enumerate() {
+                assert!(
+                    !text.contains(&replacement),
+                    "{kind} {i}: the replacement leaked"
+                );
+                assert!(
+                    !text.contains("stays live"),
+                    "{kind} {i}: upstream text kept"
+                );
+                if i < 2 || step == Step::RevokeManual {
+                    assert!(text.contains(&summary), "{kind} {i}: {text}");
+                }
+            }
+        }
+    }
+
+    /// SHA-294 T5: the summary keeps the operation, status and an
+    /// allowlisted code only, is redacted and at most 200 characters.
+    #[test]
+    fn revoke_error_summary_format() {
+        let echo = "npm_npmreplacement-xyz";
+        let cases = [
+            (
+                ProviderError::Permanent(format!(
+                    "iam:UpdateAccessKey: AccessDenied (HTTP 403) {echo}"
+                )),
+                "aws revoke failed; operation iam:UpdateAccessKey; HTTP 403; code AccessDenied; ",
+            ),
+            (
+                ProviderError::Transient(format!(
+                    "DELETE /v1/organization/projects/{{id}}/api_keys/{{key_id}}: OpenAI returned 503 (server_error) {echo}"
+                )),
+                "aws revoke transient failure; operation DELETE /v1/organization/projects/{id}/api_keys/{key_id}; HTTP 503; code server_error; ",
+            ),
+            (
+                ProviderError::Permanent(format!("POST /credentials/revoke: GitHub returned 422: {echo}")),
+                "aws revoke failed; operation POST /credentials/revoke; HTTP 422; provider",
+            ),
+            (
+                ProviderError::Permanent(format!("{echo}: refused")),
+                "aws revoke failed; provider message not kept",
+            ),
+            (
+                ProviderError::RateLimited { retry_after: None },
+                "aws revoke rate limited; provider",
+            ),
+        ];
+        for (err, start) in cases {
+            let summary = revoke_error_summary("aws", &err);
+            assert!(summary.starts_with(start), "{summary}");
+            assert!(!summary.contains(echo), "{summary}");
+            assert!(summary.chars().count() <= SUMMARY_MAX, "{summary}");
+        }
+        let long = ProviderError::Permanent(format!("{}: x", "a".repeat(500)));
+        assert!(
+            revoke_error_summary(&"p".repeat(300), &long)
+                .chars()
+                .count()
+                == SUMMARY_MAX
+        );
     }
 
     // T7 (AC7)

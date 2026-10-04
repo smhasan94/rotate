@@ -74,8 +74,8 @@ providers:
 ```
 
 Actions secrets are matched by name: by default `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY` for an AWS key, `GITHUB_TOKEN`, `GH_TOKEN` or
-`GH_PAT` for a GitHub token, `NPM_TOKEN` for an npm token and
+`AWS_SECRET_ACCESS_KEY` for an AWS key, `GH_TOKEN` or `GH_PAT` for a
+GitHub token, `NPM_TOKEN` for an npm token and
 `OPENAI_API_KEY` for an OpenAI key. Secrets Manager entries are matched by
 value. [config.md](config.md) lists every field, the name conventions and
 how to add your own names.
@@ -286,13 +286,19 @@ rotate status
 
 Re-run the same apply after that time to revoke the old secret. Before
 then a re-run makes no state-changing call and exits 3 again. The recorded
-time is kept: a different `--overlap` on the re-run does not move it.
+time is kept: a different `--overlap` on the re-run does not move it. The
+re-run's plan shows that time and what is left of it on the `overlap:`
+row, and lists every consumer the first run recorded, marked
+`(recorded)`, including one matched by value that now holds the
+replacement.
 
 <!-- test: overlap -->
 ```sh
 rotate apply trufflehog-report.json --confirm rot-5f36d3cd
 # exit: 3
 # expect: 1 pending revoke
+# expect: recorded by an earlier run
+# expect: updated (recorded)
 ```
 
 For a short window, `--wait` waits in the same run and then revokes. If it
@@ -345,7 +351,9 @@ rotate status --all
 the state file and the audit log only: no network call, no write, no lock.
 Each row has the rotation id, provider, fingerprint, step, time since the
 last update, consumers updated, the revoke time for a pending revoke, and a
-hint saying what to do next. `--all` also lists finished rotations
+hint saying what to do next. A rotation whose last step failed gets a
+`last error` line under its row; a pending revoke is waiting, not failing,
+so it has only its hint. `--all` also lists finished rotations
 (`revoked`, `rolled_back`). `--json` prints the rows as JSON
 ([status-schema.json](status-schema.json)).
 
