@@ -94,7 +94,34 @@
         "revoke_action": { "type": "string" },
         "overlap_window": { "$ref": "#/$defs/duration" },
         "blockers": { "type": "array", "items": { "type": "string" } },
-        "sources": { "$ref": "#/$defs/sources" }
+        "sources": { "$ref": "#/$defs/sources" },
+        "recorded": {
+          "description": "What an earlier run recorded for this rotation in the state file (SHA-294): every consumer it touched, with the recorded status, and the revoke time. Null for a new rotation. A consumer here may be missing from consumers, for example a Secrets Manager entry matched by value that now holds the replacement. At state pending_revoke, apply keeps revoke_not_before rather than this run's overlap_window.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["revoke_not_before", "consumers"],
+              "properties": {
+                "revoke_not_before": { "type": ["string", "null"], "format": "date-time" },
+                "consumers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["consumer", "consumer_ref", "status"],
+                    "properties": {
+                      "consumer": { "type": "string" },
+                      "consumer_ref": { "type": "string" },
+                      "status": { "enum": ["updated", "failed", "skipped", "restored"] }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
       }
     },
     "skipped": {

@@ -36,7 +36,7 @@ consumers:
       - org:acme
     # Secret names to check in addition to each provider's convention:
     #   aws:    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-    #   github: GITHUB_TOKEN, GH_TOKEN, GH_PAT
+    #   github: GH_TOKEN, GH_PAT
     #   npm:    NPM_TOKEN
     #   openai: OPENAI_API_KEY
     # secret_names hold the token or the secret half of a key pair.

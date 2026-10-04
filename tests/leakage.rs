@@ -21,6 +21,10 @@
 //! SHA-293 adds the revoke-by-hand runs (`revoke_manual`, its `status`
 //! hint and the re-runs) and `plan --check-permissions` with probe errors
 //! that echo the operator's AWS secret and GitHub token.
+//!
+//! SHA-294 adds a revoke resumed in a new process (after the overlap
+//! window, and `--wait`) whose error echoes the replacement, and a re-run
+//! of apply while the overlap window of the real AWS plugin is open.
 
 #![cfg(all(unix, feature = "test-providers", feature = "test-commands"))]
 
@@ -839,6 +843,119 @@ fn sha293_t1_revoke_manual_then_rollback() {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-294 T3, T5, T7 (AC3, AC5): a revoke resumed in a new process
+// ---------------------------------------------------------------------------
+
+/// A revoke error as npm's would read, echoing the replacement (which no
+/// redactor pattern matches) and the old secret.
+fn echoing_revoke_error(run: &MockRun) -> String {
+    format!(
+        "DELETE /-/npm/v1/tokens/token: npm returned 403: E403 refused {}; keep {MOCK_REPLACEMENT}",
+        run.old
+    )
+}
+
+/// The safe summary a resumed revoke keeps of [`echoing_revoke_error`].
+fn resumed_summary(kind: &str) -> String {
+    format!(
+        "npm revoke {kind}; operation DELETE /-/npm/v1/tokens/token; HTTP 403; code E403; \
+         provider message not kept: this run did not hold the replacement"
+    )
+}
+
+/// The revoke failing (`fail`, exit 1) or refused (`unsupported`, exit
+/// 4) in a process that never held the replacement: after the overlap
+/// window (the clock moved on), and with `--wait` in a new process. Only
+/// the safe summary reaches stdout, the state file and the audit log, and
+/// `status` shows the pending revoke as a hint, then the real failure as
+/// the last error.
+#[test]
+fn sha294_t5_resumed_revoke_keeps_only_a_safe_summary() {
+    for (how, resume) in [
+        ("fail", "after"),
+        ("unsupported", "after"),
+        ("fail", "wait"),
+        ("unsupported", "wait"),
+    ] {
+        let mut run = MockRun::new();
+        let id = run.planned_id();
+        let overlap = if resume == "wait" { "2s" } else { "1h" };
+        run.expect(
+            3,
+            &["--overlap", overlap, "apply", "--stdin", "--confirm", &id],
+        );
+        assert_eq!(run.step(&id), "pending_revoke", "{how} {resume}");
+
+        // AC3: waiting is a hint, not a last error.
+        let status = run.expect(3, &["status"]);
+        let table = text(&status.stdout);
+        assert!(!table.contains("last error"), "{how} {resume}: {table}");
+        assert!(table.contains("re-run `rotate apply` after"), "{table}");
+        let rows: Value =
+            serde_json::from_slice(&run.expect(3, &["--json", "status"]).stdout).unwrap();
+        assert_eq!(rows[0]["error"], Value::Null, "{rows}");
+
+        let said = echoing_revoke_error(&run);
+        run.set(|s| {
+            s["providers"] = match how {
+                "fail" => json!({ "npm": { "fail": { "revoke": said } } }),
+                _ => json!({ "npm": { "unsupported": { "revoke": said } } }),
+            };
+            if resume == "after" {
+                s["clock_offset_secs"] = json!(7200);
+            }
+        });
+        let args: Vec<&str> = match resume {
+            "wait" => vec!["apply", "--stdin", "--confirm", &id, "--wait"],
+            _ => vec!["apply", "--stdin", "--confirm", &id],
+        };
+        let (code, step, kind) = match how {
+            "fail" => (1, "failed", "failed"),
+            _ => (4, "revoke_manual", "not supported by the provider"),
+        };
+        let output = run.expect(code, &args);
+        assert_eq!(run.step(&id), step, "{how} {resume}");
+        let summary = resumed_summary(kind);
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.contains(&summary),
+            "{how} {resume}: {}",
+            shown(&output)
+        );
+        assert!(
+            !stdout.contains("refused"),
+            "{how} {resume}: upstream text kept"
+        );
+
+        let state = std::fs::read_to_string(run.work().join(".rotate/state.json")).unwrap();
+        assert!(!state.contains("refused"), "{how} {resume}: {state}");
+        if how == "unsupported" {
+            assert!(state.contains(&summary), "{how} {resume}: {state}");
+        }
+        let audit = std::fs::read_to_string(run.work().join(".rotate/audit.jsonl")).unwrap();
+        let last: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(last["step"], "revoke", "{last}");
+        let error = last["error"].as_str().unwrap();
+        assert!(error.contains(&summary), "{how} {resume}: {error}");
+        assert!(
+            !audit.contains("refused"),
+            "{how} {resume}: upstream text in the audit log"
+        );
+
+        // AC3: a revoke that really failed is still the last error.
+        let status = run.expect(3, &["status"]);
+        let table = text(&status.stdout);
+        if how == "fail" {
+            assert!(table.contains("last error (revoke"), "{table}");
+            assert!(table.contains(&summary), "{table}");
+        } else {
+            assert!(table.contains("revoke by hand"), "{table}");
+        }
+        run.expect(3, &["--json", "status", "--all"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Real plugins (tests/e2e)
 // ---------------------------------------------------------------------------
 
@@ -978,6 +1095,106 @@ async fn t1_real_plugins_plan_apply_status() {
     let files = assert_private_state(run.e2e.path());
     assert!(files.contains(&"state.json".to_owned()), "{files:?}");
     assert!(files.contains(&"audit.jsonl".to_owned()), "{files:?}");
+}
+
+/// SHA-294 T2 (AC2), T3 (AC3), T7: the real AWS plugin with its two
+/// Actions secrets and the Secrets Manager entry. After apply records a
+/// pending revoke (exit 3), plan and a second apply (default overlap, 0s)
+/// show no two-key warning for the rotation's own replacement, all three
+/// recorded consumers and the recorded revoke time, and apply exits 3
+/// again; `status` shows the wait as a hint only. Then, with the clock
+/// past the window, apply revokes.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha294_t2_reapply_during_the_overlap_window() {
+    let run = RealRun::start().await;
+    let id = run.rotation_id();
+    run.expect(
+        3,
+        &[
+            "--overlap",
+            "1h",
+            "apply",
+            "report.ndjson",
+            "--confirm",
+            &id,
+        ],
+    );
+    assert_eq!(run.e2e.rotation(&id)["step"], "pending_revoke");
+    let refs = [
+        e2e::PAIR_REF.to_owned(),
+        format!("github-actions:{}:{}", e2e::REPO, e2e::GH_KEY_ID_NAME),
+        format!("github-actions:{}:{}", e2e::REPO, e2e::GH_SECRET_NAME),
+    ];
+    let check = |table: &str, label: &str| {
+        assert!(!table.contains("access keys ("), "{label}: {table}");
+        assert!(
+            !table.contains("will not create a replacement"),
+            "{label}: {table}"
+        );
+        assert!(!table.contains("warning:"), "{label}: {table}");
+        for consumer_ref in &refs {
+            let row = table
+                .lines()
+                .find(|l| {
+                    l.contains(consumer_ref.as_str()) && !l.contains(&format!("{consumer_ref}_"))
+                })
+                .unwrap_or_else(|| panic!("{label}: no row for {consumer_ref}: {table}"));
+            assert!(row.contains("updated (recorded)"), "{label}: {row}");
+        }
+        let overlap = table
+            .lines()
+            .find(|l| l.trim_start().starts_with("overlap:"))
+            .unwrap();
+        assert!(
+            overlap.contains("recorded by an earlier run"),
+            "{label}: {overlap}"
+        );
+        assert!(
+            overlap.contains("(in 5") || overlap.contains("(in 1h"),
+            "{label}: {overlap}"
+        );
+    };
+    let plan = run.expect(0, &["plan", "report.ndjson"]);
+    check(&text(&plan.stdout), "plan");
+    let json = run.expect(0, &["--json", "plan", "report.ndjson"]);
+    let json: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let recorded = &json["rotations"][0]["recorded"];
+    assert_eq!(recorded["consumers"].as_array().unwrap().len(), 3, "{json}");
+    assert!(recorded["revoke_not_before"].is_string(), "{json}");
+    let own = format!("replacement: {}, created by rotation {id}", run.e2e.new_id);
+    let lines = json["rotations"][0]["scope"]["lines"].as_array().unwrap();
+    assert!(lines.iter().any(|l| l == &json!(own)), "{json}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.as_str().unwrap().starts_with("warning: ")),
+        "{json}"
+    );
+
+    let again = run.expect(3, &["apply", "report.ndjson", "--confirm", &id]);
+    check(&text(&again.stdout), "apply");
+    assert!(
+        text(&again.stdout).contains("1 pending revoke"),
+        "{}",
+        shown(&again)
+    );
+    assert_eq!(run.e2e.model.count("CreateAccessKey"), 1);
+    assert_eq!(run.e2e.model.count("UpdateAccessKey"), 0);
+
+    let status = run.expect(3, &["status"]);
+    let table = text(&status.stdout);
+    assert!(!table.contains("last error"), "{table}");
+    assert!(table.contains("re-run `rotate apply` after"), "{table}");
+    run.expect(3, &["--json", "status"]);
+
+    // Past the window: the revoke happens.
+    let scenario = json!({ "real_plugins": true, "prompt": "panic", "clock_offset_secs": 7200 });
+    std::fs::write(run.e2e.file("scenario.json"), scenario.to_string()).unwrap();
+    run.expect(0, &["apply", "report.ndjson", "--confirm", &id]);
+    assert_eq!(run.e2e.rotation(&id)["step"], "revoked");
+    assert_eq!(run.e2e.model.status(&run.e2e.leaked.id), Some("Inactive"));
+    run.expect(0, &["status", "--all"]);
+    run.assert_requests_clean().await;
 }
 
 // T1 (AC1): a consumer update denied at each consumer stops before revoke;

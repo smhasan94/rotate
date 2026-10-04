@@ -598,3 +598,33 @@ fn t4_security_doc_states_the_four_guarantees_and_limits() {
         "the limits do not mention memory dumps"
     );
 }
+
+/// SHA-294 T4 (AC4): the name convention table in docs/config.md is the
+/// one `consumer_names` uses, so a name dropped from the code (such as
+/// `GITHUB_TOKEN`, which GitHub rejects as an Actions secret name) is
+/// dropped from the docs too.
+#[test]
+fn t4_name_convention_table_matches_the_code() {
+    let section = CONFIG
+        .split("\n## Name conventions\n")
+        .nth(1)
+        .expect("docs/config.md has no \"## Name conventions\" heading");
+    let section = section.split("\n## ").next().unwrap();
+    let name = Regex::new(r"`([A-Z0-9_]+)`").unwrap();
+    let names =
+        |cell: &str| -> Vec<String> { name.captures_iter(cell).map(|c| c[1].to_owned()).collect() };
+    let mut rows = 0;
+    for line in section.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // `| provider | secret names | key id names |` rows only.
+        if cells.len() != 5 || !cells[1].starts_with('`') {
+            continue;
+        }
+        let provider = cells[1].trim_matches('`');
+        let code = rotate::plan::consumer_names(provider, &ConsumersConfig::default());
+        assert_eq!(names(cells[2]), code.secret, "{provider} secret names");
+        assert_eq!(names(cells[3]), code.key_id, "{provider} key id names");
+        rows += 1;
+    }
+    assert_eq!(rows, 4, "one row per provider");
+}

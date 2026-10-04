@@ -356,7 +356,7 @@ owner. The backlog in `docs/backlog.md` is built on these.
   is in the Later epic. (Ticket SHA-196.)
 - D4. Consumers are matched by a per-provider name convention plus explicit
   mappings in `rotate.yaml`: Actions secrets `AWS_ACCESS_KEY_ID` and
-  `AWS_SECRET_ACCESS_KEY` (AWS), `GITHUB_TOKEN`, `GH_TOKEN` or `GH_PAT`
+  `AWS_SECRET_ACCESS_KEY` (AWS), `GH_TOKEN` or `GH_PAT`
   (GitHub), `NPM_TOKEN` (npm), `OPENAI_API_KEY` (OpenAI), across the repos and
   orgs listed in `rotate.yaml`. Secrets Manager entries are matched by value
   fingerprint. Actions secrets are always "matched by name" because their

@@ -21,9 +21,11 @@ use crate::consumer::{ConsumerMatch, ConsumerRegistry, Holds, MatchMethod, Secre
 use crate::finding::SourceLocation;
 use crate::provider::{Credential, ProviderRegistry, ReplacementMode, Scope, Validity};
 use crate::secret::Fingerprint;
-use crate::state::Step;
+use crate::state::{ConsumerState, ConsumerStatus, Step};
 #[cfg(unix)]
 use crate::state::{Rotation, StateError, StateStore};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// Version of the `--json` document; bumped on any incompatible change to
 /// `docs/plan-schema.json`.
@@ -112,6 +114,21 @@ pub struct PlannedRotation {
     pub step: Step,
     /// Every location that held the secret.
     pub sources: Vec<SourceLocation>,
+    /// What an earlier run recorded for this rotation (SHA-294), set by
+    /// [`assign_ids`] when it keeps a stored id. `None` for a new rotation.
+    pub recorded: Option<Recorded>,
+}
+
+/// The part of a stored rotation the plan shows on a re-run (SHA-294):
+/// the consumers an earlier run touched, which the plan's own `find` may
+/// no longer match (a consumer matched by value now holds the
+/// replacement), and the revoke time it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    /// Every consumer the rotation recorded, with its recorded status.
+    pub consumers: Vec<ConsumerState>,
+    /// Earliest revoke time, as recorded.
+    pub revoke_not_before: Option<OffsetDateTime>,
 }
 
 /// One consumer match, with the plugin that found it.
@@ -184,7 +201,9 @@ fn provider_name(provider: &str) -> Option<ProviderName> {
 pub fn consumer_names(provider: &str, config: &ConsumersConfig) -> ConsumerNames {
     let (secret, key_id): (&[&str], &[&str]) = match provider_name(provider) {
         Some(ProviderName::Aws) => (&["AWS_SECRET_ACCESS_KEY"], &["AWS_ACCESS_KEY_ID"]),
-        Some(ProviderName::Github) => (&["GITHUB_TOKEN", "GH_TOKEN", "GH_PAT"], &[]),
+        // No GITHUB_TOKEN: GitHub rejects Actions secret names starting with
+        // GITHUB_, so it could never match.
+        Some(ProviderName::Github) => (&["GH_TOKEN", "GH_PAT"], &[]),
         Some(ProviderName::Npm) => (&["NPM_TOKEN"], &[]),
         Some(ProviderName::Openai) => (&["OPENAI_API_KEY"], &[]),
         None => (&[], &[]),
@@ -249,6 +268,55 @@ impl PlannedRotation {
         match self.replacement_mode {
             ReplacementMode::Automatic => self.scope_widening,
             ReplacementMode::Manual => None,
+        }
+    }
+
+    /// The status an earlier run recorded for `consumer_ref` (SHA-294).
+    pub fn recorded_status(&self, consumer_ref: &str) -> Option<ConsumerStatus> {
+        self.recorded
+            .as_ref()?
+            .consumers
+            .iter()
+            .find(|c| c.consumer_ref == consumer_ref)
+            .map(|c| c.status)
+    }
+
+    /// Consumers an earlier run recorded that this plan's `find` did not
+    /// match (SHA-294), for example a Secrets Manager entry matched by value
+    /// that now holds the replacement.
+    pub fn recorded_only(&self) -> impl Iterator<Item = &ConsumerState> {
+        self.recorded.iter().flat_map(|r| &r.consumers).filter(|c| {
+            !self
+                .consumers
+                .iter()
+                .any(|p| p.found.consumer_ref == c.consumer_ref)
+        })
+    }
+
+    /// The revoke time an earlier run recorded, while the rotation waits
+    /// for it at `pending_revoke` (SHA-294). Apply keeps that time rather
+    /// than the overlap window of this run.
+    pub fn recorded_revoke_time(&self) -> Option<OffsetDateTime> {
+        if self.step != Step::PendingRevoke {
+            return None;
+        }
+        self.recorded.as_ref()?.revoke_not_before
+    }
+
+    /// The `overlap:` row at `now`: the window of this run, or for a
+    /// pending revoke the recorded time and what is left of it (SHA-294).
+    pub fn overlap_text(&self, now: OffsetDateTime) -> String {
+        match self.recorded_revoke_time() {
+            Some(at) if at > now => format!(
+                "revoke after {} (in {}; recorded by an earlier run)",
+                rfc3339(at),
+                crate::apply::remaining_text(at - now)
+            ),
+            Some(at) => format!(
+                "window over at {} (recorded by an earlier run); apply revokes now",
+                rfc3339(at)
+            ),
+            None => self.overlap_window.to_string(),
         }
     }
 
@@ -383,6 +451,7 @@ pub async fn build(
             blockers: Vec::new(),
             step: Step::Planned,
             sources: item.sources,
+            recorded: None,
         };
         rotation.blockers = blockers(&rotation);
         if manual_revoke.is_some() {
@@ -435,10 +504,9 @@ pub fn assign_ids(plan: &mut Plan, store: &mut StateStore) -> Result<(), StateEr
                     && r.fingerprint == rotation.fingerprint
             })
             .max_by_key(|r| r.updated_at)
-            .map(|r| (r.rotation_id.clone(), r.step));
-        if let Some((id, step)) = existing {
-            rotation.rotation_id = id;
-            rotation.step = step;
+            .cloned();
+        if let Some(record) = existing {
+            adopt(rotation, record);
             continue;
         }
         let id = mint_id(&rotation.fingerprint, |id| store.get(id).is_some());
@@ -451,6 +519,37 @@ pub fn assign_ids(plan: &mut Plan, store: &mut StateStore) -> Result<(), StateEr
         rotation.step = Step::Planned;
     }
     Ok(())
+}
+
+/// Carries the stored `record` onto the plan's `rotation` (SHA-294): its
+/// id, step, consumers and revoke time. Once the record has a replacement,
+/// a provider warning that names it (AWS: both key slots used, one of them
+/// by this rotation's own replacement) is about a create that will not
+/// happen again, so it becomes a plain scope line.
+#[cfg(unix)]
+fn adopt(rotation: &mut PlannedRotation, record: Rotation) {
+    if let (Some(replacement), Some(scope)) = (&record.replacement_ref, &mut rotation.scope) {
+        if !replacement.is_empty() {
+            let mut own = false;
+            scope.lines.retain(|line| {
+                let names_it = line.starts_with("warning: ") && line.contains(replacement.as_str());
+                own |= names_it;
+                !names_it
+            });
+            if own {
+                scope.lines.push(format!(
+                    "replacement: {replacement}, created by rotation {}",
+                    record.rotation_id
+                ));
+            }
+        }
+    }
+    rotation.rotation_id = record.rotation_id;
+    rotation.step = record.step;
+    rotation.recorded = Some(Recorded {
+        consumers: record.consumers,
+        revoke_not_before: record.revoke_not_before,
+    });
 }
 
 /// A fresh `rot-` id with 8 hex characters, not yet in use.
@@ -559,8 +658,6 @@ pub fn split_already_rotated(
     rotations: &[Rotation],
     providers: &ProviderRegistry,
 ) -> (Vec<crate::finding::Finding>, Vec<Skipped>) {
-    use time::format_description::well_known::Rfc3339;
-
     let mut kept = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
     for finding in findings {
@@ -594,6 +691,20 @@ pub fn split_already_rotated(
         });
     }
     (kept, skipped)
+}
+
+fn rfc3339(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339).unwrap_or_else(|_| at.to_string())
+}
+
+/// The snake_case name of a recorded consumer status.
+fn status_name(status: ConsumerStatus) -> &'static str {
+    match status {
+        ConsumerStatus::Updated => "updated",
+        ConsumerStatus::Failed => "failed",
+        ConsumerStatus::Skipped => "skipped",
+        ConsumerStatus::Restored => "restored",
+    }
 }
 
 fn match_name(method: MatchMethod) -> &'static str {
@@ -658,6 +769,10 @@ pub fn render_apply_table(plan: &Plan) -> String {
 }
 
 fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
+    render_at(plan, title, note, OffsetDateTime::now_utc())
+}
+
+fn render_at(plan: &Plan, title: &str, note: &str, now: OffsetDateTime) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -699,7 +814,10 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
         if let Some(note) = r.widens_scope() {
             let _ = writeln!(out, "  scope widening: {note}");
         }
-        if r.consumers.is_empty() && r.lookup_errors.is_empty() {
+        if r.consumers.is_empty()
+            && r.lookup_errors.is_empty()
+            && r.recorded_only().next().is_none()
+        {
             field(&mut out, "consumers:", "none found");
         } else {
             out.push_str("  consumers:\n");
@@ -707,9 +825,15 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
                 .consumers
                 .iter()
                 .map(|c| {
-                    let action = match &c.found.updatable {
+                    let planned = match &c.found.updatable {
                         Ok(()) => "update".to_owned(),
                         Err(blocked) => format!("cannot update: {blocked}"),
+                    };
+                    // SHA-294: on a re-run, what the earlier run recorded.
+                    let action = match r.recorded_status(&c.found.consumer_ref) {
+                        Some(ConsumerStatus::Updated) => "updated (recorded)".to_owned(),
+                        Some(status) => format!("{planned} (recorded: {})", status_name(status)),
+                        None => planned,
                     };
                     vec![
                         c.consumer.to_owned(),
@@ -719,6 +843,14 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
                     ]
                 })
                 .collect();
+            rows.extend(r.recorded_only().map(|c| {
+                vec![
+                    c.consumer.clone(),
+                    c.consumer_ref.clone(),
+                    "recorded".to_owned(),
+                    format!("{} (recorded)", status_name(c.status)),
+                ]
+            }));
             rows.extend(r.lookup_errors.iter().map(|e| {
                 vec![
                     e.consumer.to_owned(),
@@ -730,7 +862,7 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
             out.push_str(&columns(&rows, "    "));
         }
         field(&mut out, "revoke:", r.revoke_action);
-        field(&mut out, "overlap:", &r.overlap_window.to_string());
+        field(&mut out, "overlap:", &r.overlap_text(now));
         if !r.blockers.is_empty() {
             out.push_str("  blockers:\n");
             for blocker in &r.blockers {
@@ -799,6 +931,22 @@ struct RotationView<'a> {
     overlap_window: String,
     blockers: &'a [String],
     sources: Vec<String>,
+    recorded: Option<RecordedView<'a>>,
+}
+
+/// What an earlier run recorded (SHA-294); null for a new rotation.
+#[derive(Serialize)]
+struct RecordedView<'a> {
+    #[serde(with = "time::serde::rfc3339::option")]
+    revoke_not_before: Option<OffsetDateTime>,
+    consumers: Vec<RecordedConsumerView<'a>>,
+}
+
+#[derive(Serialize)]
+struct RecordedConsumerView<'a> {
+    consumer: &'a str,
+    consumer_ref: &'a str,
+    status: &'static str,
 }
 
 #[derive(Serialize)]
@@ -894,6 +1042,18 @@ pub fn render_json(plan: &Plan) -> String {
                 overlap_window: r.overlap_window.to_string(),
                 blockers: &r.blockers,
                 sources: r.sources.iter().map(ToString::to_string).collect(),
+                recorded: r.recorded.as_ref().map(|rec| RecordedView {
+                    revoke_not_before: rec.revoke_not_before,
+                    consumers: rec
+                        .consumers
+                        .iter()
+                        .map(|c| RecordedConsumerView {
+                            consumer: &c.consumer,
+                            consumer_ref: &c.consumer_ref,
+                            status: status_name(c.status),
+                        })
+                        .collect(),
+                }),
             })
             .collect(),
         skipped: plan
@@ -1074,6 +1234,15 @@ mod tests {
         log.assert_no_mutations();
     }
 
+    /// SHA-294 T4 covers AC4: GitHub rejects Actions secret names starting
+    /// with `GITHUB_`, so the convention never offers one; `GH_TOKEN` stays.
+    #[test]
+    fn github_convention_has_no_github_prefixed_name() {
+        let names = consumer_names("github", &ConsumersConfig::default());
+        assert!(names.secret.iter().any(|n| n == "GH_TOKEN"));
+        assert!(names.all().all(|n| !n.starts_with("GITHUB_")), "{names:?}");
+    }
+
     #[test]
     fn consumer_names_merges_convention_and_config() {
         let mut config = ConsumersConfig::default();
@@ -1091,7 +1260,7 @@ mod tests {
         assert_eq!(names.key_id, ["AWS_ACCESS_KEY_ID", "DEPLOY_KEY_ID"]);
         assert_eq!(
             consumer_names("github", &config).secret,
-            ["GITHUB_TOKEN", "GH_TOKEN", "GH_PAT"]
+            ["GH_TOKEN", "GH_PAT"]
         );
         assert_eq!(consumer_names("npm", &config).secret, ["NPM_TOKEN"]);
         assert_eq!(consumer_names("openai", &config).secret, ["OPENAI_API_KEY"]);
@@ -1143,6 +1312,79 @@ mod tests {
         assert_eq!(store.get(&ids[0]).unwrap().step, Step::Created);
         assert_eq!(second.rotations[1].step, Step::Planned);
         assert!(render_table(&second).contains("in progress at step created"));
+        log.assert_no_mutations();
+    }
+
+    /// SHA-294 T2 (AC2), unit half: a re-plan of a rotation at
+    /// `pending_revoke` drops the provider warning naming its own
+    /// replacement, lists every recorded consumer and shows the recorded
+    /// revoke time instead of this run's window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replan_of_pending_revoke_shows_what_was_recorded() {
+        let log = CallLog::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".rotate/state.json");
+        let provider = || MockProvider::new("npm").identify_prefix("npm_");
+        let values = ["npm_plan_unit_replan_pending"];
+        let mut first = plan_for(&values, provider(), vec![], &log).await;
+        let id = {
+            let mut store = StateStore::open(&path).unwrap();
+            assign_ids(&mut first, &mut store).unwrap();
+            first.rotations[0].rotation_id.clone()
+        };
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            let mut stored = store.get(&id).unwrap().clone();
+            stored.step = Step::PendingRevoke;
+            stored.replacement_ref = Some("KEYNEW".into());
+            stored.revoke_not_before = Some(now + time::Duration::minutes(30));
+            stored.consumers = vec![ConsumerState {
+                consumer: "aws-secrets-manager".into(),
+                consumer_ref: "sm:prod/app".into(),
+                status: ConsumerStatus::Updated,
+                holds: None,
+            }];
+            store.upsert(stored).unwrap();
+        }
+
+        let mut second = plan_for(&values, provider(), vec![], &log).await;
+        second.rotations[0].scope = Some(Scope {
+            identity: crate::provider::Identity("user/bot".into()),
+            lines: vec![
+                "access keys: 2 of 2 used".into(),
+                "warning: user bot already has 2 access keys (KEYOLD; KEYNEW)".into(),
+                "warning: something else".into(),
+            ],
+        });
+        let mut store = StateStore::open(&path).unwrap();
+        assign_ids(&mut second, &mut store).unwrap();
+        let r = &second.rotations[0];
+        assert_eq!(r.step, Step::PendingRevoke);
+        let lines = &r.scope.as_ref().unwrap().lines;
+        assert!(!lines.iter().any(|l| l.contains("KEYOLD")), "{lines:?}");
+        assert!(lines.contains(&"warning: something else".to_owned()));
+        assert!(lines.contains(&format!("replacement: KEYNEW, created by rotation {id}")));
+
+        let table = render_at(&second, "Plan", "", now);
+        assert!(!table.contains("already has 2 access keys"), "{table}");
+        assert!(table.contains("warning:      something else"), "{table}");
+        assert!(
+            table.contains("sm:prod/app  recorded  updated (recorded)"),
+            "{table}"
+        );
+        assert!(
+            table.contains("(in 30m 0s; recorded by an earlier run)"),
+            "{table}"
+        );
+        assert!(!table.contains("overlap:      0s"), "{table}");
+        let json: serde_json::Value = serde_json::from_str(&render_json(&second)).unwrap();
+        let recorded = &json["rotations"][0]["recorded"];
+        assert_eq!(recorded["consumers"][0]["status"], "updated", "{json}");
+        assert!(recorded["revoke_not_before"].is_string(), "{json}");
+        // A new rotation has nothing recorded.
+        assert!(render_json(&first).contains("\"recorded\": null"));
         log.assert_no_mutations();
     }
 
