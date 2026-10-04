@@ -198,6 +198,26 @@ These hold for every change; a pull request that breaks one is not merged.
    to revoke a secret whose consumers could not all be updated, unless
    `--force` is given, and records the use of `--force` in the audit log.
 
+### How the acceptance test proves the MVP
+
+`tests/acceptance_mvp.rs` runs the release code path of the `rotate` binary
+(the real AWS provider, Secrets Manager consumer and GitHub Actions
+consumer) against one local wiremock server that models an AWS account and
+the Actions secrets of a repository. A TruffleHog report leaks an AWS key
+that one Secrets Manager entry and the repository's `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` secrets hold. The test shows that `rotate plan`
+lists the IAM user, all three consumer matches and the deactivate step
+while no state-changing request reaches the server; that `rotate apply`
+creates a new key, writes it to Secrets Manager and to both Actions
+secrets (the test decrypts each sealed `PUT` with the repository's private
+key), verifies it and then deactivates the old key; that the audit log has
+an `ok` entry for every step; and that neither secret access key nor the
+GitHub token appears in stdout, stderr, the trace log at `-vvv`, the audit
+log, the state file or any request other than the one that must carry it.
+It also covers a denied Actions write: the old key stays active, and the
+rotation is recovered with `rotate rollback` and a fresh apply. CI runs it
+on every pull request.
+
 ## Build from source
 
 Needs Rust stable (1.94.1 or newer).
