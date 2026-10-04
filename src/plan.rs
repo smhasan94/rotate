@@ -321,7 +321,7 @@ pub async fn build(
     plan
 }
 
-fn blockers(rotation: &PlannedRotation) -> Vec<String> {
+pub(crate) fn blockers(rotation: &PlannedRotation) -> Vec<String> {
     let mut blockers = Vec::new();
     let stuck = rotation.not_updatable().count();
     if stuck > 0 {

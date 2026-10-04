@@ -120,6 +120,26 @@ pub fn consumers_with(
     registry
 }
 
+/// The probes of `rotate plan --check-permissions` (SHA-270), configured
+/// like the real AWS provider and GitHub Actions consumer. `None` when a
+/// test scenario registers mocks instead: there is nothing real to probe.
+/// Makes no call.
+pub fn permission_checker(
+    config: &rotate::config::Config,
+) -> Option<rotate::permissions::PermissionChecker> {
+    #[cfg(feature = "test-providers")]
+    if !scenario::real_plugins() {
+        return None;
+    }
+    Some(rotate::permissions::PermissionChecker::new(
+        aws_provider(&config.providers.aws),
+        rotate::consumer::github_actions::GithubActionsConsumer::from_config(
+            &config.consumers,
+            &config.providers.github,
+        ),
+    ))
+}
+
 /// The confirmation prompt a test scenario scripts, if any. Without
 /// `test-providers` always `None`: apply reads the terminal.
 pub fn prompt() -> Option<Box<dyn Prompt>> {

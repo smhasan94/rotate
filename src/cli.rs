@@ -105,6 +105,20 @@ impl Default for InputArgs {
     }
 }
 
+/// Arguments of `rotate plan`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct PlanArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Also probe the operator's own permissions, read-only, and report
+    /// what is missing before apply: an IAM policy simulation for AWS and a
+    /// public-key read per GitHub Actions target (SHA-270). See
+    /// docs/permissions.md.
+    #[arg(long)]
+    pub check_permissions: bool,
+}
+
 /// Arguments of `rotate apply` (SHA-254).
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ApplyArgs {
@@ -175,7 +189,7 @@ pub struct StatusArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Show what would be created, updated and revoked. Makes no changes.
-    Plan(InputArgs),
+    Plan(PlanArgs),
     /// Create the replacement, update consumers, verify, then revoke.
     Apply(ApplyArgs),
     /// Restore consumers to the old secret, reactivate it where the
@@ -225,7 +239,7 @@ impl Command {
     /// The input arguments of a command that reads secrets.
     pub fn input(&self) -> Option<&InputArgs> {
         match self {
-            Command::Plan(input) => Some(input),
+            Command::Plan(args) => Some(&args.input),
             Command::Apply(args) => Some(&args.input),
             Command::Rollback(args) => Some(&args.input),
             Command::Status(_) => None,
@@ -240,7 +254,7 @@ impl Cli {
     pub fn subcommand(&self) -> Command {
         self.subcommand
             .clone()
-            .unwrap_or_else(|| Command::Plan(InputArgs::default()))
+            .unwrap_or_else(|| Command::Plan(PlanArgs::default()))
     }
 }
 
@@ -251,7 +265,21 @@ mod tests {
     #[test]
     fn no_subcommand_means_plan() {
         let cli = Cli::parse_from(["rotate"]);
-        assert_eq!(cli.subcommand(), Command::Plan(InputArgs::default()));
+        assert_eq!(cli.subcommand(), Command::Plan(PlanArgs::default()));
+    }
+
+    #[test]
+    fn plan_check_permissions_flag() {
+        let cli = Cli::parse_from(["rotate", "plan", "r.json", "--check-permissions"]);
+        let Command::Plan(args) = cli.subcommand() else {
+            panic!("not plan");
+        };
+        assert!(args.check_permissions);
+        assert_eq!(
+            args.input.report.as_deref(),
+            Some(std::path::Path::new("r.json"))
+        );
+        assert!(Cli::try_parse_from(["rotate", "apply", "--check-permissions"]).is_err());
     }
 
     #[test]
@@ -259,7 +287,7 @@ mod tests {
         let cli = Cli::parse_from(["rotate", "-vv", "--json"]);
         assert_eq!(cli.global.verbose, 2);
         assert!(cli.global.json);
-        assert_eq!(cli.subcommand(), Command::Plan(InputArgs::default()));
+        assert_eq!(cli.subcommand(), Command::Plan(PlanArgs::default()));
     }
 
     #[test]

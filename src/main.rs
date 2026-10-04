@@ -122,7 +122,10 @@ fn run(
             Err(exit) => return Ok(exit),
         };
         match &command {
-            Command::Plan(_) => return Ok(plan(console, findings, input, config, json)),
+            Command::Plan(args) => {
+                let check = args.check_permissions;
+                return Ok(plan(console, findings, input, config, json, check));
+            }
             Command::Apply(args) => return Ok(apply(console, findings, args, config)),
             Command::Rollback(args) => return Ok(rollback(console, findings, args, config)),
             _ => {}
@@ -238,13 +241,16 @@ fn build_plan(
 /// rotation in the state file. No state-changing remote call is made.
 /// Blockers and skipped rows are information, not failures: exit 0. A held
 /// or unusable state file exits 2 before any provider call; a plain I/O
-/// error writing it exits 1.
+/// error writing it exits 1. With `check_permissions`, read-only permission
+/// probes (SHA-270) add blockers and not-updatable reasons to the plan and
+/// print a warning for each probe that could not run.
 fn plan(
     console: &mut Console,
     findings: Vec<Finding>,
     input: &InputArgs,
     config: &Config,
     json: bool,
+    check_permissions: bool,
 ) -> Exit {
     let mut store = match StateStore::open(&config.state_file) {
         Ok(store) => store,
@@ -260,7 +266,7 @@ fn plan(
         Ok(runtime) => runtime,
         Err(exit) => return exit,
     };
-    let plan = match build_plan(
+    let mut plan = match build_plan(
         console,
         &runtime,
         findings,
@@ -273,6 +279,21 @@ fn plan(
         Err(exit) => return exit,
     };
     drop(store);
+    if check_permissions {
+        match providers::permission_checker(config) {
+            Some(checker) => {
+                for warning in runtime.block_on(checker.check(&mut plan)) {
+                    let _ = writeln!(console.err(), "warning: {warning}");
+                }
+            }
+            None => {
+                let _ = writeln!(
+                    console.err(),
+                    "warning: permissions not checked: no real plugins in this build"
+                );
+            }
+        }
+    }
     let rendered = if json {
         plan::render_json(&plan) + "\n"
     } else {

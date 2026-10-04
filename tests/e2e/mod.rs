@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Arc, Mutex};
@@ -66,6 +66,11 @@ pub fn user_arn() -> String {
     format!("arn:aws:iam::{ACCOUNT}:user/{USER}")
 }
 
+/// The IAM user the operator's credentials belong to.
+pub fn operator_arn() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:user/rotate-operator")
+}
+
 /// The JSON a Secrets Manager entry holds for a key pair.
 pub fn pair_json(id: &str, secret: &str) -> String {
     json!({
@@ -99,6 +104,14 @@ pub struct State {
     /// Every operation in order, as `Action` or the Secrets Manager target
     /// without its prefix.
     pub ops: Vec<String>,
+    /// The operator's IAM policy as a set of actions (`iam:CreateAccessKey`).
+    /// When set, every operator call outside it is denied and
+    /// `SimulatePrincipalPolicy` answers from it (SHA-270). When unset,
+    /// every operator call is allowed and the simulation is denied.
+    pub policy: Option<BTreeSet<String>>,
+    /// Every `SimulatePrincipalPolicy` request, as `(principal, actions,
+    /// resources)`.
+    pub simulations: Vec<(String, Vec<String>, Vec<String>)>,
 }
 
 /// An AWS account with one IAM user and one Secrets Manager entry.
@@ -115,6 +128,8 @@ impl AwsModel {
             tokens: BTreeMap::new(),
             deny_put: false,
             ops: Vec::new(),
+            policy: None,
+            simulations: Vec::new(),
         })))
     }
 
@@ -350,8 +365,51 @@ impl State {
                     None => query_error(404, "NoSuchEntity"),
                 }
             }
+            "SimulatePrincipalPolicy" => {
+                let list = |prefix: &str| -> Vec<String> {
+                    form.iter()
+                        .filter(|(k, _)| k.starts_with(prefix))
+                        .map(|(_, v)| v.clone())
+                        .collect()
+                };
+                let actions = list("ActionNames.member.");
+                let resources = list("ResourceArns.member.");
+                let principal = form.get("PolicySourceArn").cloned().unwrap_or_default();
+                self.simulations
+                    .push((principal, actions.clone(), resources.clone()));
+                let allowed = self.policy.clone().unwrap_or_default();
+                let resource = resources.first().cloned().unwrap_or_else(|| "*".into());
+                let members: String = actions
+                    .iter()
+                    .map(|a| {
+                        let decision = if allowed.contains(a) {
+                            "allowed"
+                        } else {
+                            "implicitDeny"
+                        };
+                        format!(
+                            "<member><EvalActionName>{a}</EvalActionName>\
+                             <EvalResourceName>{resource}</EvalResourceName>\
+                             <EvalDecision>{decision}</EvalDecision>\
+                             <MatchedStatements/><MissingContextValues/></member>"
+                        )
+                    })
+                    .collect();
+                iam_ok(
+                    action,
+                    &format!(
+                        "<EvaluationResults>{members}</EvaluationResults>\
+                         <IsTruncated>false</IsTruncated>"
+                    ),
+                )
+            }
             _ => query_error(400, "InvalidAction"),
         }
+    }
+
+    /// False when a policy is set and does not allow `action`.
+    pub fn allows(&self, action: &str) -> bool {
+        self.policy.as_ref().is_none_or(|p| p.contains(action))
     }
 
     pub fn secrets_manager(&mut self, op: &str, body: &[u8]) -> ResponseTemplate {
@@ -398,7 +456,7 @@ impl Respond for AwsModel {
         let mut state = self.state();
         if let Some(op) = sm_target(req) {
             state.ops.push(op.to_owned());
-            if signer != state.operator {
+            if signer != state.operator || !state.allows(&format!("secretsmanager:{op}")) {
                 return sm_error("AccessDeniedException");
             }
             return state.secrets_manager(op, &req.body);
@@ -407,10 +465,26 @@ impl Respond for AwsModel {
         let action = form.get("Action").cloned().unwrap_or_default();
         state.ops.push(action.clone());
         if action == "GetCallerIdentity" {
+            // The operator asks for its own ARN (`--check-permissions`).
+            // GetCallerIdentity needs no permission.
+            if signer == state.operator {
+                return query_ok(
+                    "https://sts.amazonaws.com/doc/2011-06-15/",
+                    "GetCallerIdentity",
+                    &format!(
+                        "<Arn>{}</Arn><UserId>AIDAE2EOPERATOR</UserId><Account>{ACCOUNT}</Account>",
+                        operator_arn()
+                    ),
+                );
+            }
             return state.sts(&signer);
         }
         // Decision D3: only the operator's own credentials touch IAM.
         if signer != state.operator {
+            return query_error(403, "AccessDenied");
+        }
+        let simulation_denied = action == "SimulatePrincipalPolicy" && state.policy.is_none();
+        if simulation_denied || !state.allows(&format!("iam:{action}")) {
             return query_error(403, "AccessDenied");
         }
         state.iam(&action, &form)
@@ -443,6 +517,10 @@ pub struct GithubState {
     pub puts: Vec<(String, String)>,
     /// Answer every `PUT` with 403.
     pub deny_put: bool,
+    /// Answer `GET .../public-key` with 403 (SHA-270).
+    pub deny_public_key: bool,
+    /// The `x-oauth-scopes` header of every answer, as for a classic token.
+    pub scopes: Option<String>,
     /// Every request, as `METHOD path`.
     pub ops: Vec<String>,
 }
@@ -470,6 +548,8 @@ impl GithubModel {
             values,
             puts: Vec::new(),
             deny_put: false,
+            deny_public_key: false,
+            scopes: None,
             ops: Vec::new(),
         })))
     }
@@ -518,6 +598,16 @@ pub fn is_github(req: &Request) -> bool {
 
 impl Respond for GithubModel {
     fn respond(&self, req: &Request) -> ResponseTemplate {
+        let response = self.answer(req);
+        match self.state().scopes.clone() {
+            Some(scopes) => response.insert_header("x-oauth-scopes", scopes.as_str()),
+            None => response,
+        }
+    }
+}
+
+impl GithubModel {
+    fn answer(&self, req: &Request) -> ResponseTemplate {
         let method = req.method.as_str().to_owned();
         let path = req.url.path().to_owned();
         let mut state = self.0.lock().unwrap();
@@ -552,6 +642,9 @@ impl Respond for GithubModel {
                 )
             }
             ("GET", "/public-key") => {
+                if state.deny_public_key {
+                    return gh_error(403, "Resource not accessible by personal access token");
+                }
                 let key = BASE64.encode(state.secret_key.public_key().as_bytes());
                 gh_json(200, json!({ "key_id": GH_KEY_ID, "key": key }))
             }
@@ -606,6 +699,8 @@ pub struct E2e {
     /// [`E2e::next_replacement`].
     pub second_id: String,
     pub second_secret: String,
+    /// The variable [`E2e::run`] passes the GitHub token in.
+    pub token_var: Mutex<&'static str>,
 }
 
 impl E2e {
@@ -685,6 +780,7 @@ impl E2e {
             new_secret,
             second_id: key_id("E2E2NDK"),
             second_secret: secret("e2e2ndK1"),
+            token_var: Mutex::new("ROTATE_GITHUB_TOKEN"),
         };
         e2e.write_inputs();
         e2e
@@ -737,7 +833,8 @@ impl E2e {
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("rotate"));
         command.env_clear();
         if self.github.is_some() {
-            command.env("ROTATE_GITHUB_TOKEN", &self.github_token);
+            let var = *self.token_var.lock().unwrap();
+            command.env(var, &self.github_token);
         }
         let output = command
             .current_dir(self.path())
