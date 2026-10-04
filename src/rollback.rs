@@ -151,6 +151,9 @@ pub enum OldSecretAction {
     Unsupported,
     /// It was never revoked; nothing to reactivate.
     NotRevoked,
+    /// An earlier rollback run found it could not be reactivated
+    /// (SHA-290): it stays revoked, and this rollback exits 1 too.
+    StillRevoked,
     /// An earlier rollback run finished this step.
     Done,
 }
@@ -198,7 +201,9 @@ impl RollbackPlan {
     /// The plan for `rotation`, minus what its saved progress says is done.
     pub fn of(rotation: &Rotation) -> Self {
         let progress = rotation.rollback.clone().unwrap_or_default();
-        let old = if progress.restore_done {
+        let old = if progress.restore_done && progress.old_still_revoked {
+            OldSecretAction::StillRevoked
+        } else if progress.restore_done {
             OldSecretAction::Done
         } else if let Some(handle) = &rotation.restore_ref {
             OldSecretAction::Restore(handle.clone())
@@ -290,8 +295,13 @@ fn status_name(status: ConsumerStatus) -> &'static str {
 }
 
 /// The text shown for a rotation the old secret cannot come back for.
-pub const UNSUPPORTED_TEXT: &str =
-    "unsupported: old secret cannot be reactivated, consumers will be restored only";
+pub const UNSUPPORTED_TEXT: &str = "unsupported: old secret cannot be reactivated; consumers will \
+     be restored but left holding a revoked secret, and rollback will exit 1";
+
+/// The plan text when an earlier rollback run could not reactivate the
+/// old secret (SHA-290).
+pub const STILL_REVOKED_TEXT: &str = "stays revoked: an earlier run could not reactivate it; the \
+     restored consumers hold a revoked secret and rollback exits 1";
 
 /// The rollback plan, one block per rotation that has work, then a note
 /// per rotation that has none.
@@ -326,6 +336,7 @@ pub fn render_plan(plans: &[RollbackPlan]) -> String {
             OldSecretAction::Restore(handle) => format!("reactivate with restore {handle}"),
             OldSecretAction::Unsupported => UNSUPPORTED_TEXT.to_owned(),
             OldSecretAction::NotRevoked => "never revoked; nothing to reactivate".to_owned(),
+            OldSecretAction::StillRevoked => STILL_REVOKED_TEXT.to_owned(),
             OldSecretAction::Done => "done in an earlier run".to_owned(),
         };
         field(&mut out, "old secret", &old);
@@ -397,6 +408,16 @@ fn field(out: &mut String, label: &str, value: &str) {
 pub enum RollbackResult {
     /// Every step is done; the rotation is `rolled_back`.
     RolledBack,
+    /// Every step is done and the rotation is `rolled_back`, but the old
+    /// secret could not be reactivated (SHA-290): the restored consumers
+    /// hold a revoked secret. Exit 1.
+    RolledBackOldRevoked {
+        /// Why it could not be reactivated; rotate's own text.
+        reason: String,
+        /// Refs of every consumer restored to the old secret, in this run
+        /// or an earlier one.
+        holding: Vec<String>,
+    },
     /// An action failed; the rollback stopped there and can be re-run.
     Failed {
         /// The action that failed.
@@ -421,6 +442,26 @@ pub struct RollbackOutcome {
     pub warnings: Vec<String>,
     /// How it ended.
     pub result: RollbackResult,
+}
+
+impl RollbackOutcome {
+    /// The lines for stderr: the old-revoked warning first, when there is
+    /// one, then every other warning.
+    pub fn stderr_warnings(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let RollbackResult::RolledBackOldRevoked { reason, .. } = &self.result {
+            lines.push(old_revoked_warning(reason));
+        }
+        lines.extend(self.warnings.iter().cloned());
+        lines
+    }
+}
+
+/// The warning for an old secret rollback could not reactivate.
+pub fn old_revoked_warning(reason: &str) -> String {
+    format!(
+        "the old secret was not reactivated ({reason}); it stays revoked, so the restored consumers hold a revoked secret"
+    )
 }
 
 /// A state or audit write failed mid-rollback.
@@ -455,6 +496,8 @@ struct Progress {
     record: Rotation,
     restored: Vec<String>,
     warnings: Vec<String>,
+    /// Why the old secret stays revoked, when it does (SHA-290).
+    old_revoked: Option<String>,
 }
 
 impl Progress {
@@ -499,14 +542,21 @@ impl<'a> RollbackExecutor<'a> {
             record,
             restored: Vec::new(),
             warnings: Vec::new(),
+            old_revoked: None,
         };
         let result = self.steps(plan, old, &mut progress).await;
+        let mut warnings = progress.warnings;
+        // A rollback that stopped after finding the old secret cannot come
+        // back still says so; a finished one carries it in its result.
+        if let (RollbackResult::Failed { .. }, Some(reason)) = (&result, &progress.old_revoked) {
+            warnings.insert(0, old_revoked_warning(reason));
+        }
         RollbackOutcome {
             rotation_id: plan.rotation_id.clone(),
             provider: plan.provider.clone(),
             fingerprint: plan.fingerprint.clone(),
             restored: progress.restored,
-            warnings: progress.warnings,
+            warnings,
             result,
         }
     }
@@ -585,6 +635,17 @@ impl<'a> RollbackExecutor<'a> {
             OldSecretAction::Unsupported => {
                 let reason = "the provider gave no handle to reactivate it";
                 if let Err(err) = self.unsupported_old(progress, reason) {
+                    return self.fail(progress, RollbackAction::RestoreOld, &err.to_string(), None);
+                }
+            }
+            OldSecretAction::StillRevoked => {
+                // The first run recorded the skipped restore_old.
+                progress.old_revoked =
+                    Some("an earlier rollback run could not reactivate it".to_owned());
+                let rollback = progress.rollback();
+                rollback.restore_done = true;
+                rollback.old_still_revoked = true;
+                if let Err(err) = self.save(progress) {
                     return self.fail(progress, RollbackAction::RestoreOld, &err.to_string(), None);
                 }
             }
@@ -713,20 +774,34 @@ impl<'a> RollbackExecutor<'a> {
                 )),
             };
         }
-        RollbackResult::RolledBack
+        match progress.old_revoked.take() {
+            Some(reason) => RollbackResult::RolledBackOldRevoked {
+                reason,
+                holding: progress
+                    .record
+                    .consumers
+                    .iter()
+                    .filter(|c| c.status == ConsumerStatus::Restored)
+                    .map(|c| c.consumer_ref.clone())
+                    .collect(),
+            },
+            None => RollbackResult::RolledBack,
+        }
     }
 
-    /// The provider cannot bring the old secret back: warn, record a
-    /// skipped `restore_old`, and carry on with the consumers.
+    /// The provider cannot bring the old secret back: record that it stays
+    /// revoked (so a resumed run knows, SHA-290) and a skipped
+    /// `restore_old`, and carry on with the consumers. The outcome says so
+    /// and exits 1.
     fn unsupported_old(
         &mut self,
         progress: &mut Progress,
         reason: &str,
     ) -> Result<(), RecordError> {
-        progress.warnings.push(format!(
-            "the old secret was not reactivated ({reason}); it stays revoked, so the restored consumers hold a revoked secret"
-        ));
-        progress.rollback().restore_done = true;
+        progress.old_revoked = Some(reason.to_owned());
+        let rollback = progress.rollback();
+        rollback.restore_done = true;
+        rollback.old_still_revoked = true;
         self.save(progress)?;
         self.event(
             progress,
@@ -838,11 +913,15 @@ fn action_name(action: RollbackAction) -> &'static str {
     }
 }
 
-/// True when any rollback failed (exit 1).
-pub fn any_failed(outcomes: &[RollbackOutcome]) -> bool {
-    outcomes
-        .iter()
-        .any(|o| matches!(o.result, RollbackResult::Failed { .. }))
+/// True when the operator has to act (exit 1): a rollback failed, or one
+/// finished with the old secret still revoked (SHA-290).
+pub fn needs_operator(outcomes: &[RollbackOutcome]) -> bool {
+    outcomes.iter().any(|o| {
+        matches!(
+            o.result,
+            RollbackResult::Failed { .. } | RollbackResult::RolledBackOldRevoked { .. }
+        )
+    })
 }
 
 /// The summary printed after rollback: a count, one row per rotation, then
@@ -852,16 +931,32 @@ pub fn render_summary(outcomes: &[RollbackOutcome]) -> String {
         .iter()
         .filter(|o| matches!(o.result, RollbackResult::Failed { .. }))
         .count();
+    let old_revoked = outcomes
+        .iter()
+        .filter(|o| matches!(o.result, RollbackResult::RolledBackOldRevoked { .. }))
+        .count();
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Rollback: {} rolled back, {failed} failed.",
-        outcomes.len() - failed
+        "Rollback: {} rolled back, {old_revoked} with the old secret still revoked, {failed} failed.",
+        outcomes.len() - failed - old_revoked
     );
     let mut notes = Vec::new();
     for o in outcomes {
         let outcome = match &o.result {
             RollbackResult::RolledBack => "rolled back".to_owned(),
+            RollbackResult::RolledBackOldRevoked { reason, holding } => {
+                let holding = if holding.is_empty() {
+                    "no consumer holds it".to_owned()
+                } else {
+                    format!("{} now hold a revoked secret", holding.join(", "))
+                };
+                notes.push(format!(
+                    "{}: {}: the old secret stays revoked ({reason}); {holding}; create a new credential and run rotate apply again",
+                    o.rotation_id, o.provider
+                ));
+                "rolled back, old secret still revoked".to_owned()
+            }
             RollbackResult::Failed { action, error } => {
                 notes.push(format!(
                     "{}: {} failed: {error}; stopped there; re-run rotate rollback to continue",
@@ -1086,7 +1181,11 @@ mod tests {
         let mut r = revoked();
         r.restore_ref = None;
         assert_eq!(RollbackPlan::of(&r).old, OldSecretAction::Unsupported);
-        assert!(render_plan(&[RollbackPlan::of(&r)]).contains(UNSUPPORTED_TEXT));
+        let text = render_plan(&[RollbackPlan::of(&r)]);
+        assert!(text.contains(UNSUPPORTED_TEXT));
+        // SHA-290 T7 (AC7).
+        assert!(text.contains("left holding a revoked secret"), "{text}");
+        assert!(text.contains("rollback will exit 1"), "{text}");
 
         r.step = Step::PendingRevoke;
         assert_eq!(RollbackPlan::of(&r).old, OldSecretAction::NotRevoked);
@@ -1130,6 +1229,7 @@ mod tests {
         r.rollback = Some(RollbackProgress {
             restore_done: true,
             revoke_done: false,
+            old_still_revoked: false,
         });
         let p = RollbackPlan::of(&r);
         assert_eq!(p.old, OldSecretAction::Done);
@@ -1149,6 +1249,8 @@ mod tests {
         let outcome = run(&mut f, &token(OLD)).await;
         assert_eq!(outcome.result, RollbackResult::RolledBack, "{outcome:?}");
         assert!(outcome.warnings.is_empty());
+        // SHA-290 T4 (AC4).
+        assert!(!needs_operator(std::slice::from_ref(&outcome)));
         assert_eq!(
             mutating(&f.log),
             [
@@ -1192,14 +1294,179 @@ mod tests {
         let provider = MockProvider::new("npm").restore_outcome(RestoreOutcome::Unsupported);
         let mut f = fixture(provider, &revoked());
         let outcome = run(&mut f, &token(OLD)).await;
-        assert_eq!(outcome.result, RollbackResult::RolledBack);
-        assert_eq!(outcome.warnings.len(), 1);
-        assert!(outcome.warnings[0].contains("the old secret was not reactivated"));
-        assert_eq!(mutating(&f.log).len(), 4);
+        // SHA-290 T1 (AC1): same actions, a distinct outcome, exit 1.
+        assert_eq!(
+            outcome.result,
+            RollbackResult::RolledBackOldRevoked {
+                reason: "npm cannot reactivate a revoked credential".into(),
+                holding: vec![GHA.into(), SM.into()],
+            }
+        );
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let stderr = outcome.stderr_warnings();
+        assert_eq!(stderr.len(), 1);
+        assert!(stderr[0].contains("the old secret was not reactivated"));
+        assert_eq!(
+            mutating(&f.log),
+            [
+                "npm.restore(npm-old-handle)".to_owned(),
+                format!("github-actions.restore({GHA})"),
+                format!("aws-secrets-manager.restore({SM})"),
+                "npm.revoke_replacement(npm-ref-1)".to_owned(),
+            ]
+        );
         assert_eq!(f.gha.current(GHA), Some(fp(OLD)));
-        let summary = render_summary(&[outcome]);
-        assert!(summary.contains("warning: the old secret was not reactivated"));
+        let saved = f.store.get("rot-unit").unwrap();
+        assert_eq!(saved.step, Step::RolledBack);
+        assert!(saved.rollback.as_ref().unwrap().old_still_revoked);
         assert_eq!(rollback_entries(&f)[0].outcome, AuditOutcome::Skipped);
+        assert!(needs_operator(std::slice::from_ref(&outcome)));
+        let summary = render_summary(&[outcome]);
+        assert!(!summary.contains("warning: the old secret"), "{summary}");
+    }
+
+    /// SHA-290 T2 (AC2): revoked with no handle (GitHub, npm, OpenAI):
+    /// no restore call, consumers restored, replacement revoked, exit 1.
+    #[tokio::test]
+    async fn no_handle_after_revoke_is_old_revoked() {
+        let mut r = revoked();
+        r.restore_ref = None;
+        let mut f = fixture(MockProvider::new("npm"), &r);
+        let outcome = run(&mut f, &token(OLD)).await;
+        assert_eq!(
+            outcome.result,
+            RollbackResult::RolledBackOldRevoked {
+                reason: "the provider gave no handle to reactivate it".into(),
+                holding: vec![GHA.into(), SM.into()],
+            }
+        );
+        assert_eq!(
+            mutating(&f.log),
+            [
+                format!("github-actions.restore({GHA})"),
+                format!("aws-secrets-manager.restore({SM})"),
+                "npm.revoke_replacement(npm-ref-1)".to_owned(),
+            ]
+        );
+        assert!(needs_operator(&[outcome]));
+    }
+
+    /// SHA-290: a rollback interrupted after the skipped restore_old
+    /// resumes with `StillRevoked` and still ends in the old-revoked
+    /// outcome, holding the consumers restored by both runs.
+    #[tokio::test]
+    async fn resumed_rollback_keeps_old_revoked() {
+        let mut r = revoked();
+        r.restore_ref = None;
+        let mut f = fixture(MockProvider::new("npm"), &r);
+        f.sm.fail_next(
+            "restore",
+            crate::consumer::ConsumerError::Permanent("denied".into()),
+        );
+        let first = run(&mut f, &token(OLD)).await;
+        assert!(matches!(first.result, RollbackResult::Failed { .. }));
+        // The stopped run still says the old secret stays revoked.
+        assert!(
+            first.warnings[0].contains("the old secret was not reactivated"),
+            "{:?}",
+            first.warnings
+        );
+        assert!(render_summary(std::slice::from_ref(&first)).contains("warning: the old secret"));
+        let saved = f.store.get("rot-unit").unwrap().clone();
+        assert!(saved.rollback.as_ref().unwrap().old_still_revoked);
+        let plan = RollbackPlan::of(&saved);
+        assert_eq!(plan.old, OldSecretAction::StillRevoked);
+        assert!(plan.has_work());
+        assert!(render_plan(&[plan]).contains(STILL_REVOKED_TEXT));
+
+        let second = run(&mut f, &token(OLD)).await;
+        assert_eq!(
+            second.result,
+            RollbackResult::RolledBackOldRevoked {
+                reason: "an earlier rollback run could not reactivate it".into(),
+                holding: vec![GHA.into(), SM.into()],
+            }
+        );
+        assert_eq!(second.restored, [SM]);
+        assert!(needs_operator(&[second]));
+    }
+
+    /// SHA-290 T3 (AC3): the header counts it apart; one note names the
+    /// rotation, provider, consumers and next step; no duplicate warning.
+    #[test]
+    fn summary_counts_old_revoked_apart() {
+        let base = RollbackOutcome {
+            rotation_id: "rot-a".into(),
+            provider: "aws".into(),
+            fingerprint: fp(OLD),
+            restored: vec![],
+            warnings: vec![],
+            result: RollbackResult::RolledBack,
+        };
+        let revoked = RollbackOutcome {
+            rotation_id: "rot-b".into(),
+            provider: "github".into(),
+            restored: vec![GHA.into()],
+            result: RollbackResult::RolledBackOldRevoked {
+                reason: "the provider gave no handle to reactivate it".into(),
+                holding: vec![GHA.into(), SM.into()],
+            },
+            ..base.clone()
+        };
+        let text = render_summary(&[base, revoked]);
+        assert!(
+            text.starts_with(
+                "Rollback: 1 rolled back, 1 with the old secret still revoked, 0 failed.\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("restored gha:org/repo:NPM_TOKEN  rolled back, old secret still revoked")
+        );
+        assert!(text.contains(&format!(
+            "rot-b: github: the old secret stays revoked (the provider gave no handle to reactivate it); {GHA}, {SM} now hold a revoked secret; create a new credential and run rotate apply again"
+        )), "{text}");
+        assert!(!text.contains("warning:"), "{text}");
+    }
+
+    /// SHA-290 T6 (AC6): exit class over mixed outcomes, and both notes.
+    #[test]
+    fn exit_is_1_for_failed_or_old_revoked() {
+        let ok = RollbackOutcome {
+            rotation_id: "rot-a".into(),
+            provider: "npm".into(),
+            fingerprint: fp(OLD),
+            restored: vec![],
+            warnings: vec![],
+            result: RollbackResult::RolledBack,
+        };
+        let old = RollbackOutcome {
+            rotation_id: "rot-b".into(),
+            result: RollbackResult::RolledBackOldRevoked {
+                reason: "r".into(),
+                holding: vec![],
+            },
+            ..ok.clone()
+        };
+        let failed = RollbackOutcome {
+            rotation_id: "rot-c".into(),
+            result: RollbackResult::Failed {
+                action: RollbackAction::RestoreConsumer,
+                error: RedactedText::new("denied"),
+            },
+            ..ok.clone()
+        };
+        assert!(!needs_operator(std::slice::from_ref(&ok)));
+        assert!(needs_operator(std::slice::from_ref(&old)));
+        assert!(needs_operator(std::slice::from_ref(&failed)));
+        let text = render_summary(&[ok, old, failed]);
+        assert!(text
+            .contains("Rollback: 1 rolled back, 1 with the old secret still revoked, 1 failed."));
+        assert!(text.contains("rot-b: npm: the old secret stays revoked (r); no consumer holds it"));
+        assert!(
+            text.contains("rot-c: restoring a consumer failed: denied; stopped there"),
+            "{text}"
+        );
     }
 
     // T6 (AC6)
@@ -1213,6 +1480,7 @@ mod tests {
         let mut f = fixture(MockProvider::new("npm"), &r);
         let outcome = run(&mut f, &token(OLD)).await;
         assert_eq!(outcome.result, RollbackResult::RolledBack);
+        assert!(!needs_operator(std::slice::from_ref(&outcome)));
         assert_eq!(
             mutating(&f.log),
             [
@@ -1294,6 +1562,9 @@ mod tests {
         let outcome = run(&mut f, &token(OLD)).await;
         assert_eq!(outcome.result, RollbackResult::RolledBack);
         assert!(outcome.warnings[0].contains("revoke the pasted replacement by hand"));
+        // SHA-290 T5 (AC5): a manual replacement keeps exit 0.
+        assert!(!needs_operator(std::slice::from_ref(&outcome)));
+        assert_eq!(outcome.stderr_warnings(), outcome.warnings);
         assert!(!mutating(&f.log).iter().any(|c| c.contains("revoke")));
 
         let provider = MockProvider::new("npm");
