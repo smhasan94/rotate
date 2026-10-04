@@ -45,6 +45,16 @@ pub const REVOKED_BY_HAND: &str = "revoked by hand";
 pub const MANUAL_REVOKE_BLOCKER: &str =
     "rotate cannot revoke this credential; apply updates consumers and verifies, then stops at revoke: delete the old one by hand";
 
+/// The provider and consumer matrix (SHA-266), named in the plan when a
+/// step is manual or unsupported.
+pub const PROVIDER_MATRIX_DOC: &str = "docs/providers.md";
+
+/// Closing line of the plan when any rotation has a manual or unsupported
+/// step.
+pub const PROVIDER_MATRIX_NOTE: &str = "Some steps above are manual or cannot be automated. \
+     See docs/providers.md (https://github.com/smhasan94/rotate/blob/main/docs/providers.md) \
+     for what rotate does per provider and consumer, and what to do by hand.";
+
 /// Blocker wording shared by every reason apply would stop before revoke.
 const REFUSE_REVOKE: &str = "apply will refuse to revoke without --force";
 
@@ -217,6 +227,14 @@ impl PlannedRotation {
     /// Matches that cannot be updated automatically.
     pub fn not_updatable(&self) -> impl Iterator<Item = &PlannedConsumer> {
         self.consumers.iter().filter(|c| !c.found.is_updatable())
+    }
+
+    /// True when a step needs the operator: a pasted replacement, a revoke
+    /// rotate cannot do, or a consumer it cannot update (SHA-266).
+    pub fn has_manual_step(&self) -> bool {
+        self.replacement_mode == ReplacementMode::Manual
+            || self.blockers.iter().any(|b| b == MANUAL_REVOKE_BLOCKER)
+            || self.not_updatable().next().is_some()
     }
 }
 
@@ -700,6 +718,11 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
             }
         }
     }
+    if plan.rotations.iter().any(PlannedRotation::has_manual_step) {
+        out.push('\n');
+        out.push_str(PROVIDER_MATRIX_NOTE);
+        out.push('\n');
+    }
     out
 }
 
@@ -918,6 +941,8 @@ mod tests {
         assert!(table.contains("gha:org/repo:NPM_TOKEN"), "{table}");
         assert!(table.contains("sm:prod/npm"), "{table}");
         assert!(table.contains("  overlap:      1h\n"), "{table}");
+        // SHA-266: nothing manual, so no pointer to the matrix.
+        assert!(!table.contains(PROVIDER_MATRIX_DOC), "{table}");
         log.assert_no_mutations();
     }
 
@@ -940,6 +965,14 @@ mod tests {
             ["1 consumer cannot be updated; apply will refuse to revoke without --force"]
         );
         assert_eq!(r.replacement_text(), MANUAL_REPLACEMENT);
+        assert!(r.has_manual_step());
+        // SHA-266 T3 (AC3): the plan names the provider matrix.
+        let table = render_table(&plan);
+        assert!(
+            table.ends_with(&format!("\n{PROVIDER_MATRIX_NOTE}\n")),
+            "{table}"
+        );
+        assert!(render_apply_table(&plan).contains(PROVIDER_MATRIX_DOC));
         log.assert_no_mutations();
     }
 
