@@ -19,7 +19,7 @@ use super::{
     Consumer, ConsumerError, ConsumerMatch, Holds, NotUpdatable, SecretRef, UpdateReceipt,
 };
 use crate::config::{ActionsTarget, ConsumersConfig, GithubConfig};
-use crate::github::{operator_token_from_env, seal, GithubClient, GithubError};
+use crate::github::{operator_token_from_env, seal, Auth, GithubClient, GithubError};
 use crate::plan::consumer_names;
 use crate::provider::Credential;
 use crate::secret::SecretValue;
@@ -30,6 +30,21 @@ pub const NAME: &str = "github-actions";
 /// Reason shown for a target that answers 404.
 pub const NOT_FOUND_REASON: &str = "not found or token lacks access";
 
+/// Reason `rotate plan --check-permissions` gives a match whose target the
+/// operator token cannot write to (SHA-270).
+pub const LACKS_SECRETS_WRITE: &str = "token lacks Secrets: write";
+
+/// What the write probe of one target found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteAccess {
+    /// A classic token with the scope the target needs.
+    Granted,
+    /// The public key was readable but the token's permissions are not
+    /// (fine-grained and app tokens): a write may still be refused.
+    Unconfirmed,
+    /// The token cannot write the target's secrets.
+    Lacking,
+}
 #[derive(Deserialize)]
 struct ListedSecret {
     name: String,
@@ -77,6 +92,52 @@ impl GithubActionsConsumer {
 
     fn targets(&self) -> &[ActionsTarget] {
         &self.config.github_actions.targets
+    }
+
+    /// The configured target a match from this consumer belongs to, as
+    /// written in `rotate.yaml` (`owner/repo` or the org name).
+    pub fn target_of(&self, consumer_ref: &str) -> Option<String> {
+        self.parse_ref(consumer_ref)
+            .ok()
+            .map(|(target, _)| target.to_string())
+    }
+
+    /// The read-only write probe of `rotate plan --check-permissions`
+    /// (SHA-270) for the target `consumer_ref` belongs to: `GET
+    /// .../actions/secrets/public-key`, which every write starts with. A 403
+    /// or 404 means the token cannot write there. A classic token's
+    /// `x-oauth-scopes` must hold `repo` for a repository, `admin:org` for
+    /// an org. Fine-grained permissions cannot be read, so a readable key
+    /// with no scopes header is [`WriteAccess::Unconfirmed`].
+    pub async fn check_write(&self, consumer_ref: &str) -> Result<WriteAccess, ConsumerError> {
+        let (target, _) = self.parse_ref(consumer_ref)?;
+        if !self.client.has_token() {
+            return Err(GithubError::NoToken.into());
+        }
+        let path = format!("{}/public-key", secrets_path(target));
+        let headers = match self
+            .client
+            .get_json_as::<PublicKey>(&path, Auth::Operator)
+            .await
+        {
+            Ok((_, headers)) => headers,
+            Err(GithubError::Status {
+                status: 403 | 404, ..
+            }) => return Ok(WriteAccess::Lacking),
+            Err(other) => return Err(other.into()),
+        };
+        let Some(scopes) = headers.get("x-oauth-scopes").and_then(|v| v.to_str().ok()) else {
+            return Ok(WriteAccess::Unconfirmed);
+        };
+        let needed = match target {
+            ActionsTarget::Repo { .. } => "repo",
+            ActionsTarget::Org(_) => "admin:org",
+        };
+        if scopes.split(',').any(|s| s.trim() == needed) {
+            Ok(WriteAccess::Granted)
+        } else {
+            Ok(WriteAccess::Lacking)
+        }
     }
 
     /// The names to look for, key-id names first, each with what it holds.
