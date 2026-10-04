@@ -160,8 +160,11 @@ What works now:
   identified by prefix and checked with `GET /-/whoami`; the plan shows the
   npm user and, from your own token list, the token's type, access,
   permissions, scopes, IP ranges and expiry. Set `ROTATE_NPM_TOKEN` (or
-  `NPM_TOKEN`) to an `npm login` session token of the same account; without
-  it the plan says the token is not visible to the operator account. Apply
+  `NPM_TOKEN`) to an `npm login` session token of the same account (a
+  granular token cannot list tokens; a session token lasts two hours, so
+  run `npm login` shortly before an unattended run); without it the plan
+  says the token is not visible to the operator account and shows a revoke
+  blocker. Apply
   asks for the new granular token in manual mode, checks it belongs to the
   same user, and deletes the leaked one by its token id. An account that
   asks for a one-time password to delete tokens makes the revoke fail

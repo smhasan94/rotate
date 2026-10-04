@@ -232,6 +232,17 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Why `revoke` would fail for `credential` as configured now, for
+    /// example a missing operator credential (SHA-292). The plan shows it
+    /// as a blocker on the revoke row. Pure: no network, only the
+    /// provider's configuration and the scope already read. `None` (the
+    /// default) means nothing is known to stop the revoke. Must not contain
+    /// a value.
+    fn revoke_blocker(&self, credential: &Credential, scope: Option<&Scope>) -> Option<String> {
+        let _ = (credential, scope);
+        None
+    }
+
     /// Whether the finding looks like one of this provider's credentials.
     /// Pure: no network.
     fn identify(&self, finding: &Finding) -> Option<Confidence>;
