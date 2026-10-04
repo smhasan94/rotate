@@ -6,6 +6,18 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Endpoint URLs in `rotate.yaml` (`providers.aws.endpoint_url`,
+  `providers.github.api_url`, `providers.npm.registry`,
+  `providers.openai.api_url`) must be `https://`, except `http://` to a
+  loopback host, and must not carry a user name or password. A tampered
+  config could otherwise send new secrets and operator tokens in clear
+  text. The error never repeats the URL.
+- `rotate plan` and `rotate apply` print a `warning:` line for each
+  endpoint that differs from its default, before apply asks for
+  confirmation; `plan --json` adds a `warnings` array.
+
 ### Changed
 
 - `rotate rollback` exits 1 when the old secret could not be reactivated

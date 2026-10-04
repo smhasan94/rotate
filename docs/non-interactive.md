@@ -78,7 +78,7 @@ fingerprint.
 
 | Command | `--json` output |
 | --- | --- |
-| `rotate plan` | One JSON document described by [plan-schema.json](plan-schema.json): `version`, `overlap_window`, `rotations` (each with `rotation_id`, `provider`, `fingerprint`, `consumers`, `blockers`, ...) and `skipped`. |
+| `rotate plan` | One JSON document described by [plan-schema.json](plan-schema.json): `version`, `overlap_window`, `rotations` (each with `rotation_id`, `provider`, `fingerprint`, `consumers`, `blockers`, ...), `skipped` and `warnings` (one per non-default endpoint in `rotate.yaml`). |
 | `rotate status` | An array of rows described by [status-schema.json](status-schema.json). |
 | `rotate apply`, `rotate rollback` | Not supported yet: exits 2 with "does not support --json yet". Use the exit code and the state file. |
 

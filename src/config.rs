@@ -184,7 +184,17 @@ impl fmt::Display for ActionsTarget {
     }
 }
 
-/// An API base URL. Must be `https://`, or `http://` for local test servers.
+/// Default `providers.github.api_url`.
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+/// Default `providers.npm.registry`.
+pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
+/// Default `providers.openai.api_url`.
+pub const DEFAULT_OPENAI_API_URL: &str = "https://api.openai.com";
+
+/// An API base URL (SHA-287): `https://`, or `http://` only to a loopback
+/// host (`127.0.0.0/8`, `::1` or `localhost`), never with a user name or
+/// password. Every setting that names an endpoint rotate sends secrets or
+/// operator credentials to must use this type.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ApiUrl(String);
@@ -194,23 +204,76 @@ impl ApiUrl {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The parsed URL without a trailing `/`, for comparing with a default.
+    fn normalized(&self) -> String {
+        url::Url::parse(&self.0)
+            .map_or_else(|_| self.0.clone(), |u| u.to_string())
+            .trim_end_matches('/')
+            .to_owned()
+    }
 }
 
-/// A URL without an `http://` or `https://` scheme and host.
+/// Why an endpoint URL was refused. No variant holds the URL as written, so
+/// a password in it never reaches an error message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid URL {0:?}: expected https://host or http://host")]
-pub struct InvalidUrl(String);
+pub enum InvalidUrl {
+    /// Not an absolute URL with a host.
+    #[error("not a URL: expected https://host[:port][/path]")]
+    NotAUrl,
+    /// A scheme other than https or http.
+    #[error("unsupported scheme {scheme:?}: only https:// is accepted")]
+    Scheme {
+        /// The parsed scheme.
+        scheme: String,
+    },
+    /// A user name or password in the URL. The message names neither, and
+    /// avoids the word, so a check for a leaked credential stays simple.
+    #[error("must not embed credentials: give tokens through the environment, not in the URL")]
+    Userinfo,
+    /// Plain http to a host that is not loopback.
+    #[error(
+        "{origin} is neither https nor loopback: only https:// is accepted, except http:// to 127.0.0.1, ::1 or localhost"
+    )]
+    NotHttps {
+        /// `scheme://host[:port]` from the parsed URL.
+        origin: String,
+    },
+}
 
 impl TryFrom<String> for ApiUrl {
     type Error = InvalidUrl;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        let host = value
-            .strip_prefix("https://")
-            .or_else(|| value.strip_prefix("http://"));
-        match host {
-            Some(host) if !host.is_empty() && !host.starts_with('/') => Ok(Self(value)),
-            _ => Err(InvalidUrl(value)),
+        let parsed = url::Url::parse(&value).map_err(|_| InvalidUrl::NotAUrl)?;
+        // Before anything that could show the URL.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(InvalidUrl::Userinfo);
+        }
+        if parsed.cannot_be_a_base() {
+            return Err(InvalidUrl::NotAUrl);
+        }
+        let Some(host) = parsed.host() else {
+            return Err(InvalidUrl::NotAUrl);
+        };
+        match parsed.scheme() {
+            "https" => Ok(Self(value)),
+            "http" => {
+                let loopback = match host {
+                    url::Host::Ipv4(ip) => ip.is_loopback(),
+                    url::Host::Ipv6(ip) => ip.is_loopback(),
+                    url::Host::Domain(name) => name == "localhost",
+                };
+                if loopback {
+                    Ok(Self(value))
+                } else {
+                    let origin = parsed.origin().ascii_serialization();
+                    Err(InvalidUrl::NotHttps { origin })
+                }
+            }
+            other => Err(InvalidUrl::Scheme {
+                scheme: other.to_owned(),
+            }),
         }
     }
 }
@@ -291,7 +354,7 @@ pub struct GithubConfig {
 impl Default for GithubConfig {
     fn default() -> Self {
         Self {
-            api_url: ApiUrl("https://api.github.com".into()),
+            api_url: ApiUrl(DEFAULT_GITHUB_API_URL.into()),
         }
     }
 }
@@ -307,7 +370,7 @@ pub struct NpmConfig {
 impl Default for NpmConfig {
     fn default() -> Self {
         Self {
-            registry: ApiUrl("https://registry.npmjs.org".into()),
+            registry: ApiUrl(DEFAULT_NPM_REGISTRY.into()),
         }
     }
 }
@@ -331,7 +394,7 @@ impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
             admin_key_env: "OPENAI_ADMIN_KEY".into(),
-            api_url: ApiUrl("https://api.openai.com".into()),
+            api_url: ApiUrl(DEFAULT_OPENAI_API_URL.into()),
             allow_broader_replacement: false,
         }
     }
@@ -349,6 +412,44 @@ pub struct ProvidersConfig {
     pub npm: NpmConfig,
     /// OpenAI settings.
     pub openai: OpenAiConfig,
+}
+
+impl ProvidersConfig {
+    /// One line per endpoint that differs from its provider's default
+    /// (SHA-287), for the plan to show before anything is sent there. Any
+    /// `providers.aws.endpoint_url` counts: by default rotate uses AWS's own
+    /// endpoints.
+    pub fn endpoint_warnings(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(url) = &self.aws.endpoint_url {
+            lines.push(format!(
+                "providers.aws.endpoint_url is {url} (default: AWS's own endpoints)"
+            ));
+        }
+        for (field, url, default) in [
+            (
+                "providers.github.api_url",
+                &self.github.api_url,
+                DEFAULT_GITHUB_API_URL,
+            ),
+            (
+                "providers.npm.registry",
+                &self.npm.registry,
+                DEFAULT_NPM_REGISTRY,
+            ),
+            (
+                "providers.openai.api_url",
+                &self.openai.api_url,
+                DEFAULT_OPENAI_API_URL,
+            ),
+        ] {
+            let default_url = ApiUrl(default.to_owned());
+            if url.normalized() != default_url.normalized() {
+                lines.push(format!("{field} is {url} (default {default})"));
+            }
+        }
+        lines
+    }
 }
 
 /// `rotate.yaml` as written. Settings that flags and environment variables
@@ -922,21 +1023,145 @@ mod tests {
         assert!(message.contains("unknown variant `gitlab`"), "{message}");
     }
 
+    /// The four endpoint fields as YAML paths, each with a value slot.
+    const URL_FIELDS: [(&str, &str); 4] = [
+        (
+            "providers.aws.endpoint_url",
+            "providers:\n  aws:\n    endpoint_url: \"{}\"\n",
+        ),
+        (
+            "providers.github.api_url",
+            "providers:\n  github:\n    api_url: \"{}\"\n",
+        ),
+        (
+            "providers.npm.registry",
+            "providers:\n  npm:\n    registry: \"{}\"\n",
+        ),
+        (
+            "providers.openai.api_url",
+            "providers:\n  openai:\n    api_url: \"{}\"\n",
+        ),
+    ];
+
+    fn yaml(template: &str, url: &str) -> String {
+        template.replace("{}", url)
+    }
+
+    /// SHA-287 T1 (AC1, AC4): plain http to any other host fails, naming
+    /// its own field and the rule.
     #[test]
-    fn api_url_must_be_http_or_https() {
-        for bad in ["api.github.com", "ftp://x", "https://", "https:///x"] {
-            let (field, _, _) =
-                invalid(&format!("providers:\n  github:\n    api_url: \"{bad}\"\n"));
-            assert_eq!(field, "providers.github.api_url", "{bad}");
+    fn sha287_t1_non_loopback_http_names_its_field() {
+        for (name, template) in URL_FIELDS {
+            let text = yaml(template, "http://api.example.com");
+            let (field, _, message) = invalid(&text);
+            assert_eq!(field, name);
+            assert!(message.contains("https://"), "{message}");
+            assert!(message.contains("localhost"), "{message}");
+            let shown = parse(&text, Path::new("rotate.yaml"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                shown.starts_with(&format!("rotate.yaml: {name} at line")),
+                "{shown}"
+            );
         }
-        let file = parse(
-            "providers:\n  npm:\n    registry: http://127.0.0.1:4873\n",
+    }
+
+    /// SHA-287 T2 (AC2): http to loopback is accepted and kept as written.
+    #[test]
+    fn sha287_t2_loopback_http_is_accepted() {
+        for url in [
+            "http://127.0.0.1:4566",
+            "http://[::1]:8080",
+            "http://localhost:4873",
+            "http://LOCALHOST:4873",
+            "HTTP://127.0.0.1",
+            "http://127.0.0.1:4566/",
+            "http://127.0.0.2:9000",
+            "https://npm.example.com",
+        ] {
+            for (name, template) in URL_FIELDS {
+                let file = parse(&yaml(template, url), Path::new("r"))
+                    .unwrap_or_else(|e| panic!("{name} {url}: {e}"));
+                let p = file.providers;
+                let got = match name {
+                    "providers.aws.endpoint_url" => p.aws.endpoint_url.unwrap(),
+                    "providers.github.api_url" => p.github.api_url,
+                    "providers.npm.registry" => p.npm.registry,
+                    _ => p.openai.api_url,
+                };
+                assert_eq!(got.as_str(), url, "{name}");
+            }
+        }
+    }
+
+    /// SHA-287 T3 (AC3): host confusion, userinfo and non-URLs are refused,
+    /// and no message shows the user name or password.
+    #[test]
+    fn sha287_t3_host_confusion_and_userinfo_are_refused() {
+        for url in [
+            "http://127.0.0.1.evil.example",
+            "http://localhost@evil.example",
+            "http://evil.example/127.0.0.1",
+            "https://user:pass@api.example.com",
+            "https://u5er-canary:pa55-canary@api.example.com",
+            "http://u5er-canary@localhost",
+            "https://:pa55-canary@api.example.com",
+            "ftp://x",
+            "https://",
+            "api.github.com",
+            "mailto:x@example.com",
+        ] {
+            for (name, template) in URL_FIELDS {
+                let text = yaml(template, url);
+                let (field, _, message) = invalid(&text);
+                assert_eq!(field, name, "{url}");
+                let shown = parse(&text, Path::new("rotate.yaml"))
+                    .unwrap_err()
+                    .to_string();
+                for secret in ["pass", "user@", "localhost@", "u5er-canary", "pa55-canary"] {
+                    assert!(!shown.contains(secret), "{url}: {shown}");
+                    assert!(!message.contains(secret), "{url}: {message}");
+                }
+            }
+        }
+    }
+
+    /// SHA-287 (AC5, AC6): one warning per non-default endpoint; defaults,
+    /// spelled out with a trailing slash or in capitals, warn nothing.
+    #[test]
+    fn endpoint_warnings_name_field_and_url() {
+        assert!(ProvidersConfig::default().endpoint_warnings().is_empty());
+        let same = parse(
+            "providers:\n  github:\n    api_url: https://api.github.com/\n  npm:\n    registry: HTTPS://REGISTRY.NPMJS.ORG\n  openai:\n    api_url: https://api.openai.com\n",
+            Path::new("r"),
+        )
+        .unwrap();
+        assert!(same.providers.endpoint_warnings().is_empty());
+
+        let npm = parse(
+            "providers:\n  npm:\n    registry: https://npm.example.com\n",
             Path::new("r"),
         )
         .unwrap();
         assert_eq!(
-            file.providers.npm.registry.as_str(),
-            "http://127.0.0.1:4873"
+            npm.providers.endpoint_warnings(),
+            ["providers.npm.registry is https://npm.example.com (default https://registry.npmjs.org)"]
+        );
+
+        let all = parse(
+            "providers:\n  aws:\n    endpoint_url: http://localhost:4566\n  github:\n    api_url: https://ghe.example.com/api/v3\n  npm:\n    registry: https://npm.example.com\n  openai:\n    api_url: https://openai.example.com\n",
+            Path::new("r"),
+        )
+        .unwrap();
+        assert_eq!(
+            all.providers.endpoint_warnings(),
+            [
+                "providers.aws.endpoint_url is http://localhost:4566 (default: AWS's own endpoints)",
+                "providers.github.api_url is https://ghe.example.com/api/v3 (default https://api.github.com)",
+                "providers.npm.registry is https://npm.example.com (default https://registry.npmjs.org)",
+                "providers.openai.api_url is https://openai.example.com (default https://api.openai.com)",
+            ]
         );
     }
 }

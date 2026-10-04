@@ -435,3 +435,99 @@ fn locked_state_file_exits_2_before_any_call() {
         Some(0)
     );
 }
+
+/// SHA-287: the stdout lines that are endpoint warnings.
+fn warning_lines(output: &Output) -> Vec<String> {
+    stdout(output)
+        .lines()
+        .filter(|l| l.starts_with("warning: "))
+        .map(str::to_owned)
+        .collect()
+}
+
+const NPM_WARNING: &str =
+    "providers.npm.registry is https://npm.example.com (default https://registry.npmjs.org)";
+
+// SHA-287 T4 (AC5): a custom registry gives exactly one warning, right
+// after the header, and the same text in --json, which still validates.
+#[test]
+fn sha287_t4_custom_registry_warns_once_in_table_and_json() {
+    let value = "npm_plancli_287_t4_value";
+    let run = Run::new();
+    let report = run.report(&[value]);
+    run.scenario(two_matches(value));
+    std::fs::write(
+        run.path().join("rotate.yaml"),
+        "providers:\n  npm:\n    registry: https://npm.example.com\n",
+    )
+    .unwrap();
+    let output = run.run(&["plan", report.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(warning_lines(&output), [format!("warning: {NPM_WARNING}")]);
+    let text = stdout(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("Plan: "), "{text}");
+    assert_eq!(lines[1], format!("warning: {NPM_WARNING}"));
+
+    let output = run.run(&["--json", "plan", report.to_str().unwrap()]);
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["warnings"], json!([NPM_WARNING]));
+    let schema: Value = serde_json::from_str(&std::fs::read_to_string(SCHEMA).unwrap()).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&plan));
+}
+
+// SHA-287 T5 (AC6): default endpoints, absent or spelled out, warn nothing.
+#[test]
+fn sha287_t5_default_endpoints_warn_nothing() {
+    let value = "npm_plancli_287_t5_value";
+    let run = Run::new();
+    let report = run.report(&[value]);
+    run.scenario(two_matches(value));
+    for config in [
+        None,
+        Some("providers:\n  github:\n    api_url: https://api.github.com/\n  npm:\n    registry: https://registry.npmjs.org/\n  openai:\n    api_url: https://api.openai.com/\n"),
+    ] {
+        let path = run.path().join("rotate.yaml");
+        match config {
+            Some(text) => std::fs::write(&path, text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        let output = run.run(&["plan", report.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(warning_lines(&output).is_empty(), "{}", stdout(&output));
+        let output = run.run(&["--json", "plan", report.to_str().unwrap()]);
+        let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(plan["warnings"], json!([]));
+    }
+}
+
+// SHA-287 T7 (AC5, AC7): every endpoint redirected, four warnings, and the
+// plan still makes only read-only calls.
+#[test]
+fn sha287_t7_custom_endpoints_add_no_call() {
+    let value = "npm_plancli_287_t7_value";
+    let run = Run::new();
+    let report = run.report(&[value]);
+    run.scenario(two_matches(value));
+    std::fs::write(
+        run.path().join("rotate.yaml"),
+        "providers:\n  aws:\n    endpoint_url: http://127.0.0.1:4566\n  github:\n    api_url: https://ghe.example.com/api/v3\n  npm:\n    registry: https://npm.example.com\n  openai:\n    api_url: https://openai.example.com\n",
+    )
+    .unwrap();
+    let output = run.run(&["plan", report.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(warning_lines(&output).len(), 4, "{}", stdout(&output));
+    let calls = run.calls();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        assert_eq!(call["mutating"], false, "{call}");
+        let method = call["method"].as_str().unwrap();
+        assert!(
+            ["identify", "check_valid", "describe_scope", "find"].contains(&method),
+            "{method}"
+        );
+    }
+}
