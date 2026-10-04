@@ -119,8 +119,10 @@ What works now:
   deactivated key), restores the old value in every consumer apply
   updated (consumers whose update failed or was skipped are left alone),
   and revokes the replacement. If the provider cannot reactivate the old
-  secret, consumers are still restored and a warning says the old secret
-  stays revoked; a pasted (manual) replacement has to be revoked by hand.
+  secret, consumers are still restored but hold a revoked secret: the
+  summary says so and rollback exits 1, so create a new credential and run
+  `rotate apply` again. A pasted (manual) replacement has to be revoked by
+  hand.
   Any error stops the rollback at that step, before the replacement is
   revoked, and exits 1; re-running continues from where it stopped without
   repeating a step, and a finished rollback (`rolled_back`) makes no call.

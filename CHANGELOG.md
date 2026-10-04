@@ -6,6 +6,28 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Endpoint URLs in `rotate.yaml` (`providers.aws.endpoint_url`,
+  `providers.github.api_url`, `providers.npm.registry`,
+  `providers.openai.api_url`) must be `https://`, except `http://` to a
+  loopback host, and must not carry a user name or password. A tampered
+  config could otherwise send new secrets and operator tokens in clear
+  text. The error never repeats the URL.
+- `rotate plan` and `rotate apply` print a `warning:` line for each
+  endpoint that differs from its default, before apply asks for
+  confirmation; `plan --json` adds a `warnings` array.
+
+### Changed
+
+- `rotate rollback` exits 1 when the old secret could not be reactivated
+  (GitHub, npm and OpenAI tokens, or after a revoke by hand): the restored
+  consumers hold a revoked secret. The summary counts such rotations apart
+  ("with the old secret still revoked") and names the consumers, the plan
+  warns before you confirm, `rotate status` says so in the hint, and an
+  interrupted rollback finished by a re-run exits 1 too. It used to exit 0
+  with only a warning.
+
 ## [0.1.0] - 2026-10-04
 
 The first release: the MVP flow end to end, from a scanner report to a

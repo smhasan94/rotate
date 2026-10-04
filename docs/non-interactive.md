@@ -78,7 +78,7 @@ fingerprint.
 
 | Command | `--json` output |
 | --- | --- |
-| `rotate plan` | One JSON document described by [plan-schema.json](plan-schema.json): `version`, `overlap_window`, `rotations` (each with `rotation_id`, `provider`, `fingerprint`, `consumers`, `blockers`, ...) and `skipped`. |
+| `rotate plan` | One JSON document described by [plan-schema.json](plan-schema.json): `version`, `overlap_window`, `rotations` (each with `rotation_id`, `provider`, `fingerprint`, `consumers`, `blockers`, ...), `skipped` and `warnings` (one per non-default endpoint in `rotate.yaml`). |
 | `rotate status` | An array of rows described by [status-schema.json](status-schema.json). |
 | `rotate apply`, `rotate rollback` | Not supported yet: exits 2 with "does not support --json yet". Use the exit code and the state file. |
 
@@ -115,7 +115,7 @@ Set `ROTATE_ACTOR` so the audit log says which job acted, for example
 | Code | Meaning | What a script should do |
 | --- | --- | --- |
 | 0 | Everything requested was done. `plan` exits 0 even when it lists blockers. | Continue. |
-| 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. | Stop and page a human; run `rotate status`. |
+| 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. Also `rollback` that finished with the old secret still revoked, so the restored consumers hold a revoked secret. | Stop and page a human; run `rotate status --all`. After such a rollback, create a new credential and run `rotate apply`. |
 | 2 | Bad arguments or configuration, an unknown rotation id, an unanswerable prompt, a state file held by another rotate process, `--json` on apply or rollback, or a rollback input that matches no rotation. Nothing was changed. | Fix the invocation. |
 | 3 | Work is pending: `apply` recorded a revoke waiting for its overlap window, or `status` found a rotation that is pending, failed, needs rollback or waits for a revoke by hand. | Re-run the same `rotate apply` after the time it printed, or schedule it. |
 | 4 | `apply`: the replacement is live and verified, but rotate cannot revoke the old secret. | A human deletes the old secret as the summary says, then re-runs `rotate apply`. |

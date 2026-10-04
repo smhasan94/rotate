@@ -64,7 +64,7 @@ or Manual.
 | `verify_replacement` | Unsupported | none | A pasted token is never stored. A rotation that stopped before verify is marked `needs_rollback`. |
 | `revoke` | Automated | none | `POST /credentials/revoke`, unauthenticated. `ghs_` installation tokens and legacy 40-hex tokens are not accepted by that API and are never revoked; `ghs_` tokens expire within an hour. |
 | `revoke_replacement` | Manual | none | Rollback cannot revoke a pasted token and tells you to revoke it on GitHub by hand. |
-| `restore` | Unsupported | none | GitHub cannot reactivate a revoked token. Rollback restores consumers only. |
+| `restore` | Unsupported | none | GitHub cannot reactivate a revoked token. Rollback restores consumers only and exits 1. |
 
 ### npm access tokens (`npm`)
 
@@ -84,7 +84,7 @@ plan shows a revoke blocker naming `ROTATE_NPM_TOKEN`.
 | `verify_replacement` | Unsupported | none | A pasted token is never stored. A rotation that stopped before verify is marked `needs_rollback`. |
 | `revoke` | Automated | npm session token | Deletes the token by the id in your token list, so it needs the list and a session token; a granular token cannot list. An account that asks for a one-time password, or a granular token with 2FA bypass (403), makes the delete fail; rotate names the page to delete it on. |
 | `revoke_replacement` | Manual | npm session token | A pasted replacement has no token id, so rollback tells you to delete it by hand. |
-| `restore` | Unsupported | none | npm cannot bring back a deleted token. Rollback restores consumers only. |
+| `restore` | Unsupported | none | npm cannot bring back a deleted token. Rollback restores consumers only and exits 1. |
 
 ### OpenAI API keys (`openai`)
 
@@ -98,7 +98,7 @@ plan shows a revoke blocker naming `ROTATE_NPM_TOKEN`.
 | `verify_replacement` | Unsupported | none | Not implemented for OpenAI. A rotation that stopped before verify is marked `needs_rollback`. |
 | `revoke` | Automated; Manual without admin key | OpenAI admin key | Deletes a user-owned key by id, or a service-account key by deleting its service account when that is the account's only key. Otherwise, and without an admin key, the plan shows a manual revoke and apply stops at revoke. |
 | `revoke_replacement` | Automated; Manual without admin key or opt-in | OpenAI admin key | Deletes the service account rotate created. A pasted replacement is revoked by hand. |
-| `restore` | Unsupported | none | OpenAI cannot bring back a deleted key. Rollback restores consumers only. |
+| `restore` | Unsupported | none | OpenAI cannot bring back a deleted key. Rollback restores consumers only and exits 1. |
 
 ## Consumers
 
@@ -201,4 +201,5 @@ entry encrypted with a customer managed KMS key also needs `kms:Decrypt` and
 - Only AWS can resume at verify after the process exits; for the others the
   rotation is marked `needs_rollback`.
 - Only AWS can restore a revoked secret. For the others, rollback puts the
-  old value back in consumers but the old secret stays revoked.
+  old value back in consumers but the old secret stays revoked, and
+  rollback exits 1.

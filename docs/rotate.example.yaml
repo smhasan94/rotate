@@ -61,6 +61,9 @@ consumers:
     # AWS pair stored as two keys is updated in one new version.
     json_keys: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
 
+# Endpoint URLs below must be https://, or http:// only to 127.0.0.1, ::1
+# or localhost, with no user name or password. Plan and apply print a
+# warning for each one that differs from its default.
 providers:
   aws:
     # Region for IAM, STS and Secrets Manager. Omit to use the AWS
