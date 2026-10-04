@@ -117,6 +117,13 @@ pub struct PlanArgs {
     /// docs/permissions.md.
     #[arg(long)]
     pub check_permissions: bool,
+
+    /// Let rotate create OpenAI replacements as service accounts, which get
+    /// all permissions in the project and may be broader than the leaked
+    /// key (SHA-291). Without it, or providers.openai.allow_broader_replacement
+    /// in rotate.yaml, you paste a restricted key instead.
+    #[arg(long)]
+    pub allow_broader_replacement: bool,
 }
 
 /// Arguments of `rotate apply` (SHA-254).
@@ -156,6 +163,13 @@ pub struct ApplyArgs {
     /// a later rotate apply finishes.
     #[arg(long)]
     pub wait: bool,
+
+    /// Let rotate create OpenAI replacements as service accounts, which get
+    /// all permissions in the project and may be broader than the leaked
+    /// key (SHA-291). Without it, or providers.openai.allow_broader_replacement
+    /// in rotate.yaml, you paste a restricted key instead.
+    #[arg(long)]
+    pub allow_broader_replacement: bool,
 }
 
 /// Arguments of `rotate rollback` (SHA-259).
@@ -389,6 +403,25 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["rotate", "plan", "r.json", "--confirm", "rot-1"]).is_err());
+    }
+
+    #[test]
+    fn allow_broader_replacement_flag_on_plan_and_apply() {
+        let Command::Plan(plan) = Cli::parse_from(["rotate", "plan", "r.json"]).subcommand() else {
+            panic!("not plan");
+        };
+        assert!(!plan.allow_broader_replacement);
+        let cli = Cli::parse_from(["rotate", "plan", "r.json", "--allow-broader-replacement"]);
+        let Command::Plan(plan) = cli.subcommand() else {
+            panic!("not plan");
+        };
+        assert!(plan.allow_broader_replacement);
+        let cli = Cli::parse_from(["rotate", "apply", "r.json", "--allow-broader-replacement"]);
+        let Command::Apply(apply) = cli.subcommand() else {
+            panic!("not apply");
+        };
+        assert!(apply.allow_broader_replacement);
+        assert!(Cli::try_parse_from(["rotate", "status", "--allow-broader-replacement"]).is_err());
     }
 
     #[test]

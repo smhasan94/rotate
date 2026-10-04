@@ -59,6 +59,10 @@ const CONSUMERS: [&str; 2] = [
 /// The suffix of a status that depends on the OpenAI admin key.
 const WITHOUT_ADMIN: &str = " without admin key";
 
+/// The suffix of a status that also depends on the OpenAI opt-in to a
+/// broader replacement (SHA-291).
+const WITHOUT_ADMIN_OR_OPT_IN: &str = " without admin key or opt-in";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Automated,
@@ -97,9 +101,10 @@ impl Cell {
                 }
             }
             Some((with, without)) => {
+                let without = without.trim();
                 let without = without
-                    .trim()
-                    .strip_suffix(WITHOUT_ADMIN)
+                    .strip_suffix(WITHOUT_ADMIN_OR_OPT_IN)
+                    .or_else(|| without.strip_suffix(WITHOUT_ADMIN))
                     .unwrap_or_else(|| panic!("{text:?}: expected \"<status>{WITHOUT_ADMIN}\""));
                 Cell {
                     with: Status::parse(with),
@@ -457,10 +462,30 @@ async fn doc_cells_match_the_providers() {
 
     // OpenAI with and without an admin key: the doc's two-part cells.
     let admin = SecretValue::from(["sk", "-admin-", &filler(40)].concat());
-    let with = OpenAiProvider::new("http://127.0.0.1:9", AdminKey::Value(admin));
+    // "With" is an admin key and the opt-in to a broader replacement
+    // (SHA-291); an admin key alone leaves replacement manual, which the
+    // cells say with "or opt-in".
+    let with = OpenAiProvider::new("http://127.0.0.1:9", AdminKey::Value(admin.clone()))
+        .with_allow_broader_replacement(true);
     let without = OpenAiProvider::new("http://127.0.0.1:9", AdminKey::None);
+    let admin_only = OpenAiProvider::new("http://127.0.0.1:9", AdminKey::Value(admin));
     assert_eq!(with.replacement_mode(), ReplacementMode::Automatic);
     assert_eq!(without.replacement_mode(), ReplacementMode::Manual);
+    assert_eq!(admin_only.replacement_mode(), ReplacementMode::Manual);
+    let admin_only_cells = derive(&admin_only).await;
+    let doc_text = doc();
+    for op in ["create_replacement", "revoke_replacement"] {
+        assert_eq!(admin_only_cells[op], Status::Manual, "{op}");
+        let row = doc_text
+            .lines()
+            .find(|l| {
+                l.contains("Automated; Manual without admin key")
+                    && l.starts_with(&format!("| `{op}`"))
+                    && l.contains("OpenAI admin key")
+            })
+            .unwrap_or_else(|| panic!("no openai {op} row"));
+        assert!(row.contains(WITHOUT_ADMIN_OR_OPT_IN), "{op}: {row}");
+    }
     let mut with_cells = derive(&with).await;
     with_cells.insert("restore", restore_status(&with, "matrix-ref").await);
     let mut without_cells = derive(&without).await;

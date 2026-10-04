@@ -29,3 +29,4 @@ providers:
     registry: https://npm.example.com
   openai:
     admin_key_env: ROTATE_OPENAI_ADMIN
+    allow_broader_replacement: true

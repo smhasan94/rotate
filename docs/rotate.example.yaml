@@ -83,3 +83,10 @@ providers:
     admin_key_env: OPENAI_ADMIN_KEY
     # API base URL, without /v1. Default: https://api.openai.com
     api_url: https://api.openai.com
+    # With an admin key, let rotate create the replacement as a service
+    # account. It gets all permissions in the project, which may be broader
+    # than the leaked key: the Admin API cannot read or copy a key's
+    # permissions. Default: false, and apply asks you to paste a restricted
+    # key with the same permissions instead. --allow-broader-replacement on
+    # plan and apply sets it for one run.
+    allow_broader_replacement: false

@@ -518,6 +518,7 @@ mod tests {
             replacement_fingerprint: None,
             consumer: None,
             replacement_mode: None,
+            scope_widened: None,
             action: None,
             step,
             outcome: if error.is_some() {

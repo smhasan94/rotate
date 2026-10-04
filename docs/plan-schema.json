@@ -56,7 +56,11 @@
           "required": ["mode", "action"],
           "properties": {
             "mode": { "enum": ["automatic", "manual"] },
-            "action": { "type": "string" }
+            "action": { "type": "string" },
+            "scope_widening": {
+              "type": ["string", "null"],
+              "description": "Set when the replacement rotate creates is broader than the leaked credential (automatic mode only), for example an OpenAI service account with all permissions in the project. Null otherwise. In manual mode the reason an automatic replacement was not used is in action."
+            }
           }
         },
         "consumers": {

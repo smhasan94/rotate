@@ -212,6 +212,17 @@ pub trait Provider: Send + Sync {
         )
     }
 
+    /// Why an automatic replacement would have broader access than the
+    /// leaked credential (SHA-291), for example an OpenAI service account
+    /// that gets all permissions in the project. Pure: no network. In
+    /// automatic mode the plan shows it on the replacement row and the
+    /// `create` audit entry records `scope_widened`; in manual mode it is
+    /// the reason the replacement is manual. `None` (the default) means a
+    /// replacement has the same access. Must not contain a value.
+    fn scope_widening(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The revoke row the plan shows instead of the usual one when rotate
     /// cannot revoke this credential itself, for example an OpenAI key the
     /// Admin API cannot delete. Pure: no network. `None` (the default)

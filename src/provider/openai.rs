@@ -11,12 +11,20 @@
 //! the leaked key as its operator credential (decision D3): an admin key
 //! equal to the leaked one is refused.
 //!
-//! With an admin key the provider runs in automatic mode:
+//! With an admin key:
 //! - scope: `GET /v1/organization/projects`, then each project's
 //!   `api_keys` listing, matching the leaked key by its `redacted_value`
 //!   (head and tail). The identity is the project id.
-//! - replacement: `POST /v1/organization/projects/{id}/service_accounts`
-//!   in the same project, named `rotate-<fingerprint hex>`. OpenAI returns
+//! - replacement (SHA-291): a service account gets the member role and all
+//!   permissions, and the Admin API can neither read the leaked key's
+//!   permissions nor set the new key's, so an automatic replacement may be
+//!   broader than the key it replaces. It is therefore manual by default:
+//!   the operator creates a restricted key with the same permissions and
+//!   pastes it. Only with `providers.openai.allow_broader_replacement` (or
+//!   `--allow-broader-replacement`) is it automatic: `POST
+//!   /v1/organization/projects/{id}/service_accounts` in the same project,
+//!   named `rotate-<fingerprint hex>`, which the plan and the audit log
+//!   mark as widening scope ([`Provider::scope_widening`]). OpenAI returns
 //!   the new key's value in that response only.
 //! - revoke: OpenAI's `DELETE .../api_keys/{key_id}` deletes user-owned
 //!   keys and refuses service-account keys. A service-account key is
@@ -91,8 +99,18 @@ pub const REVOKE_UNDELETABLE: &str = "manual: the Admin API cannot delete this k
      service account holds other keys); delete it at https://platform.openai.com/api-keys";
 
 /// Scope line about permissions, which the Admin API does not expose.
-pub const PERMISSIONS_NOTE: &str = "permissions: not readable through the Admin API; a \
-     replacement is a service account with the member role and all permissions";
+pub const PERMISSIONS_NOTE: &str = "permissions: not readable through the Admin API; an \
+     automatic replacement is a service account with the member role and all permissions";
+
+/// What an automatic replacement does to access (SHA-291): shown on the
+/// plan's replacement row, and the reason it is manual without opt-in.
+pub const SCOPE_WIDENING_NOTE: &str = "the replacement would get all permissions in the \
+     project (a service account with the member role), which may be broader than the leaked \
+     key: OpenAI's Admin API cannot read or copy a key's permissions";
+
+/// Where the opt-in to an automatic, broader replacement is set.
+pub const OPT_IN_HINT: &str = "opt in with --allow-broader-replacement or \
+     providers.openai.allow_broader_replacement: true";
 
 /// Scope warning in manual mode.
 pub const MANUAL_VERIFY_WARNING: &str = "warning: without an Admin API key rotate can check \
@@ -226,6 +244,7 @@ impl AdminKey {
 pub struct OpenAiProvider {
     base: String,
     admin: AdminKey,
+    allow_broader: bool,
     verify_delay: Duration,
     http: OnceLock<Result<reqwest::Client, String>>,
 }
@@ -235,6 +254,7 @@ impl fmt::Debug for OpenAiProvider {
         f.debug_struct("OpenAiProvider")
             .field("base", &self.base)
             .field("admin", &self.admin)
+            .field("allow_broader", &self.allow_broader)
             .finish()
     }
 }
@@ -404,9 +424,24 @@ impl OpenAiProvider {
         Self {
             base: api_url.trim_end_matches('/').to_owned(),
             admin,
+            allow_broader: false,
             verify_delay: Duration::from_secs(1),
             http: OnceLock::new(),
         }
+    }
+
+    /// `providers.openai.allow_broader_replacement` (SHA-291): with an
+    /// admin key, mint the replacement as a service account even though it
+    /// gets all permissions in the project. Off by default: the operator
+    /// then pastes a restricted key.
+    pub fn with_allow_broader_replacement(mut self, allow: bool) -> Self {
+        self.allow_broader = allow;
+        self
+    }
+
+    /// Whether the operator opted in to a broader automatic replacement.
+    pub fn allows_broader_replacement(&self) -> bool {
+        self.allow_broader
     }
 
     /// The pause between `verify` attempts (tests set zero).
@@ -876,22 +911,47 @@ impl Provider for OpenAiProvider {
         NAME
     }
 
-    /// Automatic with an admin key, manual without.
+    /// Automatic only with an admin key and the opt-in to a broader
+    /// replacement (SHA-291); manual otherwise.
     fn replacement_mode(&self) -> ReplacementMode {
-        if self.has_admin_key() {
+        if self.has_admin_key() && self.allow_broader {
             ReplacementMode::Automatic
         } else {
             ReplacementMode::Manual
         }
     }
 
+    /// With an admin key an automatic replacement gets all permissions in
+    /// the project, whether or not the operator opted in to it.
+    fn scope_widening(&self) -> Option<&'static str> {
+        self.has_admin_key().then_some(SCOPE_WIDENING_NOTE)
+    }
+
+    /// With an admin key, names the project and the leaked key from the
+    /// scope lines and asks for a restricted key; without, the organization.
     fn manual_instructions(&self, scope: &Scope) -> String {
-        format!(
-            "Create a new secret key for OpenAI organization {} at {KEYS_PAGE}, in the same \
-             project and with the same permissions as the leaked one, then paste it at the \
-             prompt.",
-            scope.identity
-        )
+        let line = |prefix: &str| {
+            scope
+                .lines
+                .iter()
+                .find_map(|l| l.strip_prefix(prefix))
+                .map(str::to_owned)
+        };
+        match (line("project: "), line("key: ")) {
+            (Some(project), Some(key)) => format!(
+                "rotate does not create OpenAI replacements by default: {SCOPE_WIDENING_NOTE}.\n\
+                 At {KEYS_PAGE}, in project {project}, create a new secret key with Restricted \
+                 permissions set to the same permissions as the leaked key {key}, then paste it \
+                 at the prompt. rotate checks that the new key is listed in the same project. \
+                 To let rotate create a broader service account key instead, {OPT_IN_HINT}."
+            ),
+            _ => format!(
+                "Create a new secret key for OpenAI organization {} at {KEYS_PAGE}, in the same \
+                 project and with the same permissions as the leaked one (Restricted \
+                 permissions), then paste it at the prompt.",
+                scope.identity
+            ),
+        }
     }
 
     /// Manual without an admin key, and for a key the Admin API cannot
@@ -959,13 +1019,19 @@ impl Provider for OpenAiProvider {
     }
 
     /// A service account named `rotate-<fingerprint hex>` in the leaked
-    /// key's project, whose key is the replacement. Mutating.
+    /// key's project, whose key is the replacement. Mutating. Refused with
+    /// no call unless the operator opted in to a broader replacement.
     async fn create_replacement(
         &self,
         credential: &Credential,
     ) -> Result<Replacement, ProviderError> {
         let key = token(credential)?;
         rotatable(key)?;
+        if self.has_admin_key() && !self.allow_broader {
+            return Err(ProviderError::Unsupported(format!(
+                "{SCOPE_WIDENING_NOTE}; {OPT_IN_HINT}"
+            )));
+        }
         let admin = self.admin_key(&[key])?;
         let found = self.find(key, &admin).await?;
         let fingerprint = credential.fingerprint();
@@ -1245,7 +1311,8 @@ mod tests {
             "http://127.0.0.1:1",
             AdminKey::Value(SecretValue::from(key(["sk-", "admin-"], 60))),
         );
-        assert_eq!(with.replacement_mode(), ReplacementMode::Automatic);
+        // SHA-291: an admin key alone no longer makes the mode automatic.
+        assert_eq!(with.replacement_mode(), ReplacementMode::Manual);
         assert_eq!(with.manual_revoke(None), None);
         let undeletable = Scope {
             identity: Identity("proj_1".into()),
@@ -1258,6 +1325,36 @@ mod tests {
         let debug = format!("{with:?}");
         assert!(debug.contains("Value([set])"), "{debug}");
         assert!(!debug.contains("sk-"), "{debug}");
+    }
+
+    // SHA-291: the opt-in decides the mode with an admin key; the
+    // widening note follows the admin key; create without opt-in is
+    // refused before any call.
+    #[tokio::test]
+    async fn broader_replacement_needs_opt_in() {
+        let admin = || AdminKey::Value(SecretValue::from(key(["sk-", "admin-"], 60)));
+        let base = "http://127.0.0.1:1";
+        let plain = OpenAiProvider::new(base, admin());
+        let opted = OpenAiProvider::new(base, admin()).with_allow_broader_replacement(true);
+        let none = OpenAiProvider::new(base, AdminKey::None).with_allow_broader_replacement(true);
+        assert!(!plain.allows_broader_replacement());
+        assert!(opted.allows_broader_replacement());
+        assert_eq!(plain.replacement_mode(), ReplacementMode::Manual);
+        assert_eq!(opted.replacement_mode(), ReplacementMode::Automatic);
+        assert_eq!(none.replacement_mode(), ReplacementMode::Manual);
+        assert_eq!(plain.scope_widening(), Some(SCOPE_WIDENING_NOTE));
+        assert_eq!(opted.scope_widening(), Some(SCOPE_WIDENING_NOTE));
+        assert_eq!(none.scope_widening(), None);
+        let leaked = Credential::Token(SecretValue::from(key(["sk-", "proj-"], 60)));
+        match plain.create_replacement(&leaked).await {
+            Err(ProviderError::Unsupported(text)) => {
+                assert!(text.contains("all permissions"), "{text}");
+                assert!(text.contains("--allow-broader-replacement"), "{text}");
+            }
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("expected Unsupported, got a replacement"),
+        }
+        assert!(format!("{opted:?}").contains("allow_broader: true"));
     }
 
     // T8 (AC8)

@@ -320,6 +320,11 @@ pub struct OpenAiConfig {
     pub admin_key_env: String,
     /// API base URL, without `/v1`.
     pub api_url: ApiUrl,
+    /// Let rotate create the replacement as a service account even though
+    /// it gets all permissions in the project, which may be broader than
+    /// the leaked key (SHA-291). Off by default: the operator pastes a
+    /// restricted key. `--allow-broader-replacement` sets it for one run.
+    pub allow_broader_replacement: bool,
 }
 
 impl Default for OpenAiConfig {
@@ -327,6 +332,7 @@ impl Default for OpenAiConfig {
         Self {
             admin_key_env: "OPENAI_ADMIN_KEY".into(),
             api_url: ApiUrl("https://api.openai.com".into()),
+            allow_broader_replacement: false,
         }
     }
 }
@@ -640,6 +646,7 @@ mod tests {
             config.providers.openai.api_url.as_str(),
             "https://api.openai.com"
         );
+        assert!(!config.providers.openai.allow_broader_replacement);
         assert_eq!(config.providers.aws.region, None);
         assert_eq!(config.source, None);
     }
@@ -705,6 +712,7 @@ mod tests {
         );
         assert_eq!(providers.npm.registry.as_str(), "https://npm.example.com");
         assert_eq!(providers.openai.admin_key_env, "ROTATE_OPENAI_ADMIN");
+        assert!(providers.openai.allow_broader_replacement);
     }
 
     #[test]
@@ -815,7 +823,13 @@ mod tests {
         assert!(!sm.tag_filters.is_empty());
         assert!(sm.json_keys.is_some());
         assert!(file.providers.aws.region.is_some());
-        for key in ["api_url:", "registry:", "admin_key_env:", "endpoint_url:"] {
+        for key in [
+            "api_url:",
+            "registry:",
+            "admin_key_env:",
+            "endpoint_url:",
+            "allow_broader_replacement:",
+        ] {
             assert!(EXAMPLE.contains(key), "example is missing {key}");
         }
     }

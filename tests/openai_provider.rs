@@ -24,8 +24,8 @@ use rotate::consumer::{ConsumerMatch, ConsumerRegistry};
 use rotate::finding::{Finding, SourceLocation};
 use rotate::plan::{self, MANUAL_REVOKE_BLOCKER};
 use rotate::provider::openai::{
-    AdminKey, OpenAiProvider, PERMISSIONS_NOTE, REVOKE_NEEDS_ADMIN, REVOKE_UNDELETABLE,
-    UNDELETABLE_WARNING,
+    AdminKey, OpenAiProvider, KEYS_PAGE, PERMISSIONS_NOTE, REVOKE_NEEDS_ADMIN, REVOKE_UNDELETABLE,
+    SCOPE_WIDENING_NOTE, UNDELETABLE_WARNING,
 };
 use rotate::provider::{
     Credential, Identity, Provider, ProviderError, ProviderRegistry, ReplacementMode,
@@ -71,7 +71,13 @@ fn admin_key() -> String {
     key(ADMIN, "admin0")
 }
 
+/// An admin key and the opt-in to a broader replacement (SHA-291).
 fn automatic(rec: &CallRecorder, admin: &str) -> OpenAiProvider {
+    admin_only(rec, admin).with_allow_broader_replacement(true)
+}
+
+/// An admin key without the opt-in: manual replacement (SHA-291).
+fn admin_only(rec: &CallRecorder, admin: &str) -> OpenAiProvider {
     OpenAiProvider::new(&rec.uri(), AdminKey::Value(SecretValue::from(admin)))
         .with_verify_delay(Duration::ZERO)
 }
@@ -1037,4 +1043,476 @@ async fn live_openai_replacement_cycle() {
         .await
         .unwrap();
     verified.unwrap();
+}
+
+// SHA-291: an admin key no longer means an automatic, broader replacement.
+
+/// The audit log's `create` entries.
+fn create_entries(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["step"] == "create")
+        .collect()
+}
+
+/// No text holds any of `values`, nor OpenAI's redacted form of them.
+fn assert_absent(values: &[(&str, &str)], texts: &[(&str, &str)]) {
+    for (who, value) in values {
+        for (label, text) in texts {
+            assert!(!text.contains(value), "{who} key in {label}");
+            assert!(
+                !text.contains(&redacted(value)),
+                "{who} redacted key in {label}"
+            );
+        }
+    }
+}
+
+// SHA-291 T1 (AC1): admin key, no opt-in. The replacement row says the
+// replacement would get all permissions, the mode is manual, there is no
+// blocker for it, and the plan makes no service-accounts POST.
+#[tokio::test]
+async fn sha291_t1_no_opt_in_plans_manual_without_post() {
+    let rec = CallRecorder::start().await;
+    let admin = admin_key();
+    let leaked = key(PROJ, "w1leak");
+    mount_models(&rec, &leaked, 200, None).await;
+    mount_org(&rec, &admin, &leaked, vec![]).await;
+    mount_create(&rec, "proj_b", "svc_acct_new", &key(SVC, "w1new0")).await;
+
+    let p = pipeline(admin_only(&rec, &admin), &leaked).await;
+    let rotation = &p.plan.rotations[0];
+    assert_eq!(rotation.replacement_mode, ReplacementMode::Manual);
+    assert_eq!(rotation.scope_widening, Some(SCOPE_WIDENING_NOTE));
+    assert_eq!(rotation.widens_scope(), None);
+    assert!(rotation.blockers.is_empty(), "{:?}", rotation.blockers);
+    let table = plan::render_table(&p.plan);
+    let row = table
+        .lines()
+        .find(|l| l.trim_start().starts_with("replacement:"))
+        .unwrap();
+    assert!(row.contains("manual: you will be asked to paste"), "{row}");
+    assert!(row.contains("all permissions"), "{row}");
+    assert!(row.contains("--allow-broader-replacement"), "{row}");
+    assert!(!table.contains("scope widening:"), "{table}");
+    let json: serde_json::Value = serde_json::from_str(&plan::render_json(&p.plan)).unwrap();
+    let replacement = &json["rotations"][0]["replacement"];
+    assert_eq!(replacement["mode"], "manual");
+    assert!(replacement["action"]
+        .as_str()
+        .unwrap()
+        .contains("all permissions"));
+    assert!(replacement["scope_widening"].is_null());
+
+    let calls = rec.calls().await;
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.method == "POST" && c.path.ends_with("/service_accounts")),
+        "{calls:?}"
+    );
+    rec.assert_no_mutations().await;
+}
+
+// SHA-291 T2 (AC2), library half: with the opt-in the mode is automatic,
+// the note is shown on its own line and in JSON, and nothing blocks.
+#[tokio::test]
+async fn sha291_t2_opt_in_plans_automatic_with_note() {
+    let rec = CallRecorder::start().await;
+    let admin = admin_key();
+    let leaked = key(PROJ, "w2leak");
+    mount_models(&rec, &leaked, 200, None).await;
+    mount_org(&rec, &admin, &leaked, vec![]).await;
+
+    let p = pipeline(automatic(&rec, &admin), &leaked).await;
+    let rotation = &p.plan.rotations[0];
+    assert_eq!(rotation.replacement_mode, ReplacementMode::Automatic);
+    assert_eq!(rotation.widens_scope(), Some(SCOPE_WIDENING_NOTE));
+    assert!(rotation.blockers.is_empty(), "{:?}", rotation.blockers);
+    let table = plan::render_table(&p.plan);
+    assert!(
+        table.contains(&format!("  scope widening: {SCOPE_WIDENING_NOTE}\n")),
+        "{table}"
+    );
+    assert!(table.contains("create a new openai credential for proj_b"));
+    assert!(!table.contains("blockers:"), "{table}");
+    let json: serde_json::Value = serde_json::from_str(&plan::render_json(&p.plan)).unwrap();
+    assert_eq!(json["rotations"][0]["replacement"]["mode"], "automatic");
+    assert_eq!(
+        json["rotations"][0]["replacement"]["scope_widening"],
+        SCOPE_WIDENING_NOTE
+    );
+    assert_eq!(json["rotations"][0]["blockers"], serde_json::json!([]));
+    rec.assert_no_mutations().await;
+}
+
+// SHA-291 T3 (AC3): apply with the opt-in creates the service account as
+// before, and the create audit entry records `scope_widened: true`.
+#[tokio::test]
+async fn sha291_t3_opt_in_apply_posts_and_audits_scope_widened() {
+    let rec = CallRecorder::start().await;
+    let admin = admin_key();
+    let leaked = key(PROJ, "w3leak");
+    let fresh = key(SVC, "w3new0");
+    mount_models(&rec, &leaked, 200, None).await;
+    mount_models(&rec, &fresh, 200, None).await;
+    mount_org(
+        &rec,
+        &admin,
+        &leaked,
+        vec![account_key("key_new", "svc_acct_new", &fresh)],
+    )
+    .await;
+    mount_create(&rec, "proj_b", "svc_acct_new", &fresh).await;
+    mount_delete(
+        &rec,
+        "/v1/organization/projects/proj_b/api_keys/key_leak",
+        200,
+    )
+    .await;
+
+    let mut p = pipeline(automatic(&rec, &admin), &leaked).await;
+    let outcome = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+        .run(&p.plan.rotations[0])
+        .await;
+    assert!(
+        matches!(outcome.result, RunResult::Revoked),
+        "{:?}",
+        outcome.result
+    );
+    let calls = rec.calls().await;
+    let posts: Vec<_> = calls.iter().filter(|c| c.method == "POST").collect();
+    assert_eq!(posts.len(), 1, "{calls:?}");
+    assert_eq!(
+        posts[0].path,
+        "/v1/organization/projects/proj_b/service_accounts"
+    );
+    let creates = create_entries(p.dir.path());
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    assert_eq!(creates[0]["outcome"], "ok");
+    assert_eq!(creates[0]["replacement_mode"], "automatic");
+    assert_eq!(creates[0]["scope_widened"], true);
+}
+
+/// T4's setup: admin key, no opt-in, and a restricted key `fresh` the
+/// operator made in the same project.
+async fn manual_with_admin(rec: &CallRecorder, admin: &str, leaked: &str, fresh: &str) {
+    mount_models(rec, leaked, 200, None).await;
+    mount_models(rec, fresh, 200, None).await;
+    mount_org(
+        rec,
+        admin,
+        leaked,
+        vec![user_key("key_fresh", "backend prod restricted", fresh)],
+    )
+    .await;
+    mount_create(rec, "proj_b", "svc_acct_new", &key(SVC, "w4svc0")).await;
+    mount_delete(
+        rec,
+        "/v1/organization/projects/proj_b/api_keys/key_leak",
+        200,
+    )
+    .await;
+}
+
+// SHA-291 T4 (AC4): without the opt-in, apply prints instructions naming
+// the project, the leaked key's name and the keys page where restricted
+// keys are made, takes the pasted key, verifies it is in the same project,
+// and never creates a service account.
+#[tokio::test]
+async fn sha291_t4_manual_instructions_name_project_key_and_page() {
+    let rec = CallRecorder::start().await;
+    let admin = admin_key();
+    let leaked = key(PROJ, "w4leak");
+    let fresh = key(PROJ, "w4new0");
+    manual_with_admin(&rec, &admin, &leaked, &fresh).await;
+
+    let mut p = pipeline(admin_only(&rec, &admin), &leaked).await;
+    let mut term = Term::default();
+    let outcome = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+        .with_manual(
+            ReplacementSource::Supplied(Some(SecretValue::from(fresh.as_str()))),
+            &mut term,
+        )
+        .run(&p.plan.rotations[0])
+        .await;
+    assert!(
+        matches!(outcome.result, RunResult::Revoked),
+        "{:?}",
+        outcome.result
+    );
+    for needle in [
+        "Backend (proj_b)",
+        "backend prod (key_leak)",
+        KEYS_PAGE,
+        "Restricted",
+        "same permissions",
+        "--allow-broader-replacement",
+    ] {
+        assert!(term.out.contains(needle), "{needle} not in: {}", term.out);
+    }
+    let calls = rec.calls().await;
+    assert!(!calls.iter().any(|c| c.method == "POST"), "{calls:?}");
+    let creates = create_entries(p.dir.path());
+    assert_eq!(creates[0]["replacement_mode"], "manual");
+    assert!(creates[0].get("scope_widened").is_none(), "{creates:?}");
+    assert_eq!(
+        p.gha.current("gha:acme/app:OPENAI_API_KEY"),
+        Some(SecretValue::from(fresh.as_str()).fingerprint())
+    );
+}
+
+// SHA-291 T5 (AC5): the scope-widening note is in
+// `replacement.scope_widening`, which `docs/plan-schema.json` documents,
+// and the document validates against the schema.
+#[tokio::test]
+async fn sha291_t5_scope_widening_field_is_in_the_schema() {
+    let rec = CallRecorder::start().await;
+    let admin = admin_key();
+    let leaked = key(PROJ, "w5leak");
+    mount_models(&rec, &leaked, 200, None).await;
+    mount_org(&rec, &admin, &leaked, vec![]).await;
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../docs/plan-schema.json")).unwrap();
+    let field =
+        &schema["$defs"]["rotation"]["properties"]["replacement"]["properties"]["scope_widening"];
+    assert_eq!(field["type"], serde_json::json!(["string", "null"]));
+    assert!(field["description"].as_str().unwrap().len() > 20);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for provider in [automatic(&rec, &admin), admin_only(&rec, &admin)] {
+        let p = pipeline(provider, &leaked).await;
+        let json: serde_json::Value = serde_json::from_str(&plan::render_json(&p.plan)).unwrap();
+        let errors: Vec<String> = validator
+            .iter_errors(&json)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let note = &json["rotations"][0]["replacement"]["scope_widening"];
+        match p.plan.rotations[0].replacement_mode {
+            ReplacementMode::Automatic => assert_eq!(note, SCOPE_WIDENING_NOTE),
+            ReplacementMode::Manual => assert!(note.is_null()),
+        }
+    }
+}
+
+// SHA-291 T6 (AC1, AC3, AC4): the T1 plan, the T3 automatic apply and the
+// T4 manual apply, with canary leaked, new, pasted and admin keys. None of
+// them, nor OpenAI's redacted form, is in a table, JSON, terminal text,
+// summary, outcome, TRACE log, audit log or state file.
+#[tokio::test]
+async fn sha291_t6_no_key_in_any_output() {
+    let capture = trace_capture();
+    let admin = admin_key();
+
+    // T1 and T4: no opt-in.
+    let rec = CallRecorder::start().await;
+    let leaked = key(PROJ, "w6leak");
+    let pasted = key(PROJ, "w6past");
+    manual_with_admin(&rec, &admin, &leaked, &pasted).await;
+    let mut manual_run = pipeline(admin_only(&rec, &admin), &leaked).await;
+    let manual_table = plan::render_table(&manual_run.plan);
+    let manual_json = plan::render_json(&manual_run.plan);
+    let mut term = Term::default();
+    let manual_outcome = Executor::new(
+        &manual_run.providers,
+        &manual_run.consumers,
+        &mut manual_run.store,
+        &mut manual_run.audit,
+    )
+    .with_manual(
+        ReplacementSource::Supplied(Some(SecretValue::from(pasted.as_str()))),
+        &mut term,
+    )
+    .run(&manual_run.plan.rotations[0])
+    .await;
+    assert!(matches!(manual_outcome.result, RunResult::Revoked));
+
+    // T3: opt-in.
+    let rec = CallRecorder::start().await;
+    let leaked_auto = key(PROJ, "w6aleak");
+    let fresh = key(SVC, "w6anew0");
+    mount_models(&rec, &leaked_auto, 200, None).await;
+    mount_models(&rec, &fresh, 200, None).await;
+    mount_org(
+        &rec,
+        &admin,
+        &leaked_auto,
+        vec![account_key("key_new", "svc_acct_new", &fresh)],
+    )
+    .await;
+    mount_create(&rec, "proj_b", "svc_acct_new", &fresh).await;
+    mount_delete(
+        &rec,
+        "/v1/organization/projects/proj_b/api_keys/key_leak",
+        200,
+    )
+    .await;
+    let mut auto_run = pipeline(automatic(&rec, &admin), &leaked_auto).await;
+    let auto_table = plan::render_table(&auto_run.plan);
+    let auto_outcome = Executor::new(
+        &auto_run.providers,
+        &auto_run.consumers,
+        &mut auto_run.store,
+        &mut auto_run.audit,
+    )
+    .run(&auto_run.plan.rotations[0])
+    .await;
+    assert!(matches!(auto_outcome.result, RunResult::Revoked));
+
+    let read = |run: &Pipeline, name: &str| {
+        std::fs::read_to_string(run.dir.path().join(name)).unwrap_or_default()
+    };
+    let manual_audit = read(&manual_run, "audit.jsonl");
+    let auto_audit = read(&auto_run, "audit.jsonl");
+    assert!(!manual_audit.is_empty() && !auto_audit.is_empty());
+    let summary = apply::render_summary(&[manual_outcome.clone(), auto_outcome.clone()]);
+    let logs = capture.contents();
+    assert!(!logs.is_empty(), "the TRACE capture saw nothing");
+    let texts = [
+        ("manual plan table", manual_table),
+        ("manual plan json", manual_json),
+        ("automatic plan table", auto_table),
+        ("stdout", term.out.clone()),
+        ("stderr", term.err.clone()),
+        ("summary", summary),
+        ("outcomes", format!("{manual_outcome:?}{auto_outcome:?}")),
+        ("manual audit log", manual_audit),
+        ("manual state file", read(&manual_run, "state.json")),
+        ("automatic audit log", auto_audit),
+        ("automatic state file", read(&auto_run, "state.json")),
+        ("logs", logs),
+    ];
+    let texts: Vec<(&str, &str)> = texts.iter().map(|(l, t)| (*l, t.as_str())).collect();
+    assert_absent(
+        &[
+            ("leaked", &leaked),
+            ("pasted", &pasted),
+            ("automatic leaked", &leaked_auto),
+            ("new", &fresh),
+            ("admin", &admin),
+        ],
+        &texts,
+    );
+}
+
+/// Runs the binary with the real plugins against `rec` (SHA-264), the
+/// admin key in the environment and `extra_yaml` added to the OpenAI
+/// provider settings in `rotate.yaml`.
+#[cfg(all(unix, feature = "test-providers"))]
+fn run_binary(
+    dir: &std::path::Path,
+    rec: &CallRecorder,
+    extra_yaml: &str,
+    args: &[&str],
+    secrets: (&str, &str),
+) -> std::process::Output {
+    const ADMIN_ENV: &str = "ROTATE_SHA291_OPENAI_ADMIN";
+    let (admin, leaked) = secrets;
+    std::fs::write(
+        dir.join("rotate.yaml"),
+        format!(
+            "providers:\n  openai:\n    api_url: {}\n    admin_key_env: {ADMIN_ENV}\n{extra_yaml}",
+            rec.uri()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("scenario.json"),
+        serde_json::json!({ "real_plugins": true, "prompt": "panic" }).to_string(),
+    )
+    .unwrap();
+    assert_cmd::Command::cargo_bin("rotate")
+        .unwrap()
+        .current_dir(dir)
+        .env_clear()
+        .env("HOME", dir)
+        .env("ROTATE_TEST_SCENARIO", dir.join("scenario.json"))
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env(ADMIN_ENV, admin)
+        .args(args)
+        .write_stdin(format!("{leaked}\n"))
+        .output()
+        .unwrap()
+}
+
+// SHA-291 T1 and T2 (AC1, AC2) through the binary: no opt-in plans a
+// manual replacement; the opt-in by rotate.yaml, then by the flag, plans an
+// automatic one with the note and no blocker. No run makes a
+// state-changing call, and neither key reaches stdout, stderr (at -vvv) or
+// the state file.
+#[cfg(all(unix, feature = "test-providers"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha291_t2_opt_in_by_config_and_by_flag_through_the_binary() {
+    let rec = CallRecorder::start().await;
+    let admin = admin_key();
+    let leaked = key(PROJ, "w2bin0");
+    mount_models(&rec, &leaked, 200, None).await;
+    mount_org(&rec, &admin, &leaked, vec![]).await;
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../docs/plan-schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+
+    let cases: [(&str, &str, &[&str]); 3] = [
+        ("no opt-in", "", &[]),
+        ("config", "    allow_broader_replacement: true\n", &[]),
+        ("flag", "", &["--allow-broader-replacement"]),
+    ];
+    for (case, yaml, flag) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = vec!["-vvv", "--json", "plan", "--stdin", "--provider", "openai"];
+        args.extend_from_slice(flag);
+        let output = run_binary(dir.path(), &rec, yaml, &args, (&admin, &leaked));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(0), "{case}: {stdout}{stderr}");
+        let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let errors: Vec<String> = validator
+            .iter_errors(&plan)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{case}: {errors:?}");
+        let rotation = &plan["rotations"][0];
+        assert_eq!(rotation["blockers"], serde_json::json!([]), "{case}");
+        let replacement = &rotation["replacement"];
+        if case == "no opt-in" {
+            assert_eq!(replacement["mode"], "manual", "{case}");
+            assert!(replacement["scope_widening"].is_null(), "{case}");
+            assert!(replacement["action"]
+                .as_str()
+                .unwrap()
+                .contains("all permissions"));
+        } else {
+            assert_eq!(replacement["mode"], "automatic", "{case}");
+            assert_eq!(replacement["scope_widening"], SCOPE_WIDENING_NOTE, "{case}");
+        }
+        args.retain(|a| *a != "--json");
+        let table = run_binary(dir.path(), &rec, yaml, &args, (&admin, &leaked));
+        let table_out = String::from_utf8_lossy(&table.stdout).into_owned();
+        let table_err = String::from_utf8_lossy(&table.stderr).into_owned();
+        assert_eq!(table.status.code(), Some(0), "{case}: {table_err}");
+        assert_eq!(
+            table_out.contains("scope widening:"),
+            case != "no opt-in",
+            "{case}: {table_out}"
+        );
+        let state = std::fs::read_to_string(dir.path().join(".rotate/state.json")).unwrap();
+        assert_absent(
+            &[("leaked", &leaked), ("admin", &admin)],
+            &[
+                ("stdout", &stdout),
+                ("stderr", &stderr),
+                ("table stdout", &table_out),
+                ("table stderr", &table_err),
+                ("state file", &state),
+            ],
+        );
+    }
+    let calls = rec.calls().await;
+    assert!(
+        calls.iter().any(|c| c.path == "/v1/organization/projects"),
+        "the plans listed projects: {calls:?}"
+    );
+    rec.assert_no_mutations().await;
 }

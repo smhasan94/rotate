@@ -834,6 +834,8 @@ struct Progress {
     record: Rotation,
     provider: &'static str,
     mode: ReplacementMode,
+    /// The replacement is broader than the leaked credential (SHA-291).
+    scope_widened: bool,
     forced: Vec<String>,
 }
 
@@ -911,6 +913,7 @@ impl<'a> Executor<'a> {
                 }),
             provider: rotation.provider,
             mode: rotation.replacement_mode,
+            scope_widened: rotation.widens_scope().is_some(),
             forced: Vec::new(),
         };
         let result = self.steps(rotation, &mut progress).await;
@@ -1459,6 +1462,7 @@ impl<'a> Executor<'a> {
             record,
             provider,
             mode: ReplacementMode::Automatic,
+            scope_widened: false,
             forced: Vec::new(),
         };
         let result = self.revoked_by_hand(&mut progress);
@@ -1553,6 +1557,9 @@ impl<'a> Executor<'a> {
         }
         if step == AuditStep::Create {
             event = event.with_mode(progress.mode);
+            if progress.scope_widened {
+                event = event.with_scope_widened();
+            }
         }
         if let Some(error) = error {
             event = event.with_error(error);
@@ -2582,6 +2589,7 @@ mod tests {
             scope: None,
             scope_error: None,
             replacement_mode: ReplacementMode::Automatic,
+            scope_widening: None,
             consumers: Vec::new(),
             lookup_errors: Vec::new(),
             revoke_action: "x",
