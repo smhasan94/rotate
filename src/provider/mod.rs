@@ -177,15 +177,66 @@ pub enum ProviderError {
     /// token where a key pair was required.
     #[error("unsupported by the provider: {0}")]
     Unsupported(String),
+    /// Another error with rotate's own fixed advice on what to do about it
+    /// (SHA-298). Displays and behaves as `error`; the guidance is a
+    /// constant, never built from upstream or runtime text, so it survives
+    /// where the upstream text is only summarized (a resumed revoke).
+    #[error("{error}")]
+    Guided {
+        /// The error being explained.
+        error: Box<ProviderError>,
+        /// What the operator should do. Must not contain a value.
+        guidance: &'static str,
+    },
 }
 
 impl ProviderError {
     /// True for failures a retry with backoff may fix (SHA-248).
     pub fn is_retryable(&self) -> bool {
         matches!(
-            self,
+            self.base(),
             ProviderError::RateLimited { .. } | ProviderError::Transient(_)
         )
+    }
+
+    /// This error with `guidance` attached (SHA-298).
+    pub fn with_guidance(self, guidance: &'static str) -> Self {
+        ProviderError::Guided {
+            error: Box::new(self.into_base()),
+            guidance,
+        }
+    }
+
+    /// The guidance attached with [`with_guidance`](Self::with_guidance).
+    pub fn guidance(&self) -> Option<&'static str> {
+        match self {
+            ProviderError::Guided { guidance, .. } => Some(guidance),
+            _ => None,
+        }
+    }
+
+    /// The error without its guidance; match on this, not on `self`.
+    pub fn base(&self) -> &ProviderError {
+        match self {
+            ProviderError::Guided { error, .. } => error.base(),
+            other => other,
+        }
+    }
+
+    /// Owned [`base`](Self::base).
+    pub fn into_base(self) -> ProviderError {
+        match self {
+            ProviderError::Guided { error, .. } => error.into_base(),
+            other => other,
+        }
+    }
+
+    /// The reason text when the base error is `Unsupported`.
+    pub fn unsupported(&self) -> Option<&str> {
+        match self.base() {
+            ProviderError::Unsupported(why) => Some(why),
+            _ => None,
+        }
     }
 }
 
@@ -432,6 +483,30 @@ mod tests {
         );
 
         assert!(registry.identify(&finding("other")).unwrap().is_none());
+    }
+
+    /// SHA-298 T4: a guided error behaves as the error it wraps.
+    #[test]
+    fn guided_error_behaves_as_its_base() {
+        let cases = [
+            ProviderError::RateLimited { retry_after: None },
+            ProviderError::Transient("t".into()),
+            ProviderError::Permanent("p".into()),
+            ProviderError::Unsupported("u".into()),
+        ];
+        for base in cases {
+            let guided = base.clone().with_guidance("do this");
+            assert_eq!(guided.to_string(), base.to_string());
+            assert_eq!(guided.is_retryable(), base.is_retryable());
+            assert_eq!(guided.base(), &base);
+            assert_eq!(guided.unsupported(), base.unsupported());
+            assert_eq!(guided.guidance(), Some("do this"));
+            assert_eq!(base.guidance(), None);
+            // Re-guiding replaces the guidance rather than nesting.
+            let again = guided.with_guidance("other");
+            assert_eq!(again.guidance(), Some("other"));
+            assert_eq!(again.clone().into_base(), base);
+        }
     }
 
     // T6 (AC6)

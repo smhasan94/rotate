@@ -229,7 +229,8 @@ async fn verify_wrong_identity_fails(fx: &ProviderFixture, rec: &mut Recorder) -
 /// Why the revoke checks are skipped: the provider cannot revoke this
 /// credential at all (for example OpenAI without an Admin API key).
 fn revoke_unsupported(e: &ProviderError) -> Option<Outcome> {
-    matches!(e, ProviderError::Unsupported(_))
+    e.unsupported()
+        .is_some()
         .then(|| Outcome::Skipped("revoke is unsupported for this credential".into()))
 }
 
