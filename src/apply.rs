@@ -985,13 +985,19 @@ impl<'a> Executor<'a> {
                 return result;
             }
         }
-        if from <= Resume::Verify {
+        // The verified replacement leaves `held` but stays alive, and so
+        // registered with the redactor, until revoke is over: a revoke error
+        // or revoke-by-hand text that echoes it is printed and stored after
+        // this point (SHA-293).
+        let _verified = if from <= Resume::Verify {
             progress.record.failed_step = None;
             if let Err(result) = self.verify(rotation, provider.as_ref(), progress).await {
                 return result;
             }
-            self.held.remove(&id);
-        }
+            self.held.remove(&id)
+        } else {
+            None
+        };
         self.finish(rotation, provider.as_ref(), progress).await
     }
 
@@ -2928,6 +2934,53 @@ mod tests {
             stored.revoke_instructions.as_deref(),
             Some("delete it at https://example.test")
         );
+    }
+
+    /// SHA-293: a revoke error or revoke-by-hand text that echoes the
+    /// replacement is redacted. The replacement is out of `held` once
+    /// verified, but stays registered until revoke is over.
+    #[tokio::test]
+    async fn revoke_text_echoing_the_replacement_is_redacted() {
+        // A provider name of its own per case, so no other test registers
+        // the same replacement value.
+        let cases = [
+            ("unsupported", "sha293unsupported", Step::RevokeManual),
+            ("permanent", "sha293permanent", Step::Failed),
+        ];
+        for (kind, name, step) in cases {
+            let value = format!("npm_apply_unit_echo_{kind}");
+            let replacement = format!("npm_{name}-replacement-1");
+            let mut f = fixture(&value, MockProvider::new(name));
+            let plan = plan(&mut f, &value, "0s").await;
+            let echo = format!("refused; the new key {replacement} stays live");
+            let error = match kind {
+                "unsupported" => ProviderError::Unsupported(echo),
+                _ => ProviderError::Permanent(echo),
+            };
+            f.provider.fail_always("revoke", error);
+            let outcome = run(&mut f, &plan).await;
+            drop(plan);
+            let stored = f.store.get(&outcome.rotation_id).unwrap().clone();
+            assert_eq!(stored.step, step, "{kind}");
+            // The state record holds the text only as revoke instructions.
+            let state = serde_json::to_string(&stored).unwrap();
+            let texts = [
+                format!("{:?}", outcome.result),
+                format!("{:?}", last_audit(&f)),
+                stored.revoke_instructions.clone().unwrap_or_default(),
+            ];
+            for (i, text) in texts.iter().enumerate() {
+                assert!(
+                    !text.contains(&replacement),
+                    "{kind}: the replacement leaked"
+                );
+                assert!(
+                    text.contains("[REDACTED") || (i == 2 && step == Step::Failed),
+                    "{kind}: {text}"
+                );
+            }
+            assert!(!state.contains(&replacement), "{kind}: in the state record");
+        }
     }
 
     // T7 (AC7)
