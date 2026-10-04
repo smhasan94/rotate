@@ -122,3 +122,32 @@ fn missing_flag_value_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("--config"));
 }
+
+/// SHA-294 T1 covers AC1: no internal ticket id reaches `--help` or `-h`
+/// for the root command or any subcommand.
+#[test]
+fn help_has_no_ticket_ids() {
+    let ticket = regex::Regex::new(r"SHA-\d+").unwrap();
+    let subcommands = [
+        None,
+        Some("plan"),
+        Some("apply"),
+        Some("rollback"),
+        Some("status"),
+    ];
+    for sub in subcommands {
+        for flag in ["--help", "-h"] {
+            let mut cmd = rotate();
+            if let Some(sub) = sub {
+                cmd.arg(sub);
+            }
+            let out = cmd.arg(flag).output().unwrap();
+            assert!(out.status.success(), "{sub:?} {flag}");
+            let text = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                !ticket.is_match(&text),
+                "{sub:?} {flag} names a ticket:\n{text}"
+            );
+        }
+    }
+}
