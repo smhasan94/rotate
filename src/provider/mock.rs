@@ -39,6 +39,7 @@ pub struct MockProvider {
     scope: Scope,
     restore_outcome: RestoreOutcome,
     mode: ReplacementMode,
+    manual_revoke: Option<&'static str>,
     log: CallLog,
     queued_failures: Mutex<HashMap<String, VecDeque<ProviderError>>>,
     standing_failures: Mutex<HashMap<String, ProviderError>>,
@@ -84,6 +85,7 @@ impl MockProvider {
             },
             restore_outcome: RestoreOutcome::Restored,
             mode: ReplacementMode::Automatic,
+            manual_revoke: None,
             log: CallLog::new(),
             queued_failures: Mutex::new(HashMap::new()),
             standing_failures: Mutex::new(HashMap::new()),
@@ -137,6 +139,19 @@ impl MockProvider {
     pub fn mode(mut self, mode: ReplacementMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// What `Provider::manual_revoke` returns (default `None`): the
+    /// credential has to be revoked by hand (SHA-289).
+    pub fn manual_revoke(mut self, instructions: &'static str) -> Self {
+        self.manual_revoke = Some(instructions);
+        self
+    }
+
+    /// Treat `fingerprint` as revoked from now on, as an operator deleting
+    /// it by hand would: `check_valid` reports it `Invalid` (SHA-289).
+    pub fn mark_revoked(&self, fingerprint: Fingerprint) {
+        lock(&self.revoked).insert(fingerprint);
     }
 
     /// Write calls to a log shared with other doubles.
@@ -340,6 +355,10 @@ impl Provider for MockProvider {
 
     fn replacement_mode(&self) -> ReplacementMode {
         self.mode
+    }
+
+    fn manual_revoke(&self, _scope: Option<&Scope>) -> Option<&'static str> {
+        self.manual_revoke
     }
 
     fn identify(&self, finding: &Finding) -> Option<Confidence> {

@@ -45,6 +45,29 @@ use crate::secret::SecretValue;
 /// The consumer's name in plans, config and the audit log.
 pub const NAME: &str = "aws-secrets-manager";
 
+/// Every Secrets Manager action this consumer calls with the operator's
+/// credentials (SHA-270): `find` reads entries (and lists them for
+/// `tag_filters`), `update` and `restore` read and write a new version.
+/// `docs/permissions.md` documents exactly these.
+pub const REQUIRED_ACTIONS: &[&str] = &[
+    "secretsmanager:GetSecretValue",
+    "secretsmanager:PutSecretValue",
+    "secretsmanager:ListSecrets",
+];
+
+/// The actions `update` and `restore` need on one entry, which `rotate
+/// plan --check-permissions` simulates.
+pub const WRITE_ACTIONS: &[&str] = &[
+    "secretsmanager:GetSecretValue",
+    "secretsmanager:PutSecretValue",
+];
+
+/// The entry a match from [`SecretsManagerConsumer`] names, as configured
+/// (a name or an ARN). `None` for any other reference.
+pub fn secret_id(consumer_ref: &str) -> Option<String> {
+    Location::parse(consumer_ref).ok().map(|l| l.secret_id)
+}
+
 /// Prefix of every client request token rotate sends.
 const TOKEN_PREFIX: &str = "rotate-";
 /// Hex characters of the digest kept in a token (AWS allows 32 to 64).
@@ -857,6 +880,16 @@ mod tests {
         };
         assert_eq!(whole.to_ref(), "aws-secrets-manager:prod/token#$");
         assert_eq!(Location::parse(&whole.to_ref()).unwrap(), whole);
+    }
+
+    #[test]
+    fn secret_id_of_a_match() {
+        assert_eq!(
+            secret_id("aws-secrets-manager:prod/app#$.AWS_SECRET_ACCESS_KEY|$.AWS_ACCESS_KEY_ID")
+                .as_deref(),
+            Some("prod/app")
+        );
+        assert_eq!(secret_id("github-actions:acme/api:X"), None);
     }
 
     #[test]

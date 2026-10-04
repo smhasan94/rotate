@@ -49,6 +49,26 @@ use crate::secret::{SecretPair, SecretValue};
 /// Name used in plans, config and the audit log.
 pub const NAME: &str = "aws";
 
+/// Every IAM action this provider calls with the operator's credentials,
+/// across plan, apply and rollback. `docs/permissions.md` documents exactly
+/// these (SHA-270); `tests/permissions_doc.rs` keeps the two in sync with
+/// the SDK calls in this file. `iam:DeleteAccessKey` is never called.
+pub const REQUIRED_ACTIONS: &[&str] = &[
+    "iam:GetAccessKeyLastUsed",
+    "iam:GetUser",
+    "iam:ListAttachedUserPolicies",
+    "iam:ListUserPolicies",
+    "iam:ListGroupsForUser",
+    "iam:ListAccessKeys",
+    "iam:CreateAccessKey",
+    "iam:UpdateAccessKey",
+];
+
+/// The operator actions `rotate plan --check-permissions` adds: its own ARN,
+/// then the policy simulation. Both are optional for every other command.
+pub const CHECK_PERMISSIONS_ACTIONS: &[&str] =
+    &["sts:GetCallerIdentity", "iam:SimulatePrincipalPolicy"];
+
 /// `Unknown` reason for an `ASIA` key.
 pub const TEMPORARY_CREDENTIAL: &str = "temporary credential: revoke by rotating the source";
 
@@ -418,6 +438,71 @@ impl AwsProvider {
             .map_err(|e| classify(OP, &e).into_operator_error(OP))
     }
 
+    /// The operator's own principal ARN, for `rotate plan
+    /// --check-permissions` (SHA-270): `sts:GetCallerIdentity` signed with
+    /// the operator's credentials. An assumed-role session ARN becomes the
+    /// role's ARN, which is what the IAM policy simulator accepts; a role
+    /// with a path is then not found and the simulation reports that.
+    pub async fn operator_principal(&self) -> Result<String, ProviderError> {
+        const OP: &str = "sts:GetCallerIdentity";
+        let config = match self.operator.get_or_init(|| self.load_operator()).await {
+            Ok(config) => config,
+            Err(message) => return Err(ProviderError::Permanent(message.clone())),
+        };
+        let out = aws_sdk_sts::Client::new(config)
+            .get_caller_identity()
+            .send()
+            .await
+            .map_err(|e| classify(OP, &e).into_operator_error(OP))?;
+        let arn = out.arn().map(clean).unwrap_or_default();
+        principal_arn(&arn).ok_or_else(|| {
+            ProviderError::Unsupported(format!(
+                "{OP}: the operator principal {arn} cannot be simulated"
+            ))
+        })
+    }
+
+    /// `iam:SimulatePrincipalPolicy` for `principal` with `actions` on
+    /// `resource`: the actions the simulation does not allow, in the order
+    /// given. Read-only; the operator needs `iam:SimulatePrincipalPolicy`.
+    pub async fn simulate_operator(
+        &self,
+        principal: &str,
+        actions: &[&str],
+        resource: &str,
+    ) -> Result<Vec<String>, ProviderError> {
+        const OP: &str = "iam:SimulatePrincipalPolicy";
+        let iam = self.iam().await?;
+        let mut allowed = Vec::new();
+        let mut marker = None;
+        for _ in 0..MAX_PAGES {
+            let out = iam
+                .simulate_principal_policy()
+                .policy_source_arn(principal)
+                .set_action_names(Some(actions.iter().map(|a| (*a).to_owned()).collect()))
+                .resource_arns(resource)
+                .set_marker(marker.take())
+                .send()
+                .await
+                .map_err(|e| classify(OP, &e).into_operator_error(OP))?;
+            for result in out.evaluation_results() {
+                let action = clean(result.eval_action_name());
+                if result.eval_decision().as_str() == "allowed" {
+                    allowed.push(action);
+                }
+            }
+            marker = next_marker(out.is_truncated(), out.marker());
+            if marker.is_none() {
+                break;
+            }
+        }
+        Ok(actions
+            .iter()
+            .filter(|a| !allowed.iter().any(|x| x.eq_ignore_ascii_case(a)))
+            .map(|a| (*a).to_owned())
+            .collect())
+    }
+
     /// `OLD:NEW` when this process created the replacement for `old`, else
     /// `OLD`.
     fn restore_ref_for(&self, old: &str) -> String {
@@ -710,6 +795,33 @@ fn parse_restore_ref(restore_ref: &str) -> Result<(&str, Option<&str>), Provider
 }
 
 /// The account id from an ARN (`arn:aws:iam::<acct>:user/...`).
+/// The IAM principal ARN the policy simulator accepts for a caller ARN:
+/// users and roles as they are, an assumed-role session as its role.
+/// `None` for root, federated users and anything else.
+fn principal_arn(arn: &str) -> Option<String> {
+    let mut parts = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(_), Some(account), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    match service {
+        "iam" if resource.starts_with("user/") || resource.starts_with("role/") => {
+            Some(arn.to_owned())
+        }
+        "sts" => {
+            let role = resource.strip_prefix("assumed-role/")?.split('/').next()?;
+            (!role.is_empty()).then(|| format!("arn:{partition}:iam::{account}:role/{role}"))
+        }
+        _ => None,
+    }
+}
+
 fn account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4).filter(|a| !a.is_empty())
 }
@@ -1190,6 +1302,28 @@ mod tests {
             p.restore("not-a-key").await,
             Err(ProviderError::Permanent(_))
         ));
+    }
+
+    #[test]
+    fn principal_arn_for_simulation() {
+        assert_eq!(
+            principal_arn("arn:aws:iam::000000000000:user/ops/alice").as_deref(),
+            Some("arn:aws:iam::000000000000:user/ops/alice")
+        );
+        assert_eq!(
+            principal_arn("arn:aws:sts::000000000000:assumed-role/Rotate/session-1").as_deref(),
+            Some("arn:aws:iam::000000000000:role/Rotate")
+        );
+        assert_eq!(
+            principal_arn("arn:aws-us-gov:sts::000000000000:assumed-role/R/s").as_deref(),
+            Some("arn:aws-us-gov:iam::000000000000:role/R")
+        );
+        assert_eq!(principal_arn("arn:aws:iam::000000000000:root"), None);
+        assert_eq!(
+            principal_arn("arn:aws:sts::000000000000:federated-user/bob"),
+            None
+        );
+        assert_eq!(principal_arn("junk"), None);
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod finding;
 pub mod fsutil;
 pub mod github;
 pub mod input;
+pub mod permissions;
 pub mod plan;
 pub mod provider;
 pub mod redact;

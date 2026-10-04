@@ -120,6 +120,26 @@ pub fn consumers_with(
     registry
 }
 
+/// The probes of `rotate plan --check-permissions` (SHA-270), configured
+/// like the real AWS provider and GitHub Actions consumer. `None` when a
+/// test scenario registers mocks instead: there is nothing real to probe.
+/// Makes no call.
+pub fn permission_checker(
+    config: &rotate::config::Config,
+) -> Option<rotate::permissions::PermissionChecker> {
+    #[cfg(feature = "test-providers")]
+    if !scenario::real_plugins() {
+        return None;
+    }
+    Some(rotate::permissions::PermissionChecker::new(
+        aws_provider(&config.providers.aws),
+        rotate::consumer::github_actions::GithubActionsConsumer::from_config(
+            &config.consumers,
+            &config.providers.github,
+        ),
+    ))
+}
+
 /// The confirmation prompt a test scenario scripts, if any. Without
 /// `test-providers` always `None`: apply reads the terminal.
 pub fn prompt() -> Option<Box<dyn Prompt>> {
@@ -180,6 +200,10 @@ pub fn finish() {
 /// For end-to-end tests of the real plugins (SHA-264): `real_plugins:
 /// true` registers them instead of mocks; only `prompt` applies then.
 ///
+/// For revoke by hand (SHA-289): `providers.<name>.manual_revoke` is the
+/// text `manual_revoke` returns; `providers.<name>.unsupported` maps a
+/// method name to the text of an `Unsupported` error every call returns.
+///
 /// For rollback (SHA-259): `providers.<name>.restore` is `"unsupported"` to
 /// make `restore` return `Unsupported`; each call-log line also has
 /// `reference`, the consumer ref, restore handle or replacement ref the
@@ -236,6 +260,9 @@ mod scenario {
         #[serde(default)]
         foreign: Vec<Fingerprint>,
         restore: Option<String>,
+        manual_revoke: Option<String>,
+        #[serde(default)]
+        unsupported: BTreeMap<String, String>,
     }
 
     #[derive(Deserialize)]
@@ -324,8 +351,15 @@ mod scenario {
                 for fingerprint in &setup.foreign {
                     mock = mock.owner(fingerprint.clone(), Identity("someone-else".into()));
                 }
+                if let Some(text) = &setup.manual_revoke {
+                    // Instructions are `&'static str`; a test binary runs once.
+                    mock = mock.manual_revoke(Box::leak(text.clone().into_boxed_str()));
+                }
                 for (method, error) in &setup.fail {
                     mock.fail_always(method, ProviderError::Permanent(error.clone()));
+                }
+                for (method, error) in &setup.unsupported {
+                    mock.fail_always(method, ProviderError::Unsupported(error.clone()));
                 }
             }
             registry.register(Arc::new(mock));

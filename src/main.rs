@@ -124,7 +124,10 @@ fn run(
         #[cfg(feature = "leak-canary-test")]
         plant_leak(&findings);
         match &command {
-            Command::Plan(_) => return Ok(plan(console, findings, input, config, json)),
+            Command::Plan(args) => {
+                let check = args.check_permissions;
+                return Ok(plan(console, findings, input, config, json, check));
+            }
             Command::Apply(args) => return Ok(apply(console, findings, args, config)),
             Command::Rollback(args) => return Ok(rollback(console, findings, args, config)),
             _ => {}
@@ -229,6 +232,7 @@ fn build_plan(
         .await
     });
     plan.skipped.extend(already_rotated);
+    plan::mark_revoked_by_hand(&mut plan, store.rotations());
     if let Err(err) = plan::assign_ids(&mut plan, store) {
         return Err(state_error(console, err));
     }
@@ -240,13 +244,16 @@ fn build_plan(
 /// rotation in the state file. No state-changing remote call is made.
 /// Blockers and skipped rows are information, not failures: exit 0. A held
 /// or unusable state file exits 2 before any provider call; a plain I/O
-/// error writing it exits 1.
+/// error writing it exits 1. With `check_permissions`, read-only permission
+/// probes (SHA-270) add blockers and not-updatable reasons to the plan and
+/// print a warning for each probe that could not run.
 fn plan(
     console: &mut Console,
     findings: Vec<Finding>,
     input: &InputArgs,
     config: &Config,
     json: bool,
+    check_permissions: bool,
 ) -> Exit {
     let mut store = match StateStore::open(&config.state_file) {
         Ok(store) => store,
@@ -262,7 +269,7 @@ fn plan(
         Ok(runtime) => runtime,
         Err(exit) => return exit,
     };
-    let plan = match build_plan(
+    let mut plan = match build_plan(
         console,
         &runtime,
         findings,
@@ -275,6 +282,21 @@ fn plan(
         Err(exit) => return exit,
     };
     drop(store);
+    if check_permissions {
+        match providers::permission_checker(config) {
+            Some(checker) => {
+                for warning in runtime.block_on(checker.check(&mut plan)) {
+                    let _ = writeln!(console.err(), "warning: {warning}");
+                }
+            }
+            None => {
+                let _ = writeln!(
+                    console.err(),
+                    "warning: permissions not checked: no real plugins in this build"
+                );
+            }
+        }
+    }
     let rendered = if json {
         plan::render_json(&plan) + "\n"
     } else {
@@ -330,12 +352,21 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         Err(exit) => return exit,
     };
     print_out(console, &plan::render_apply_table(&plan));
-    if plan.rotations.is_empty() {
+    // Old secrets deleted by hand since an earlier run (SHA-289): recorded
+    // revoked with no further call and no question.
+    let by_hand: Vec<&plan::Skipped> = plan
+        .skipped
+        .iter()
+        .filter(|s| s.reason == plan::REVOKED_BY_HAND)
+        .collect();
+    if plan.rotations.is_empty() && by_hand.is_empty() {
         let _ = writeln!(console.err(), "Nothing to apply.");
         return Exit::Ok;
     }
 
-    let all_ids = apply::rotation_ids(&plan);
+    // A --confirm naming a rotation deleted by hand is not an unknown id.
+    let mut all_ids = apply::rotation_ids(&plan);
+    all_ids.extend(by_hand.iter().filter_map(|s| s.rotation_id.as_deref()));
     let mut askable = Vec::new();
     for rotation in &plan.rotations {
         match apply::eligibility_in(rotation, &store) {
@@ -407,9 +438,10 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     }
 
     let mut outcomes = Vec::new();
-    if requested
-        .iter()
-        .any(|r| apply::eligibility_in(r, &store).is_ok())
+    if !by_hand.is_empty()
+        || requested
+            .iter()
+            .any(|r| apply::eligibility_in(r, &store).is_ok())
     {
         let mut audit = match AuditLog::open(&config.audit_log) {
             Ok(audit) => audit,
@@ -433,6 +465,11 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         if let Some(clock) = providers::clock() {
             executor = executor.with_clock(clock);
         }
+        outcomes.extend(
+            by_hand
+                .iter()
+                .filter_map(|s| executor.confirm_revoked_by_hand(s)),
+        );
         runtime.block_on(async {
             for rotation in &requested {
                 outcomes.push(executor.run(rotation).await);
@@ -450,6 +487,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
     match apply::run_status(&outcomes) {
         RunStatus::Done => Exit::Ok,
         RunStatus::Failed => Exit::RotationFailed,
+        RunStatus::RevokeManual => Exit::RevokeManual,
         RunStatus::Pending => Exit::Pending,
         RunStatus::Unsupported => Exit::Usage,
     }

@@ -413,6 +413,15 @@ impl Provider for GithubProvider {
         ReplacementMode::Manual
     }
 
+    /// Manual for a GitHub App installation token (SHA-289), named by the
+    /// scope's `type` line: the credential revocation API refuses it.
+    fn manual_revoke(&self, scope: Option<&Scope>) -> Option<&'static str> {
+        let kind = scope
+            .and_then(|s| line(s, "type"))
+            .and_then(TokenKind::from_label);
+        (kind == Some(TokenKind::AppInstallation)).then_some(INSTALLATION_UNSUPPORTED)
+    }
+
     /// What to create on github.com, built from the scope lines
     /// `describe_scope` wrote: for a classic token, the exact scope list.
     fn manual_instructions(&self, scope: &Scope) -> String {
@@ -787,6 +796,19 @@ mod tests {
         assert!(oauth.contains("authorize the app again"), "{oauth}");
         let unknown = p.manual_instructions(&scope_of(&[]));
         assert!(unknown.contains("octocat"), "{unknown}");
+    }
+
+    // SHA-289: plan shows a manual revoke for an installation token only.
+    #[test]
+    fn manual_revoke_for_installation_tokens() {
+        let p = provider();
+        assert_eq!(
+            p.manual_revoke(Some(&scope_of(&["type: github app installation"]))),
+            Some(INSTALLATION_UNSUPPORTED)
+        );
+        assert_eq!(p.manual_revoke(Some(&scope_of(&["type: classic"]))), None);
+        assert_eq!(p.manual_revoke(Some(&scope_of(&[]))), None);
+        assert_eq!(p.manual_revoke(None), None);
     }
 
     #[test]
