@@ -2,11 +2,67 @@
 
 rotate never uses a leaked secret as its own credential (decision D3). It
 acts with the operator's credentials, so scope those to what rotate needs.
+Running it with admin credentials during an incident widens the blast
+radius if rotate or the host is compromised. This page lists the minimum
+for each provider and consumer, derived from the calls the code makes.
+What rotate automates per provider, and what stays manual, is in
+[providers.md](providers.md).
+
+## By command
+
+| Command | AWS (operator credentials) | GitHub Actions token | npm operator token | OpenAI admin key |
+| --- | --- | --- | --- | --- |
+| `rotate plan` | the IAM reads below, `secretsmanager:GetSecretValue`, `secretsmanager:ListSecrets` (tag filters only) | Secrets: read | token list | project and key reads |
+| `rotate plan --check-permissions` | as `plan`, plus `sts:GetCallerIdentity` and `iam:SimulatePrincipalPolicy` | as `plan`, plus the public-key read | as `plan` | as `plan` |
+| `rotate apply` | as `plan`, plus `iam:CreateAccessKey`, `iam:UpdateAccessKey`, `secretsmanager:PutSecretValue` | Secrets: read and write | token list and delete | as `plan`, plus service account create and key or service account delete |
+| `rotate rollback` | `iam:GetAccessKeyLastUsed`, `iam:UpdateAccessKey`, `secretsmanager:GetSecretValue`, `secretsmanager:PutSecretValue` | Secrets: read and write | none | service account delete |
+| `rotate status` | none | none | none | none |
+
+`rotate status` reads only the local state file and audit log and makes no
+network call. `rotate apply` re-plans first, so it needs everything `plan`
+needs.
+
+## Checking permissions before apply (`--check-permissions`)
+
+`rotate plan --check-permissions` probes your own permissions, read-only,
+after building the plan, so a missing permission shows up before `rotate
+apply` rather than halfway through it.
+
+- AWS: rotate calls `sts:GetCallerIdentity` with your credentials to learn
+  your principal ARN (an assumed-role session is checked as its role), then
+  `iam:SimulatePrincipalPolicy` with the provider's IAM actions on the key
+  owner's ARN, and with `secretsmanager:GetSecretValue` and
+  `secretsmanager:PutSecretValue` on each matched entry that `rotate.yaml`
+  names by ARN. Each action the simulation does not allow becomes a plan
+  blocker: `operator lacks iam:CreateAccessKey on arn:aws:iam::...:user/...
+  (IAM policy simulation)`. An entry named by name is not simulated (its
+  ARN has a suffix rotate does not know); list it by ARN to check it.
+- GitHub Actions: rotate reads `GET /repos/{owner}/{repo}/actions/secrets/public-key`
+  (or `/orgs/{org}/...`) once per target with an updatable match; every
+  write starts with this call. A 403 or 404, or a classic token whose
+  `x-oauth-scopes` lacks `repo` (repository) or `admin:org` (org), marks
+  the target's matches not updatable with the reason
+  `token lacks Secrets: write`, which also adds the usual "consumer cannot
+  be updated" blocker.
+  GitHub does not expose a fine-grained token's permissions, so a
+  fine-grained token that can read the key passes with a warning: make sure
+  it has "Secrets: read and write".
+- npm and OpenAI have no read-only way to test a permission, so they are
+  not probed. Their plan rows already show what the operator credential
+  could not see.
+
+A probe that cannot run (no `iam:SimulatePrincipalPolicy`, no operator
+credentials, a network error) prints a warning on stderr and adds nothing to
+the plan. The probes never change state, and `--json` keeps the same shape:
+the results are in `blockers` and in each consumer's `reason`.
+`iam:SimulatePrincipalPolicy` and `sts:GetCallerIdentity` are needed only
+for this flag.
 
 ## AWS IAM access keys (provider `aws`)
 
 The leaked key signs one call only: `sts:GetCallerIdentity`, the validity
-check in `rotate plan`. That call needs no permission.
+check in `rotate plan`. That call needs no permission. The replacement key
+signs the same call during apply, to verify it.
 
 Everything else uses the operator's AWS credentials from the default chain
 (environment, shared profile, SSO or credential process), in the region from
@@ -16,24 +72,34 @@ reports validity and shows the scope as unavailable.
 
 | Action | Used by | Why |
 | --- | --- | --- |
-| `iam:GetAccessKeyLastUsed` | plan, apply, rollback | owner of the leaked key (or of the replacement, on rollback) and when each key was last used |
-| `iam:GetUser` | plan | the owner's ARN, which the replacement must match |
-| `iam:ListAttachedUserPolicies`, `iam:ListUserPolicies`, `iam:ListGroupsForUser` | plan | scope lines; a denied read becomes a "not visible" line |
-| `iam:ListAccessKeys` | plan, apply | key slots: IAM allows two keys per user |
+| `iam:GetAccessKeyLastUsed` | plan, apply, rollback | owner of the leaked key (or of the replacement, on rollback and resume) and when each key was last used |
+| `iam:GetUser` | plan, apply | the owner's ARN, which the replacement must match |
+| `iam:ListAttachedUserPolicies`, `iam:ListUserPolicies`, `iam:ListGroupsForUser` | plan, apply | scope lines; a denied read becomes a "not visible" line |
+| `iam:ListAccessKeys` | plan, apply | key slots: IAM allows two keys per user; on resume, that the replacement is still Active |
 | `iam:CreateAccessKey` | apply | the replacement key |
 | `iam:UpdateAccessKey` | apply, rollback | deactivate the leaked key; on rollback reactivate it and deactivate the replacement |
+| `sts:GetCallerIdentity` | plan `--check-permissions` | your own ARN, for the simulation; needs no permission |
+| `iam:SimulatePrincipalPolicy` | plan `--check-permissions` | the permission probe |
 
-rotate never calls `iam:DeleteAccessKey`. When the user already has two
-keys, the plan shows a warning and apply refuses to create a replacement:
-delete the key that is not leaked yourself, then run apply again.
+rotate never calls `iam:DeleteAccessKey`, and the policy below does not
+grant it. When the user already has two keys, the plan shows a warning and
+apply refuses to create a replacement: delete the key that is not leaked
+yourself, then run apply again. Deactivated keys are never deleted either;
+delete them yourself once you no longer need rollback.
 
-A policy that limits these to the users rotate may touch:
+### Minimal IAM policy
+
+Attach this to the principal you run rotate as. It covers the AWS provider
+and the Secrets Manager consumer; drop the statements for the parts you do
+not use. Replace `<account-id>`, `<region>` and `<operator>` (the user or
+role you run rotate as).
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "RotateIamAccessKeys",
       "Effect": "Allow",
       "Action": [
         "iam:GetAccessKeyLastUsed",
@@ -46,10 +112,95 @@ A policy that limits these to the users rotate may touch:
         "iam:UpdateAccessKey"
       ],
       "Resource": "arn:aws:iam::<account-id>:user/*"
+    },
+    {
+      "Sid": "RotateSecretsManagerEntries",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:<region>:<account-id>:secret:*"
+    },
+    {
+      "Sid": "RotateSecretsManagerTagSearch",
+      "Effect": "Allow",
+      "Action": "secretsmanager:ListSecrets",
+      "Resource": "*"
+    },
+    {
+      "Sid": "RotateCheckPermissions",
+      "Effect": "Allow",
+      "Action": "iam:SimulatePrincipalPolicy",
+      "Resource": "arn:aws:iam::<account-id>:<operator>"
+    },
+    {
+      "Sid": "RotateWhoAmI",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
     }
   ]
 }
 ```
+
+`RotateSecretsManagerTagSearch` is needed only with
+`consumers.aws_secrets_manager.tag_filters`; `ListSecrets` does not support
+resource-level permissions. `RotateCheckPermissions` and `RotateWhoAmI` are
+needed only for `--check-permissions`; `sts:GetCallerIdentity` is allowed
+for every principal anyway, so that statement just makes it explicit.
+
+### Scoping the policy
+
+Narrow each `Resource` to what rotate may touch:
+
+| To limit rotate to | Use |
+| --- | --- |
+| IAM users under a path, for example CI users | `arn:aws:iam::<account-id>:user/ci/*` |
+| named IAM users | `arn:aws:iam::<account-id>:user/deploy-bot`, one entry per user |
+| Secrets Manager entries under a prefix | `arn:aws:secretsmanager:<region>:<account-id>:secret:prod/*` |
+| one Secrets Manager entry | `arn:aws:secretsmanager:<region>:<account-id>:secret:prod/app-*` (the `-*` matches the 6-character suffix AWS adds) |
+| simulating only yourself | `arn:aws:iam::<account-id>:user/<your-user>` or `arn:aws:iam::<account-id>:role/<your-role>` |
+
+You can also add conditions, for example `aws:ResourceTag/rotate` on IAM
+users, or `secretsmanager:ResourceTag/...` on entries. An entry encrypted
+with a customer managed KMS key also needs `kms:Decrypt` (read) and
+`kms:GenerateDataKey` (write) on that key; the AWS managed key needs
+nothing extra.
+
+## AWS Secrets Manager (consumer `aws-secrets-manager`)
+
+Uses the same operator AWS credentials and region chain as the AWS
+provider.
+
+| Action | Used by | Why |
+| --- | --- | --- |
+| `secretsmanager:GetSecretValue` | plan, apply, rollback | compare the stored value's fingerprint; read the current version before writing |
+| `secretsmanager:PutSecretValue` | apply, rollback | write the new value (rollback: the old value) as a new version |
+| `secretsmanager:ListSecrets` | plan, apply | only for `tag_filters` |
+
+An entry rotate cannot read is listed by name and marked not updatable.
+
+## GitHub Actions secrets (consumer `github-actions`)
+
+The operator token comes from `ROTATE_GITHUB_TOKEN`, else `GITHUB_TOKEN`.
+Use a token other than any you might be rotating, and set
+`ROTATE_GITHUB_TOKEN` in CI so the job's own `GITHUB_TOKEN` is not used.
+
+| Target | Classic token | Fine-grained token |
+| --- | --- | --- |
+| repository secrets | `repo` scope | repository permission "Secrets: read and write" on each target repository |
+| organization secrets | `admin:org` scope | organization permission "Secrets: read and write" (shown as "Organization secrets" in some GitHub versions) |
+
+| Call | Used by | Why |
+| --- | --- | --- |
+| `GET {target}/actions/secrets` | plan, apply | list secret names (values cannot be read back); a 403 or 404 makes the target not updatable |
+| `GET {target}/actions/secrets/public-key` | apply, rollback, plan `--check-permissions` | the key every value is sealed with; the write probe |
+| `GET /orgs/{org}/actions/secrets/{name}` and `.../repositories` | apply, rollback | keep an org secret's visibility and selected repositories |
+| `PUT {target}/actions/secrets/{name}` | apply, rollback | write the sealed value |
+
+A fine-grained token with only "Secrets: read" can plan but not apply:
+the `PUT` fails, apply stops before revoke and the old secret stays valid.
 
 ## GitHub tokens (provider `github`)
 
@@ -90,6 +241,13 @@ The leaked token signs only `GET /-/whoami`, which is read-only. Everything
 else uses your operator token from `ROTATE_NPM_TOKEN`, then `NPM_TOKEN`. In
 CI, `NPM_TOKEN` is often the leaked token itself, so set `ROTATE_NPM_TOKEN`.
 rotate refuses to use the leaked token as the operator token.
+
+Operator token requirement: an `npm login` session token for the same
+account as the leaked token. npm's token list and token delete endpoints
+accept only that kind of token: a granular access token cannot list
+tokens, whatever its permissions, and npm has revoked the classic
+automation tokens, so neither can be used for the scope read or the
+revoke.
 
 | Call | Signed with | Used by | Why |
 | --- | --- | --- | --- |

@@ -36,6 +36,13 @@ What works now:
   `.rotate/state.json` with a short id (`rot-` and 8 hex characters) that
   stays the same on the next `plan` run. It exits 0 even when blockers
   exist, and 2 if another rotate process holds the state file.
+- `rotate plan --check-permissions` also probes your own permissions,
+  read-only, before you apply: an IAM policy simulation
+  (`iam:SimulatePrincipalPolicy`) for the AWS actions rotate will call, and
+  a public-key read per GitHub Actions target. A missing AWS action becomes
+  a blocker; an Actions target the token cannot write is listed as
+  "token lacks Secrets: write". [docs/permissions.md](docs/permissions.md) has the
+  minimal IAM policy and the GitHub, npm and OpenAI token requirements.
 - `rotate apply` runs the same plan, prints it, and asks you to type each
   rotation id (read from the terminal, never stdin, so `--stdin` still
   works). `--confirm <rotation-id>` (repeatable) replaces the prompt for
