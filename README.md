@@ -274,6 +274,9 @@ NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env
   gitleaks fields rotate reads.
 - [docs/rotate.example.yaml](docs/rotate.example.yaml): every config option
   with its default.
+- [docs/providers.md](docs/providers.md): what rotate automates for each
+  provider and consumer, what is manual or unsupported, and what to prepare
+  before an incident.
 - [docs/permissions.md](docs/permissions.md): the operator permissions each
   provider needs.
 - [CONTRIBUTING.md](CONTRIBUTING.md): checks, branches, commits and pull

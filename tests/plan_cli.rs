@@ -360,6 +360,31 @@ fn manual_mode_replacement_wording() {
     assert_eq!(plan["rotations"][0]["replacement"]["mode"], "manual");
 }
 
+// SHA-266 T3 (AC3): a plan with a manual step names the provider matrix;
+// one with only automated steps does not.
+#[test]
+fn manual_step_points_to_provider_matrix() {
+    let value = "npm_plancli_266_manual";
+    let run = Run::new();
+    let report = run.report(&[value]);
+    let mut scenario = two_matches(value);
+    scenario["providers"] = json!({ "npm": { "mode": "manual" } });
+    run.scenario(scenario);
+    let output = run.run(&["plan", report.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("docs/providers.md"), "{out}");
+
+    let value = "npm_plancli_266_automatic";
+    let run = Run::new();
+    let report = run.report(&[value]);
+    run.scenario(two_matches(value));
+    let output = run.run(&["plan", report.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(!out.contains("docs/providers.md"), "{out}");
+}
+
 // T8 (AC1, AC5)
 #[test]
 fn plan_never_leaks_canary() {
