@@ -264,6 +264,16 @@ pub fn hint(rotation: &Rotation, now: OffsetDateTime) -> String {
             )
         ),
         Step::Revoked => "done".to_owned(),
+        // SHA-290: the restored consumers hold a revoked secret.
+        Step::RolledBack
+            if rotation
+                .rollback
+                .as_ref()
+                .is_some_and(|p| p.old_still_revoked) =>
+        {
+            "rolled back; the old secret stays revoked: create a new credential and run `rotate apply`"
+                .to_owned()
+        }
         Step::RolledBack => "rolled back".to_owned(),
     }
 }
@@ -499,6 +509,15 @@ mod tests {
         r.step = Step::RolledBack;
         assert!(!is_pending(&r));
         assert!(!is_shown_by_default(&r));
+        assert_eq!(hint(&r, now()), "rolled back");
+        // SHA-290: the hint says the old secret stays revoked; still done.
+        r.rollback.as_mut().unwrap().old_still_revoked = true;
+        assert!(!is_pending(&r));
+        assert!(!is_shown_by_default(&r));
+        assert_eq!(
+            hint(&r, now()),
+            "rolled back; the old secret stays revoked: create a new credential and run `rotate apply`"
+        );
     }
 
     #[test]

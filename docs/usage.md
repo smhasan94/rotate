@@ -331,16 +331,22 @@ Continuing the overlap example, while the revoke is still pending:
 ```sh
 rotate rollback trufflehog-report.json --confirm rot-5f36d3cd
 # exit: 0
-# expect: Rollback: 1 rolled back, 0 failed.
+# expect: Rollback: 1 rolled back, 0 with the old secret still revoked, 0 failed.
 rotate status --all
 # exit: 0
 # expect: rolled_back
 ```
 
 - A secret that matches no rotation exits 2 and nothing is called.
-- When the provider cannot bring the old secret back, consumers are still
-  restored and a warning says the old secret stays revoked. A pasted
-  (manual) replacement has to be revoked by hand.
+- When the provider cannot bring the old secret back (GitHub, npm and
+  OpenAI never can; nor can any provider after a revoke by hand),
+  consumers are still restored and the replacement is revoked, but the
+  restored consumers now hold a revoked secret. The plan says so before you
+  confirm, the summary counts it as "with the old secret still revoked" and
+  names those consumers, and rollback exits 1, also when an interrupted
+  rollback is finished by a re-run. Create a new credential and run
+  `rotate apply` again. A pasted (manual) replacement has to be revoked by
+  hand.
 - Any error stops the rollback before the replacement is revoked and exits
   1; re-running continues where it stopped.
 - AWS deactivates the replacement key and never deletes it, and an IAM user
@@ -400,7 +406,7 @@ Global flags work before or after the command.
 | Code | Meaning |
 | --- | --- |
 | 0 | Everything requested was done. `plan` exits 0 even when it lists blockers. |
-| 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. |
+| 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. Also `rollback` that finished with the old secret still revoked: the restored consumers hold a revoked secret. |
 | 2 | Bad arguments, bad configuration, a wrong or unknown rotation id, a state file held by another rotate process, or a rollback input that matches no rotation. Nothing was changed. |
 | 3 | Work is pending: `apply` recorded a revoke waiting for its overlap window, or `status` found a rotation that is pending, failed, needs rollback or waits for a revoke by hand. |
 | 4 | `apply`: the replacement is live and verified, but rotate cannot revoke the old secret; delete it by hand as the summary says, then re-run `apply` to record it. |
