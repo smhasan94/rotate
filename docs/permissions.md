@@ -242,12 +242,13 @@ else uses your operator token from `ROTATE_NPM_TOKEN`, then `NPM_TOKEN`. In
 CI, `NPM_TOKEN` is often the leaked token itself, so set `ROTATE_NPM_TOKEN`.
 rotate refuses to use the leaked token as the operator token.
 
-Operator token requirement: an `npm login` session token for the same
-account as the leaked token. npm's token list and token delete endpoints
-accept only that kind of token: a granular access token cannot list
-tokens, whatever its permissions, and npm has revoked the classic
-automation tokens, so neither can be used for the scope read or the
-revoke.
+Operator token requirement. The npm operator token must be an
+`npm login` session token for the same account as the leaked token: npm's
+token list accepts no other kind, granular access tokens included. A granular token
+without 2FA bypass may delete tokens but cannot list them, and rotate needs
+the list to find the token id; one with 2FA bypass gets a 403 on both. npm
+revoked the classic automation tokens on 2025-12-09. The npm sources are in
+[plans/SHA-292.md](plans/SHA-292.md).
 
 | Call | Signed with | Used by | Why |
 | --- | --- | --- | --- |
@@ -257,12 +258,16 @@ revoke.
 | `DELETE /-/npm/v1/tokens/token/{id}` | operator token | apply | delete the leaked token |
 | `GET /-/whoami` | leaked token | apply | only when the token list has no entry: a 401 means it is already deleted |
 
-The token list accepts only an `npm login` session token (two hours), so
-the operator token must be one, for the same account as the leaked token.
-A granular token cannot list tokens; one created with `bypass_2fa` cannot
-delete them either. Without a usable operator token the plan still shows
+A session token lasts two hours and only `npm login` makes one, so npm
+revoke cannot run unattended from CI on a stored token: run `npm login`
+shortly before an unattended run and pass the new token as
+`ROTATE_NPM_TOKEN`. Without a usable operator token the plan still shows
 the user and says "token not visible to operator account", and the revoke
-fails before any change.
+row gets a blocker: `no npm operator token` when none is set, or "npm
+refused the operator token on the token list" when npm answers 401 or 403
+(the scope line then says a session token is needed). Apply would update
+the consumers and verify, then stop at revoke with the leaked token still
+valid.
 
 rotate deletes the token by the id npm lists for it, so the token value
 never appears in a URL. It finds the entry by its redacted form (first 8

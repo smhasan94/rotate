@@ -96,6 +96,13 @@ Ends with: all four MVP providers pass the conformance suite.
 | SHA-262 | OpenAI API key provider: identify, check via models, scope and revoke via Admin API, service-account replacement with manual fallback | 3 | SHA-249, SHA-257 |
 | SHA-266 | Provider and consumer matrix doc: automated, manual or unsupported per operation | 1 | SHA-261, SHA-262 |
 
+npm operator token (corrected by SHA-292): the SHA-261 text said a
+long-lived automation or granular token would do. Neither does. The npm operator token must be an `npm login` session token for
+the same account as the leaked token: npm's token list accepts no other
+kind, granular access tokens included. Session tokens last two hours, so
+npm revoke cannot run unattended on a stored token. Sources:
+`docs/plans/SHA-292.md`.
+
 ## Epic 7: Hardening and v0.1.0 release (SHA-192)
 
 Ends with: v0.1.0 on GitHub Releases with docs.
