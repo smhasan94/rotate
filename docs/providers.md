@@ -32,7 +32,7 @@ or Manual.
 | `create_replacement` | apply | Mints the new secret. In manual mode, `manual_instructions` says what to create and apply asks you to paste it instead. |
 | `verify` | apply | Checks the new secret works and belongs to the same identity, before anything is revoked. |
 | `verify_replacement` | apply (resume) | Checks the replacement by its reference when apply resumes at verify in a new process, since rotate never stores the value. |
-| `revoke` | apply | Revokes the leaked secret. Always the last step. When `manual_revoke` returns a row, the plan shows it instead and apply stops at revoke. |
+| `revoke` | apply | Revokes the leaked secret. Always the last step. When `manual_revoke` returns a row, the plan shows it instead and apply stops at revoke. When `revoke_blocker` returns a reason (npm without a usable operator token), the plan shows it as a blocker. |
 | `revoke_replacement` | rollback | Revokes the replacement by its reference. |
 | `restore` | rollback | Brings the revoked secret back. |
 
@@ -68,6 +68,12 @@ or Manual.
 
 ### npm access tokens (`npm`)
 
+The npm operator token must be an `npm login` session token for the same
+account as the leaked token: npm's token list accepts no other kind,
+granular access tokens included. Session tokens last two hours, so an
+unattended run needs a fresh `npm login` first; without a usable one the
+plan shows a revoke blocker naming `ROTATE_NPM_TOKEN`.
+
 | Operation | Status | Operator credential | Note |
 | --- | --- | --- | --- |
 | `identify` | Automated | none | `npm_` plus 36 letters and digits (granular and `npm login` session tokens). |
@@ -76,7 +82,7 @@ or Manual.
 | `create_replacement` | Manual | none | npm creates tokens only with the account password and a one-time password. Apply names the granular token page and the settings to copy, then asks you to paste it. |
 | `verify` | Automated | none | `GET /-/whoami` with the pasted token; the user must match. |
 | `verify_replacement` | Unsupported | none | A pasted token is never stored. A rotation that stopped before verify is marked `needs_rollback`. |
-| `revoke` | Automated | npm session token | Deletes the token by the id in your token list. An account that asks for a one-time password makes the delete fail; rotate names the page to delete it on. |
+| `revoke` | Automated | npm session token | Deletes the token by the id in your token list, so it needs the list and a session token; a granular token cannot list. An account that asks for a one-time password, or a granular token with 2FA bypass (403), makes the delete fail; rotate names the page to delete it on. |
 | `revoke_replacement` | Manual | npm session token | A pasted replacement has no token id, so rollback tells you to delete it by hand. |
 | `restore` | Unsupported | none | npm cannot bring back a deleted token. Rollback restores consumers only. |
 
@@ -153,7 +159,8 @@ entry encrypted with a customer managed KMS key also needs `kms:Decrypt` and
 
 - [ ] A way to get an `npm login` session token for each account whose
   tokens may leak, set as `ROTATE_NPM_TOKEN` (not the `NPM_TOKEN` your CI
-  uses). It lasts two hours.
+  uses). It lasts two hours, so an unattended run cannot keep one: run
+  `npm login` shortly before. A granular access token does not work.
 - [ ] Know whether the account asks for a one-time password to delete
   tokens; if it does, plan to delete the leaked token on npmjs.com.
 - [ ] Access to the account's website login and one-time password, to create
