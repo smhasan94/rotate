@@ -296,7 +296,7 @@ accounts). rotate refuses an admin key that is the key being rotated.
 | `GET /v1/models` | leaked key | plan, revoke | validity (200 and 429 valid, 401 invalid); without an admin key, the `openai-organization` header; at revoke, whether an unlisted key is already gone |
 | `GET /v1/organization/projects` | admin key | plan, apply | find the key's project |
 | `GET /v1/organization/projects/{id}/api_keys` | admin key | plan, apply | find the key by its redacted value, its owner and last use; verify the replacement is in the same project |
-| `POST /v1/organization/projects/{id}/service_accounts` | admin key | apply | create the replacement: a service account named `rotate-<fingerprint hex>` and its key |
+| `POST /v1/organization/projects/{id}/service_accounts` | admin key | apply, only with `allow_broader_replacement` | create the replacement: a service account named `rotate-<fingerprint hex>` and its key |
 | `GET /v1/models` | new key | apply | the replacement works |
 | `DELETE /v1/organization/projects/{id}/api_keys/{key_id}` | admin key | apply | revoke a user-owned key |
 | `DELETE /v1/organization/projects/{id}/service_accounts/{id}` | admin key | apply, rollback | revoke a service-account key that is its account's only key; delete the replacement's service account |
@@ -308,10 +308,22 @@ the key at platform.openai.com/api-keys and apply stops at the revoke step
 with the consumers already updated. A key that is in no project the admin
 key can list (a legacy user key) gets no scope and is not applied.
 
-The Admin API does not expose a key's permissions, so the replacement
-service account has the member role and all permissions; restrict it on
-the dashboard if the leaked key was restricted. OpenAI cannot bring a
-deleted key back, so rollback cannot restore the old key.
+The Admin API neither shows a key's permissions nor sets them when it
+creates one, so a replacement service account has the member role and all
+permissions in the project, which may be broader than the leaked key. rotate
+therefore does not create one by default, even with an admin key: the plan
+shows a manual replacement and says why, and apply names the project and
+the leaked key and asks you to create a key with Restricted permissions
+matching it at platform.openai.com/api-keys, then paste it. The admin key
+is still used to find the key, to check the pasted key is listed in the
+same project, and to revoke. To let rotate create the service account,
+accept the wider access with `providers.openai.allow_broader_replacement:
+true` in `rotate.yaml` or `--allow-broader-replacement` on `plan` and
+`apply`: the plan then shows a `scope widening` note (`replacement.scope_widening`
+in `--json`) and the `create` audit entry records `scope_widened: true`.
+Restrict the new key on the dashboard afterwards if the leaked key was
+restricted. OpenAI cannot bring a deleted key back, so rollback cannot
+restore the old key.
 
 Without an admin key the provider runs in manual mode: apply asks for the
 new key, accepts it once it works and reports the same `openai-organization`

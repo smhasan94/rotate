@@ -29,7 +29,7 @@ or Manual.
 | `identify` | plan | Recognises the secret's format. No network. |
 | `check_valid` | plan | The cheapest read-only call that says valid, invalid or unknown. |
 | `describe_scope` | plan | Who owns the secret and what it can reach. |
-| `create_replacement` | apply | Mints the new secret. In manual mode, `manual_instructions` says what to create and apply asks you to paste it instead. |
+| `create_replacement` | apply | Mints the new secret. In manual mode, `manual_instructions` says what to create and apply asks you to paste it instead. When `scope_widening` returns a note, an automatic replacement would be broader than the leaked secret: the plan shows the note and the `create` audit entry records `scope_widened`. |
 | `verify` | apply | Checks the new secret works and belongs to the same identity, before anything is revoked. |
 | `verify_replacement` | apply (resume) | Checks the replacement by its reference when apply resumes at verify in a new process, since rotate never stores the value. |
 | `revoke` | apply | Revokes the leaked secret. Always the last step. When `manual_revoke` returns a row, the plan shows it instead and apply stops at revoke. |
@@ -87,11 +87,11 @@ or Manual.
 | `identify` | Automated | none | `sk-proj-`, `sk-svcacct-`, legacy `sk-` keys and `sk-admin-` admin keys. Admin keys are identified so they are not claimed by another provider. |
 | `check_valid` | Automated | none | `GET /v1/models` signed with the leaked key. Admin keys cannot call it: they are reported unknown and never rotated. |
 | `describe_scope` | Automated | OpenAI admin key | With an admin key, the project, key name, owner and last use from the Admin API. Without one, only the organization from the response header. |
-| `create_replacement` | Automated; Manual without admin key | OpenAI admin key | A new service account in the same project, named `rotate-<fingerprint>`. Without an admin key apply asks you to paste a new key. |
+| `create_replacement` | Automated; Manual without admin key or opt-in | OpenAI admin key | Manual by default: apply names the project and the leaked key and asks you to paste a new key with Restricted permissions matching it. With an admin key and the opt-in (`providers.openai.allow_broader_replacement: true` or `--allow-broader-replacement`), a new service account in the same project, named `rotate-<fingerprint>`. It gets all permissions in the project, which may be broader than the leaked key, so the plan shows a `scope widening` note and the audit log records `scope_widened: true`. |
 | `verify` | Automated | OpenAI admin key | `GET /v1/models` with the new key, which must be listed in the same project. Without an admin key only the organization header is compared. |
 | `verify_replacement` | Unsupported | none | Not implemented for OpenAI. A rotation that stopped before verify is marked `needs_rollback`. |
 | `revoke` | Automated; Manual without admin key | OpenAI admin key | Deletes a user-owned key by id, or a service-account key by deleting its service account when that is the account's only key. Otherwise, and without an admin key, the plan shows a manual revoke and apply stops at revoke. |
-| `revoke_replacement` | Automated; Manual without admin key | OpenAI admin key | Deletes the service account rotate created. A pasted replacement is revoked by hand. |
+| `revoke_replacement` | Automated; Manual without admin key or opt-in | OpenAI admin key | Deletes the service account rotate created. A pasted replacement is revoked by hand. |
 | `restore` | Unsupported | none | OpenAI cannot bring back a deleted key. Rollback restores consumers only. |
 
 ## Consumers
@@ -164,6 +164,9 @@ entry encrypted with a customer managed KMS key also needs `kms:Decrypt` and
 - [ ] An organization Admin API key in `OPENAI_ADMIN_KEY` with read and write
   access to projects, kept separate from the keys it manages. Without it,
   replacement and revoke are manual.
+- [ ] Decide whether rotate may replace keys with service-account keys that
+  have all permissions in the project (`allow_broader_replacement`). If not,
+  be ready to create restricted keys by hand on the API keys page.
 - [ ] Know which leaked keys are service-account keys that share an account
   with other keys: rotate cannot revoke those.
 - [ ] Admin keys themselves are rotated by hand on the admin keys page.
