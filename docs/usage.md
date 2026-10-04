@@ -141,8 +141,8 @@ Rotation rot-5f36d3cd  aws  sha256:8088a3c392bc0b3e
 - **identity** and **sources**: who owns the secret, and where the scanner
   found it (`file:line@commit`).
 - **replacement**: what apply creates, or `manual` when you will create it
-  yourself and paste it (GitHub and npm tokens, OpenAI keys without an
-  admin key).
+  yourself and paste it (GitHub and npm tokens, and OpenAI keys unless an
+  admin key and `allow_broader_replacement` are both set).
 - **consumers**: every place found holding the secret, how it was matched
   (`by name` or `by value`) and whether apply can update it.
 - **revoke**: what happens to the old secret at the end.
@@ -374,6 +374,7 @@ Global flags work before or after the command.
 | `--provider <NAME>` | plan, apply, rollback | Provider of the `--stdin` secret: `aws`, `github`, `npm` or `openai`. |
 | `--concurrency <N>` | plan, apply, rollback | Provider checks in flight at once, 1 to 64. Default 8. |
 | `--check-permissions` | plan | Probe the operator's permissions, read-only. |
+| `--allow-broader-replacement` | plan, apply | Let rotate create an OpenAI replacement with all permissions (see [config.md](config.md#providersopenaiallow_broader_replacement)). |
 | `--confirm <ROTATION_ID>` | apply, rollback | Confirm this rotation without a prompt. Repeatable. |
 | `--all` | apply | Confirm every rotation with one prompt. |
 | `--all` | status | Also list finished rotations. |

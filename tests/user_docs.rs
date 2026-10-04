@@ -250,6 +250,7 @@ fn fields(config: &FileConfig) -> Vec<(&'static str, bool)> {
     let OpenAiConfig {
         admin_key_env,
         api_url: openai_api,
+        allow_broader_replacement,
     } = openai;
     vec![
         ("overlap_window", overlap_window.is_some()),
@@ -295,6 +296,10 @@ fn fields(config: &FileConfig) -> Vec<(&'static str, bool)> {
         (
             "providers.openai.api_url",
             *openai_api != OpenAiConfig::default().api_url,
+        ),
+        (
+            "providers.openai.allow_broader_replacement",
+            *allow_broader_replacement,
         ),
     ]
 }
@@ -378,6 +383,12 @@ fn t2_documented_defaults_match_the_code() {
         (
             "providers.openai.api_url",
             OpenAiConfig::default().api_url.to_string(),
+        ),
+        (
+            "providers.openai.allow_broader_replacement",
+            OpenAiConfig::default()
+                .allow_broader_replacement
+                .to_string(),
         ),
     ];
     let sections = field_sections();
