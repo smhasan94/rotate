@@ -58,9 +58,9 @@ use crate::audit::{AuditError, AuditEvent, AuditLog, AuditStep, Outcome as Audit
 use crate::console::Console;
 use crate::consumer::ConsumerRegistry;
 use crate::input::{self, ReplacementInputError, REPLACEMENT_MAX};
-use crate::plan::{Plan, PlannedRotation};
+use crate::plan::{Plan, PlannedRotation, Skipped};
 use crate::provider::{
-    Credential, Provider, ProviderError, ProviderRegistry, Replacement, ReplacementMode,
+    Credential, Provider, ProviderError, ProviderRegistry, Replacement, ReplacementMode, Validity,
 };
 use crate::secret::{Fingerprint, SecretValue};
 use crate::state::{ConsumerState, ConsumerStatus, Rotation, StateError, StateStore, Step};
@@ -555,6 +555,8 @@ pub fn resume_point(record: &Rotation) -> Resume {
             Some(AuditStep::Force | AuditStep::Revoke) => Resume::Revoke,
             _ => Resume::Update,
         },
+        // A revoke by hand is confirmed in `finish` with `check_valid`.
+        Step::RevokeManual => Resume::Revoke,
         Step::NeedsRollback | Step::Revoked | Step::RolledBack => Resume::Revoke,
     }
 }
@@ -564,6 +566,14 @@ const LOST_REPLACEMENT: &str = "the replacement value from the earlier run is go
 
 /// Audit detail of a step a resume does not repeat.
 const DONE_EARLIER: &str = "already done in an earlier run";
+
+/// Audit detail of the `ok` revoke entry written when a later run finds the
+/// old secret no longer works after a revoke by hand (SHA-289).
+pub const REVOKED_BY_HAND: &str = "revoked by hand, confirmed by check_valid";
+
+/// Instructions for a `revoke_manual` rotation whose record has none.
+const REVOKE_BY_HAND_FALLBACK: &str =
+    "delete the old secret at the provider by hand, then re-run rotate apply";
 
 /// What the revoke gate decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,6 +694,12 @@ pub enum RunResult {
         /// Why, and what to do, redacted.
         reason: RedactedText,
     },
+    /// The replacement is live and verified, but the provider cannot revoke
+    /// the old secret: the operator must delete it by hand (SHA-289).
+    RevokeManual {
+        /// The provider's instructions, redacted.
+        instructions: RedactedText,
+    },
     /// Not attempted.
     Skipped(Ineligible),
 }
@@ -735,13 +751,16 @@ pub enum RunStatus {
     /// Some rotation failed, was held before revoke or needs rollback
     /// (exit 1).
     Failed,
+    /// Some old secret has to be revoked by hand (exit 4, SHA-289).
+    RevokeManual,
     /// Some revoke waits for its overlap window (exit 3).
     Pending,
     /// Some rotation could not be attempted (exit 2).
     Unsupported,
 }
 
-/// Exit class for `outcomes`: failed, then pending, then unsupported.
+/// Exit class for `outcomes`: failed, then revoke by hand, then pending,
+/// then unsupported.
 pub fn run_status(outcomes: &[Outcome]) -> RunStatus {
     let any = |f: fn(&RunResult) -> bool| outcomes.iter().any(|o| f(&o.result));
     if any(|r| {
@@ -754,6 +773,8 @@ pub fn run_status(outcomes: &[Outcome]) -> RunStatus {
         )
     }) {
         RunStatus::Failed
+    } else if any(|r| matches!(r, RunResult::RevokeManual { .. })) {
+        RunStatus::RevokeManual
     } else if any(|r| matches!(r, RunResult::PendingRevoke { .. })) {
         RunStatus::Pending
     } else if any(|r| {
@@ -1232,6 +1253,9 @@ impl<'a> Executor<'a> {
         provider: &dyn Provider,
         progress: &mut Progress,
     ) -> RunResult {
+        if progress.record.step == Step::RevokeManual {
+            return self.recheck_by_hand(rotation, provider, progress).await;
+        }
         let now = (self.clock)();
         // A force recorded by an earlier run still stands.
         let force = self.force || progress.record.force;
@@ -1294,8 +1318,16 @@ impl<'a> Executor<'a> {
                 tokio::time::sleep(pause).await;
             }
         }
+        // SHA-289: a credential rotate cannot revoke ends at revoke_manual,
+        // not failed: everything up to the revoke worked.
+        if let Some(instructions) = provider.manual_revoke(rotation.scope.as_ref()) {
+            return self.revoke_by_hand(progress, instructions);
+        }
         let revoked = match provider.revoke(&rotation.credential).await {
             Ok(revoked) => revoked,
+            Err(ProviderError::Unsupported(instructions)) => {
+                return self.revoke_by_hand(progress, &instructions);
+            }
             Err(err) => {
                 return self.fail(
                     progress,
@@ -1319,6 +1351,127 @@ impl<'a> Executor<'a> {
             };
         }
         RunResult::Revoked
+    }
+
+    /// Records `revoke_manual` (SHA-289): the old secret has to be deleted
+    /// by hand as `instructions` say. One `skipped` revoke audit entry with
+    /// the instructions. Revoke was not called, or the provider refused it.
+    fn revoke_by_hand(&mut self, progress: &mut Progress, instructions: &str) -> RunResult {
+        let instructions = RedactedText::new(instructions);
+        progress.record.step = Step::RevokeManual;
+        progress.record.failed_step = None;
+        progress.record.revoke_instructions = Some(instructions.as_str().to_owned());
+        let recorded = self.save(progress).and_then(|()| {
+            self.event(
+                progress,
+                AuditStep::Revoke,
+                AuditOutcome::Skipped,
+                None,
+                Some(instructions.as_str()),
+            )
+        });
+        if let Err(err) = recorded {
+            return self.fail(progress, AuditStep::Revoke, &err.to_string(), None);
+        }
+        RunResult::RevokeManual { instructions }
+    }
+
+    /// A rotation an earlier run left at `revoke_manual` (SHA-289): one
+    /// read-only `check_valid` on the old secret, and no other call. Invalid
+    /// means the operator deleted it: `revoked`. Valid, unknown or an error
+    /// leaves it at `revoke_manual`, with a `skipped` revoke audit entry.
+    async fn recheck_by_hand(
+        &mut self,
+        rotation: &PlannedRotation,
+        provider: &dyn Provider,
+        progress: &mut Progress,
+    ) -> RunResult {
+        let instructions = progress
+            .record
+            .revoke_instructions
+            .clone()
+            .unwrap_or_else(|| REVOKE_BY_HAND_FALLBACK.to_owned());
+        let still = match provider.check_valid(&rotation.credential).await {
+            Ok(Validity::Invalid) => return self.revoked_by_hand(progress),
+            Ok(Validity::Valid) => "the old secret still works".to_owned(),
+            Ok(Validity::Unknown { reason }) => {
+                format!("could not tell whether the old secret still works ({reason})")
+            }
+            Err(err) => format!("could not check the old secret ({err})"),
+        };
+        if let Err(err) = self.event(
+            progress,
+            AuditStep::Revoke,
+            AuditOutcome::Skipped,
+            None,
+            Some(&format!("{still}; {instructions}")),
+        ) {
+            tracing::warn!(rotation_id = %progress.record.rotation_id, "{err}");
+        }
+        RunResult::RevokeManual {
+            instructions: RedactedText::new(&instructions),
+        }
+    }
+
+    /// Records a revoke by hand as done: step `revoked` and an `ok` revoke
+    /// audit entry saying how it was confirmed.
+    fn revoked_by_hand(&mut self, progress: &mut Progress) -> RunResult {
+        progress.record.step = Step::Revoked;
+        progress.record.failed_step = None;
+        progress.record.revoke_instructions = None;
+        let recorded = self.save(progress).and_then(|()| {
+            self.event(
+                progress,
+                AuditStep::Revoke,
+                AuditOutcome::Ok,
+                None,
+                Some(REVOKED_BY_HAND),
+            )
+        });
+        if let Err(err) = recorded {
+            return RunResult::Failed {
+                step: AuditStep::Revoke,
+                error: RedactedText::new(&format!("the old secret was revoked by hand but {err}")),
+            };
+        }
+        RunResult::Revoked
+    }
+
+    /// Records the old secret of a `revoke_manual` rotation as revoked when
+    /// the plan found it no longer works (SHA-289): assessment's
+    /// `check_valid` said `Invalid`, so the plan skipped it with reason
+    /// [`plan::REVOKED_BY_HAND`](crate::plan::REVOKED_BY_HAND) and the
+    /// rotation's id. Makes no call. `None` when that rotation is not at
+    /// `revoke_manual` for this secret, or a rollback of it is in progress.
+    pub fn confirm_revoked_by_hand(&mut self, skipped: &Skipped) -> Option<Outcome> {
+        let provider = skipped.provider?;
+        let record = self
+            .store
+            .get(skipped.rotation_id.as_deref()?)
+            .filter(|r| {
+                r.step == Step::RevokeManual
+                    && !r.is_rolling_back()
+                    && r.provider == provider
+                    && r.fingerprint == skipped.fingerprint
+            })
+            .cloned()?;
+        let mut progress = Progress {
+            record,
+            provider,
+            mode: ReplacementMode::Automatic,
+            forced: Vec::new(),
+        };
+        let result = self.revoked_by_hand(&mut progress);
+        Some(Outcome {
+            rotation_id: progress.record.rotation_id.clone(),
+            provider,
+            fingerprint: progress.record.fingerprint.clone(),
+            replacement_fingerprint: progress.record.replacement_fingerprint.clone(),
+            consumers: progress.record.consumers.clone(),
+            unchanged: Vec::new(),
+            forced: Vec::new(),
+            result,
+        })
     }
 
     /// Records `--force` when it lets the revoke through past consumers
@@ -1565,8 +1718,18 @@ fn step_name(step: Step) -> &'static str {
         Step::Revoked => "revoked",
         Step::Failed => "failed",
         Step::NeedsRollback => "needs_rollback",
+        Step::RevokeManual => "revoke_manual",
         Step::RolledBack => "rolled_back",
     }
+}
+
+/// The provider's revoke-by-hand text without its leading `manual: ` or
+/// `unsupported: ` tag, for a sentence.
+pub fn by_hand_text(instructions: &str) -> &str {
+    ["manual: ", "unsupported: "]
+        .iter()
+        .find_map(|tag| instructions.strip_prefix(tag))
+        .unwrap_or(instructions)
 }
 
 fn audit_step_name(step: AuditStep) -> &'static str {
@@ -1614,12 +1777,13 @@ pub fn render_summary(outcomes: &[Outcome]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Apply: {} revoked, {} pending revoke, {} held, {} failed, {} need rollback, {} skipped.",
+        "Apply: {} revoked, {} pending revoke, {} held, {} failed, {} need rollback, {} revoke by hand, {} skipped.",
         count(|r| matches!(r, RunResult::Revoked)),
         count(|r| matches!(r, RunResult::PendingRevoke { .. })),
         count(|r| matches!(r, RunResult::Held { .. })),
         count(|r| matches!(r, RunResult::Failed { .. })),
         count(|r| matches!(r, RunResult::NeedsRollback { .. })),
+        count(|r| matches!(r, RunResult::RevokeManual { .. })),
         count(|r| matches!(r, RunResult::Skipped(_))),
     );
     if outcomes.is_empty() {
@@ -1666,6 +1830,14 @@ pub fn render_summary(outcomes: &[Outcome]) -> String {
             RunResult::NeedsRollback { reason } => {
                 notes.push(format!("{}: needs rollback: {reason}", o.rotation_id));
                 "needs rollback".to_owned()
+            }
+            RunResult::RevokeManual { instructions } => {
+                notes.push(format!(
+                    "{}: revoke by hand: {}; the replacement is live and verified; re-run rotate apply once the old secret is deleted to record it",
+                    o.rotation_id,
+                    by_hand_text(instructions.as_str())
+                ));
+                "revoke by hand".to_owned()
             }
             RunResult::Held { reason } => {
                 notes.push(format!("{}: {reason}", o.rotation_id));
@@ -2675,5 +2847,310 @@ mod tests {
         );
         assert!(!summary.contains("stopped before revoke"));
         assert_eq!(run_status(&[outcome]), RunStatus::Failed);
+    }
+
+    // SHA-289: revoke by hand.
+
+    const BY_HAND: &str = crate::provider::openai::REVOKE_NEEDS_ADMIN;
+
+    fn last_audit(f: &Fixture) -> crate::audit::AuditEntry {
+        crate::audit::read_all(&f.audit_path)
+            .unwrap()
+            .map(Result::unwrap)
+            .last()
+            .unwrap()
+    }
+
+    fn calls(log: &CallLog) -> Vec<String> {
+        log.calls()
+            .into_iter()
+            .map(|c| format!("{}.{}", c.target, c.method))
+            .collect()
+    }
+
+    /// Runs `value` to `revoke_manual` with a provider that cannot revoke.
+    async fn to_revoke_manual(value: &str) -> (Fixture, Plan) {
+        let mut f = fixture(value, MockProvider::new("npm").manual_revoke(BY_HAND));
+        let plan = plan(&mut f, value, "0s").await;
+        let outcome = run(&mut f, &plan).await;
+        assert_eq!(
+            outcome.result,
+            RunResult::RevokeManual {
+                instructions: RedactedText::new(BY_HAND)
+            }
+        );
+        f.log.clear();
+        (f, plan)
+    }
+
+    // T1 (AC1)
+    #[tokio::test]
+    async fn manual_revoke_never_calls_revoke() {
+        let value = "npm_apply_unit_by_hand";
+        let (f, plan) = to_revoke_manual(value).await;
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::RevokeManual);
+        assert_eq!(stored.revoke_instructions.as_deref(), Some(BY_HAND));
+        assert_eq!(stored.failed_step, None);
+        assert!(!f.provider.is_revoked(&fp(value)));
+        let entry = last_audit(&f);
+        assert_eq!(entry.step, AuditStep::Revoke);
+        assert_eq!(entry.outcome, AuditOutcome::Skipped);
+        assert_eq!(entry.error.unwrap().as_str(), BY_HAND);
+        assert!(
+            !f.store
+                .get(&plan.rotations[0].rotation_id)
+                .unwrap()
+                .step
+                .is_terminal(),
+            "revoke_manual is not terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_revoke_becomes_revoke_manual() {
+        let value = "npm_apply_unit_unsupported";
+        let mut f = fixture(value, MockProvider::new("npm"));
+        let plan = plan(&mut f, value, "0s").await;
+        f.provider.fail_always(
+            "revoke",
+            ProviderError::Unsupported("delete it at https://example.test".into()),
+        );
+        let outcome = run(&mut f, &plan).await;
+        assert_eq!(
+            run_status(std::slice::from_ref(&outcome)),
+            RunStatus::RevokeManual
+        );
+        assert!(mutating(&f.log).contains(&"npm.revoke".to_owned()));
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::RevokeManual);
+        assert_eq!(
+            stored.revoke_instructions.as_deref(),
+            Some("delete it at https://example.test")
+        );
+    }
+
+    // T7 (AC7)
+    #[tokio::test]
+    async fn permanent_or_transient_revoke_error_is_failed() {
+        for error in [
+            ProviderError::Permanent("denied".into()),
+            ProviderError::Transient("503".into()),
+        ] {
+            let value = format!("npm_apply_unit_revoke_err_{}", error.is_retryable());
+            let mut f = fixture(&value, MockProvider::new("npm"));
+            let plan = plan(&mut f, &value, "0s").await;
+            f.provider.fail_always("revoke", error.clone());
+            let outcome = run(&mut f, &plan).await;
+            assert!(
+                matches!(
+                    outcome.result,
+                    RunResult::Failed {
+                        step: AuditStep::Revoke,
+                        ..
+                    }
+                ),
+                "{error}: {outcome:?}"
+            );
+            let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+            assert_eq!(stored.step, Step::Failed);
+            assert_eq!(stored.failed_step, Some(AuditStep::Revoke));
+            assert_eq!(stored.revoke_instructions, None);
+        }
+    }
+
+    // T8 (AC8)
+    #[tokio::test]
+    async fn manual_revoke_waits_for_the_window_first() {
+        fn later() -> OffsetDateTime {
+            OffsetDateTime::now_utc() + time::Duration::hours(1)
+        }
+        let value = "npm_apply_unit_by_hand_window";
+        let mut f = fixture(value, MockProvider::new("npm").manual_revoke(BY_HAND));
+        let plan = plan(&mut f, value, "10m").await;
+        let outcome = run(&mut f, &plan).await;
+        assert!(
+            matches!(outcome.result, RunResult::PendingRevoke { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(run_status(&[outcome]), RunStatus::Pending);
+        let id = &plan.rotations[0].rotation_id;
+        assert_eq!(f.store.get(id).unwrap().step, Step::PendingRevoke);
+        assert_eq!(f.store.get(id).unwrap().revoke_instructions, None);
+
+        let outcome = Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit)
+            .with_clock(later)
+            .run(&plan.rotations[0])
+            .await;
+        assert!(
+            matches!(outcome.result, RunResult::RevokeManual { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.store.get(id).unwrap().step, Step::RevokeManual);
+        assert!(f.log.calls().iter().all(|c| c.method != "revoke"));
+    }
+
+    // T5 (AC5): the old secret stopped working between plan and apply.
+    #[tokio::test]
+    async fn rerun_records_revoked_once_check_valid_says_invalid() {
+        let value = "npm_apply_unit_by_hand_done";
+        let (mut f, plan) = to_revoke_manual(value).await;
+        f.provider.mark_revoked(fp(value));
+        let outcome = run(&mut f, &plan).await;
+        assert_eq!(outcome.result, RunResult::Revoked);
+        assert_eq!(calls(&f.log), ["npm.check_valid"]);
+        assert_eq!(run_status(&[outcome]), RunStatus::Done);
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::Revoked);
+        assert_eq!(stored.revoke_instructions, None);
+        let entry = last_audit(&f);
+        assert_eq!(entry.step, AuditStep::Revoke);
+        assert_eq!(entry.outcome, AuditOutcome::Ok);
+        assert_eq!(entry.error.unwrap().as_str(), REVOKED_BY_HAND);
+    }
+
+    // T5 (AC5): the plan already saw it invalid; apply records it with no
+    // call at all.
+    #[tokio::test]
+    async fn plan_skip_records_revoked_by_hand_without_a_call() {
+        let value = "npm_apply_unit_by_hand_plan";
+        let (mut f, first) = to_revoke_manual(value).await;
+        let id = first.rotations[0].rotation_id.clone();
+        f.provider.mark_revoked(fp(value));
+        let mut again = plan(&mut f, value, "0s").await;
+        assert!(again.rotations.is_empty());
+        assert_eq!(again.skipped[0].reason, "invalid");
+        crate::plan::mark_revoked_by_hand(&mut again, f.store.rotations());
+        assert_eq!(again.skipped[0].reason, crate::plan::REVOKED_BY_HAND);
+        assert_eq!(again.skipped[0].rotation_id.as_deref(), Some(id.as_str()));
+
+        let mut executor = Executor::new(&f.providers, &f.consumers, &mut f.store, &mut f.audit);
+        let outcome = executor.confirm_revoked_by_hand(&again.skipped[0]).unwrap();
+        assert_eq!(outcome.rotation_id, id);
+        assert_eq!(outcome.result, RunResult::Revoked);
+        // Already recorded: nothing to do a second time.
+        assert!(executor
+            .confirm_revoked_by_hand(&again.skipped[0])
+            .is_none());
+        drop(executor);
+        assert!(f.log.calls().is_empty(), "{:?}", calls(&f.log));
+        assert_eq!(f.store.get(&id).unwrap().step, Step::Revoked);
+        let entry = last_audit(&f);
+        assert_eq!(entry.outcome, AuditOutcome::Ok);
+        assert_eq!(entry.error.unwrap().as_str(), REVOKED_BY_HAND);
+    }
+
+    // T6 (AC6)
+    #[tokio::test]
+    async fn rerun_while_still_valid_only_checks() {
+        let value = "npm_apply_unit_by_hand_valid";
+        let (mut f, plan) = to_revoke_manual(value).await;
+        let outcome = run(&mut f, &plan).await;
+        assert_eq!(calls(&f.log), ["npm.check_valid"]);
+        assert_eq!(
+            outcome.result,
+            RunResult::RevokeManual {
+                instructions: RedactedText::new(BY_HAND)
+            }
+        );
+        assert_eq!(run_status(&[outcome]), RunStatus::RevokeManual);
+        let stored = f.store.get(&plan.rotations[0].rotation_id).unwrap();
+        assert_eq!(stored.step, Step::RevokeManual);
+        let entry = last_audit(&f);
+        assert_eq!(entry.outcome, AuditOutcome::Skipped);
+        let text = entry.error.unwrap();
+        assert!(
+            text.as_str().starts_with("the old secret still works; "),
+            "{text}"
+        );
+
+        // A check that fails leaves it too.
+        f.log.clear();
+        f.provider
+            .fail_next("check_valid", ProviderError::Transient("timeout".into()));
+        let outcome = run(&mut f, &plan).await;
+        assert!(matches!(outcome.result, RunResult::RevokeManual { .. }));
+        assert_eq!(calls(&f.log), ["npm.check_valid"]);
+    }
+
+    // T3 (AC3)
+    #[test]
+    fn summary_line_for_revoke_by_hand() {
+        let mut o = Outcome::skipped(&gate_rotation(), Ineligible::NoScope);
+        o.rotation_id = "rot-3".into();
+        o.result = RunResult::RevokeManual {
+            instructions: RedactedText::new(BY_HAND),
+        };
+        let summary = render_summary(&[o]);
+        assert!(
+            summary.starts_with(
+                "Apply: 0 revoked, 0 pending revoke, 0 held, 0 failed, 0 need rollback, 1 revoke by hand, 0 skipped."
+            ),
+            "{summary}"
+        );
+        let line = summary
+            .lines()
+            .find(|l| l.starts_with("rot-3: "))
+            .expect("a note line");
+        assert_eq!(
+            line,
+            "rot-3: revoke by hand: without an Admin API key rotate cannot delete OpenAI keys; delete it at https://platform.openai.com/api-keys; the replacement is live and verified; re-run rotate apply once the old secret is deleted to record it"
+        );
+        assert!(summary.contains("revoke by hand\n"), "{summary}");
+        assert_eq!(
+            by_hand_text(crate::provider::github::INSTALLATION_UNSUPPORTED),
+            &crate::provider::github::INSTALLATION_UNSUPPORTED["unsupported: ".len()..]
+        );
+    }
+
+    // T4 (AC4)
+    #[test]
+    fn run_status_precedence_with_revoke_by_hand() {
+        let with = |result: RunResult| {
+            let mut o = Outcome::skipped(&gate_rotation(), Ineligible::NoScope);
+            o.result = result;
+            o
+        };
+        let manual = || {
+            with(RunResult::RevokeManual {
+                instructions: RedactedText::new(BY_HAND),
+            })
+        };
+        let failed = || {
+            with(RunResult::Failed {
+                step: AuditStep::Update,
+                error: RedactedText::new("denied"),
+            })
+        };
+        let pending = || {
+            with(RunResult::PendingRevoke {
+                not_before: OffsetDateTime::now_utc(),
+                remaining: time::Duration::minutes(1),
+            })
+        };
+        let unsupported = || with(RunResult::Skipped(Ineligible::NoScope));
+        let cases = [
+            (vec![failed(), manual()], RunStatus::Failed),
+            (vec![manual(), pending()], RunStatus::RevokeManual),
+            (vec![pending(), manual()], RunStatus::RevokeManual),
+            (vec![manual(), unsupported()], RunStatus::RevokeManual),
+            (vec![pending(), unsupported()], RunStatus::Pending),
+            (
+                vec![manual(), with(RunResult::Revoked)],
+                RunStatus::RevokeManual,
+            ),
+        ];
+        for (outcomes, expected) in cases {
+            assert_eq!(run_status(&outcomes), expected, "{outcomes:?}");
+        }
+    }
+
+    #[test]
+    fn revoke_manual_resumes_at_revoke_and_is_eligible() {
+        let mut r = Rotation::new("rot-1", "npm", fp("npm_resume_manual"));
+        r.step = Step::RevokeManual;
+        r.replacement_ref = Some("npm-ref-1".into());
+        assert_eq!(resume_point(&r), Resume::Revoke);
+        assert_eq!(step_eligibility(Step::RevokeManual), Ok(()));
     }
 }
