@@ -2586,6 +2586,7 @@ mod tests {
             lookup_errors: Vec::new(),
             revoke_action: "x",
             overlap_window: "0s".parse().unwrap(),
+            revoke_blocker: None,
             blockers: Vec::new(),
             step: Step::Planned,
             sources: Vec::new(),

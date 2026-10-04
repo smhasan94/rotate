@@ -94,6 +94,10 @@ pub struct PlannedRotation {
     pub revoke_action: &'static str,
     /// Copy of [`Plan::overlap_window`], so a rotation reads on its own.
     pub overlap_window: Overlap,
+    /// Why the provider's revoke would fail as configured now (see
+    /// [`Provider::revoke_blocker`](crate::provider::Provider::revoke_blocker)),
+    /// for example no npm operator token (SHA-292). Also in `blockers`.
+    pub revoke_blocker: Option<String>,
     /// Why apply would stop before the revoke. Empty when nothing blocks.
     pub blockers: Vec<String>,
     /// Step recorded in the state file; `planned` for a new rotation.
@@ -321,6 +325,13 @@ pub async fn build(
         let manual_revoke = providers
             .get(provider)
             .and_then(|p| p.manual_revoke(item.scope.as_ref()));
+        // A revoke done by hand needs no operator credential.
+        let revoke_blocker = match manual_revoke {
+            Some(_) => None,
+            None => providers
+                .get(provider)
+                .and_then(|p| p.revoke_blocker(&item.credential, item.scope.as_ref())),
+        };
         let mut rotation = PlannedRotation {
             rotation_id: String::new(),
             provider,
@@ -335,6 +346,7 @@ pub async fn build(
             lookup_errors,
             revoke_action: manual_revoke.unwrap_or_else(|| revoke_action(provider)),
             overlap_window,
+            revoke_blocker,
             blockers: Vec::new(),
             step: Step::Planned,
             sources: item.sources,
@@ -365,6 +377,7 @@ pub(crate) fn blockers(rotation: &PlannedRotation) -> Vec<String> {
             err.consumer
         ));
     }
+    blockers.extend(rotation.revoke_blocker.clone());
     blockers
 }
 
@@ -992,6 +1005,20 @@ mod tests {
         assert_eq!(plan.skipped[0].provider, Some("npm"));
         assert_eq!(plan.skipped[1].reason, "unsupported");
         assert!(log.calls().iter().all(|c| c.method != "find"));
+        log.assert_no_mutations();
+    }
+
+    // SHA-292: a provider's revoke blocker is a blocker, and stays one when
+    // `--check-permissions` recomputes the list.
+    #[tokio::test]
+    async fn revoke_blocker_survives_recompute() {
+        let log = CallLog::new();
+        let provider = MockProvider::new("npm").identify_prefix("npm_");
+        let mut plan = plan_for(&["npm_plan_unit_revoke_blocker"], provider, vec![], &log).await;
+        let r = &mut plan.rotations[0];
+        assert_eq!(r.revoke_blocker, None);
+        r.revoke_blocker = Some("no operator token".into());
+        assert_eq!(blockers(r), ["no operator token"]);
         log.assert_no_mutations();
     }
 

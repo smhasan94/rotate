@@ -11,7 +11,12 @@
 //! The operator token (`ROTATE_NPM_TOKEN`, then `NPM_TOKEN`) signs the token
 //! list, `GET /-/npm/v1/tokens`, and the delete, `DELETE
 //! /-/npm/v1/tokens/token/{key}`. npm accepts only an `npm login` session
-//! token on the list. Revoke finds the leaked token's entry in that list and
+//! token on the list ([`OPERATOR_REQUIREMENT`]; SHA-292 records the npm
+//! sources); a granular token without 2FA bypass may delete but not list,
+//! and one with 2FA bypass gets a 403 on both. Session tokens expire after
+//! two hours, so an unattended run needs a fresh `npm login` first. The plan
+//! shows a blocker ([`NpmProvider::revoke_blocker`]) when no usable operator
+//! token is set or npm refused it on the list. Revoke finds the leaked token's entry in that list and
 //! deletes it by the entry's `key`, so the token value is never put in a
 //! URL. An entry matches when its `key` is the sha512 hex of the token
 //! (npm's old key scheme, see [`token_key`]) or when the redacted `token`
@@ -57,6 +62,27 @@ pub const TOKEN_VARS: [&str; 2] = ["ROTATE_NPM_TOKEN", "NPM_TOKEN"];
 /// Scope line, and the start of the revoke error, when the operator's token
 /// list has no entry for the leaked token (AC5).
 pub const NOT_VISIBLE: &str = "token not visible to operator account";
+
+/// The operator token kind npm requires, as the docs state it. The same
+/// sentence is in `docs/permissions.md`, `docs/providers.md` and
+/// `docs/backlog.md` (SHA-292, kept in step by a test).
+pub const OPERATOR_REQUIREMENT: &str = "The npm operator token must be an `npm login` session \
+     token for the same account as the leaked token: npm's token list accepts no other kind, \
+     granular access tokens included.";
+
+/// Start of the plan blocker when no operator token is set (SHA-292).
+pub const NO_OPERATOR: &str = "no npm operator token";
+
+/// What the scope line says when npm refused the operator token on the
+/// token list (401 or 403).
+pub const LIST_REFUSED: &str = "listing tokens needs an `npm login` session token";
+
+/// Session token lifetime, for blockers and scope lines.
+const SESSION_EXPIRY: &str = "session tokens expire after two hours, so an unattended run needs a \
+     fresh `npm login` shortly before it";
+
+/// End of every revoke blocker.
+const REVOKE_FAILS: &str = "without it apply stops at revoke and the leaked token stays valid";
 
 /// The public registry, whose website is [`PUBLIC_WEB`].
 pub const PUBLIC_REGISTRY: &str = "https://registry.npmjs.org";
@@ -585,7 +611,7 @@ impl NpmProvider {
     pub async fn lookup(&self, token: &SecretValue) -> Result<Lookup, ProviderError> {
         let Some(operator) = self.operator() else {
             return Ok(Lookup::Missing(
-                "no operator token: set ROTATE_NPM_TOKEN or NPM_TOKEN to an npm login session \
+                "no operator token: set ROTATE_NPM_TOKEN or NPM_TOKEN to an `npm login` session \
                  token"
                     .into(),
             ));
@@ -601,7 +627,8 @@ impl NpmProvider {
             Err(err @ NpmError::RateLimited { .. }) => Err(op_error(LIST, err)),
             Err(err @ NpmError::Status { status, .. }) if status == 401 || status == 403 => {
                 Ok(Lookup::Missing(format!(
-                    "{LIST}: {err}; listing tokens needs an npm login session token"
+                    "{LIST}: {err}; {LIST_REFUSED} in ROTATE_NPM_TOKEN, not a granular access \
+                     token; {SESSION_EXPIRY}"
                 )))
             }
             Err(err) => Ok(Lookup::Missing(format!("{LIST}: {err}"))),
@@ -639,6 +666,13 @@ impl NpmProvider {
                 Err(ProviderError::Permanent(format!(
                     "{DELETE}: {err}. A granular token that bypasses 2FA cannot delete tokens; use \
                      an npm login session token as ROTATE_NPM_TOKEN, or delete the token at {}",
+                    self.tokens_page(user)
+                )))
+            }
+            Err(err @ NpmError::Status { status: 403, .. }) => {
+                Err(ProviderError::Permanent(format!(
+                    "{DELETE}: {err}. The operator token may not delete tokens; use an npm login \
+                     session token as ROTATE_NPM_TOKEN, or delete the token at {}",
                     self.tokens_page(user)
                 )))
             }
@@ -785,6 +819,42 @@ impl Provider for NpmProvider {
             "Create a new granular access token for {user} {place} {same}. Read-write tokens \
              last at most 90 days. Then paste it at the prompt."
         )
+    }
+
+    /// A blocker when revoke cannot work with the operator token as set:
+    /// none set, the leaked token itself (decision D3), or one npm refused
+    /// on the token list (the scope's [`NOT_VISIBLE`] line says
+    /// [`LIST_REFUSED`]). Reads the environment once; no network.
+    fn revoke_blocker(&self, credential: &Credential, scope: Option<&Scope>) -> Option<String> {
+        let Credential::Token(leaked) = credential else {
+            return None;
+        };
+        let Some(operator) = self.operator() else {
+            return Some(format!(
+                "{NO_OPERATOR}: set ROTATE_NPM_TOKEN to an `npm login` session token of the same \
+                 account (npm lists tokens only for a session token, not a granular access \
+                 token); {SESSION_EXPIRY}; {REVOKE_FAILS}"
+            ));
+        };
+        if operator == leaked {
+            return Some(format!(
+                "the npm operator token is the leaked token and rotate never uses it (decision \
+                 D3): set ROTATE_NPM_TOKEN to another `npm login` session token of the same \
+                 account; {REVOKE_FAILS}"
+            ));
+        }
+        let refused = scope.is_some_and(|s| {
+            s.lines
+                .iter()
+                .any(|l| l.starts_with(NOT_VISIBLE) && l.contains(LIST_REFUSED))
+        });
+        refused.then(|| {
+            format!(
+                "npm refused the operator token on the token list: ROTATE_NPM_TOKEN (or \
+                 NPM_TOKEN) must be an `npm login` session token, not a granular access token; \
+                 {SESSION_EXPIRY}; {REVOKE_FAILS}"
+            )
+        })
     }
 
     fn identify(&self, finding: &Finding) -> Option<Confidence> {
@@ -1188,6 +1258,49 @@ mod tests {
             .with_operator_token(None)
             .manual_instructions(&scope_of(&["user: alice"]));
         assert!(private.contains("on https://npm.example.com"), "{private}");
+    }
+
+    // SHA-292: the revoke blocker names the variable and the token kind,
+    // and never the token.
+    #[test]
+    fn revoke_blocker_cases() {
+        let leaked = tok(BODY);
+        let operator = format!("{}x", &tok(BODY)[..BODY + 3]);
+        let cred = Credential::Token(SecretValue::from(leaked.as_str()));
+
+        let none = provider().revoke_blocker(&cred, None).unwrap();
+        assert!(none.starts_with(NO_OPERATOR), "{none}");
+        for part in ["ROTATE_NPM_TOKEN", "`npm login` session token", "two hours"] {
+            assert!(none.contains(part), "{part} missing: {none}");
+        }
+
+        let same = NpmProvider::new(PUBLIC_REGISTRY)
+            .with_operator_token(Some(SecretValue::from(leaked.as_str())))
+            .revoke_blocker(&cred, None)
+            .unwrap();
+        assert!(same.contains("D3"), "{same}");
+
+        let set = NpmProvider::new(PUBLIC_REGISTRY)
+            .with_operator_token(Some(SecretValue::from(operator.as_str())));
+        assert_eq!(set.revoke_blocker(&cred, None), None);
+        let visible = scope_of(&["user: alice", "type: granular"]);
+        assert_eq!(set.revoke_blocker(&cred, Some(&visible)), None);
+        let missing = scope_of(&["user: alice", &format!("{NOT_VISIBLE} (none of 3 match)")]);
+        assert_eq!(set.revoke_blocker(&cred, Some(&missing)), None);
+        let refused_line = format!("{NOT_VISIBLE} (GET /-/npm/v1/tokens: 403; {LIST_REFUSED} ...)");
+        let refused = scope_of(&["user: alice", &refused_line]);
+        let text = set.revoke_blocker(&cred, Some(&refused)).unwrap();
+        assert!(text.contains("ROTATE_NPM_TOKEN"), "{text}");
+        assert!(text.contains("not a granular access token"), "{text}");
+
+        for text in [&none, &same, &text] {
+            assert!(!text.contains(&leaked) && !text.contains(&operator));
+        }
+        let pair = Credential::KeyPair(crate::secret::SecretPair::new(
+            "key-id",
+            SecretValue::from("x"),
+        ));
+        assert_eq!(provider().revoke_blocker(&pair, None), None);
     }
 
     #[test]
