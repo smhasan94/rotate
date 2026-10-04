@@ -12,7 +12,8 @@ pub enum Exit {
     /// Everything requested was done.
     Ok = 0,
     /// A rotation step failed. The old secret is still valid unless the
-    /// output says otherwise.
+    /// output says otherwise. Also `rollback` finishing with the restored
+    /// consumers holding a revoked secret (SHA-290).
     RotationFailed = 1,
     /// Bad arguments, bad configuration, or a subcommand that is not
     /// implemented yet.

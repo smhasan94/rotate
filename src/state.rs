@@ -123,6 +123,16 @@ pub struct RollbackProgress {
     /// The replacement step is finished: it was revoked, or there was none,
     /// or it has to be revoked by hand.
     pub revoke_done: bool,
+    /// The provider step found the old secret revoked with no way to
+    /// reactivate it (SHA-290): the restored consumers hold a revoked
+    /// secret and rollback exits 1, on a resumed run too. Written only
+    /// when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub old_still_revoked: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One rotation's recorded progress. Holds no secret values.
@@ -781,6 +791,13 @@ mod tests {
         );
         assert_eq!(json["consumers"][0]["status"], "restored");
         assert_eq!(json["consumers"][0]["holds"], "key_id");
+        // SHA-290: written only when true.
+        rotation.rollback.as_mut().unwrap().old_still_revoked = true;
+        let json = serde_json::to_value(&rotation).unwrap();
+        assert_eq!(
+            json["rollback"],
+            serde_json::json!({"restore_done": false, "revoke_done": false, "old_still_revoked": true})
+        );
         rotation.step = Step::RolledBack;
         assert!(!rotation.is_rolling_back());
     }
@@ -804,6 +821,7 @@ mod tests {
         rotation.rollback = Some(RollbackProgress {
             restore_done: true,
             revoke_done: false,
+            old_still_revoked: true,
         });
         rotation.revoke_not_before = Some(OffsetDateTime::now_utc() + Duration::minutes(15));
         rotation.force = true;

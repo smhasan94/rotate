@@ -708,8 +708,51 @@ fn t1_mock_rollback_unsupported_restore() {
     );
     run.consumers_hold(MOCK_REPLACEMENT);
     run.set(|s| s["providers"] = json!({ "npm": { "restore": "unsupported" } }));
-    run.run(&["rollback", "--stdin", "--confirm", &id]);
-    run.run(&["status", "--all"]);
+    // SHA-290 T8 (AC1): the old secret stays revoked, so exit 1.
+    run.expect(1, &["rollback", "--stdin", "--confirm", &id]);
+    assert_eq!(run.step(&id), "rolled_back");
+    let status = run.expect(0, &["status", "--all"]);
+    assert!(
+        text(&status.stdout).contains("the old secret stays revoked"),
+        "{}",
+        shown(&status)
+    );
+    run.expect(0, &["--json", "status", "--all"]);
+}
+
+// SHA-290 T8 (AC2): a rotation revoked by hand (no restore handle) rolled
+// back: consumers restored, replacement revoked, exit 1; every run swept.
+#[test]
+fn sha290_t8_rollback_after_revoke_by_hand_exits_1() {
+    let mut run = MockRun::new();
+    let said = echoing_instructions(&run, "manual_revoke");
+    run.set(|s| s["providers"] = json!({ "npm": { "manual_revoke": said } }));
+    let id = run.planned_id();
+    run.expect(
+        4,
+        &["--overlap", "0s", "apply", "--stdin", "--confirm", &id],
+    );
+    // Deleted by hand: apply records it revoked, with no handle.
+    run.set(|s| s["providers"]["npm"]["validity"] = json!("invalid"));
+    run.expect(0, &["apply", "--stdin", "--confirm", &id]);
+    assert_eq!(run.step(&id), "revoked");
+
+    let providers = run.scenario["providers"].clone();
+    run.consumers_hold(MOCK_REPLACEMENT);
+    run.set(|s| s["providers"] = providers);
+    let output = run.expect(1, &["rollback", "--stdin", "--confirm", &id]);
+    let out = text(&output.stdout);
+    assert!(out.contains("rollback will exit 1"), "{}", shown(&output));
+    assert!(
+        out.contains("1 with the old secret still revoked"),
+        "{}",
+        shown(&output)
+    );
+    assert_eq!(run.step(&id), "rolled_back");
+    run.expect(0, &["status", "--all"]);
+    run.expect(0, &["--json", "status", "--all"]);
+    // Finished: a second rollback has nothing to do.
+    run.expect(0, &["rollback", "--stdin", "--confirm", &id]);
 }
 
 // T1 (AC1): the panic and error paths. `__test-console` prints, fails or

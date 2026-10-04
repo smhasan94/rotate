@@ -606,7 +606,7 @@ fn rollback(
     }
     drop(store);
     for outcome in &outcomes {
-        for warning in &outcome.warnings {
+        for warning in outcome.stderr_warnings() {
             let _ = writeln!(console.err(), "warning: {}: {warning}", outcome.rotation_id);
         }
     }
@@ -614,7 +614,7 @@ fn rollback(
         console,
         &format!("\n{}", rollback::render_summary(&outcomes)),
     );
-    if rollback::any_failed(&outcomes) {
+    if rollback::needs_operator(&outcomes) {
         Exit::RotationFailed
     } else {
         Exit::Ok
