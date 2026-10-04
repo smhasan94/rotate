@@ -15,8 +15,8 @@ OpenAI API keys.
 
 ## Status
 
-Pre-release. Nothing is published yet, and the tool cannot rotate anything
-today.
+Pre-release: no version is published yet. The MVP flow works end to end
+from source (see [Quick start](#quick-start)); the first release is v0.1.0.
 
 What works now:
 
@@ -258,47 +258,66 @@ the first tagged version.
 
 ## Quick start
 
-Placeholder until the providers land; the commands are the intended flow.
+The full walkthrough is [docs/usage.md](docs/usage.md).
 
 ```sh
-# Dry run: show what would be created, updated and revoked.
+# 1. Say where your secrets are used (see docs/config.md).
+cat > rotate.yaml <<'YAML'
+consumers:
+  github_actions:
+    targets: [acme/api]
+  aws_secrets_manager:
+    secrets: [prod/app]
+YAML
+
+# 2. Dry run: show what would be created, updated and revoked. Changes nothing.
 rotate plan trufflehog-report.json
 
-# One secret from stdin. Use --provider to skip identification.
-pbpaste | rotate plan --stdin
+# One secret instead of a report: paste it, then Ctrl-D. Never pass it as an argument.
+rotate plan --stdin
 
-# Apply the plan: type each rotation id when asked.
+# 3. Apply: type each rotation id when asked.
 rotate apply trufflehog-report.json
 
-# What is in progress or waiting for its overlap window; exits 3 if any.
+# 4. What is in progress or waiting for its overlap window; exits 3 if any.
 rotate status
 
-# Non-interactive, for CI: confirm by id.
-rotate apply trufflehog-report.json --confirm rot-1a2b3c4d
-
-# Manual replacement (GitHub, npm) without a terminal: supply the new token.
-NEW_TOKEN=... rotate apply --stdin --confirm rot-1a2b3c4d --replacement-from-env NEW_TOKEN
+# Undo a rotation: give the same input again.
+rotate rollback trufflehog-report.json
 ```
+
+- [docs/usage.md](docs/usage.md): install, first run, reading the plan,
+  apply, the overlap window, rollback, status, every flag and the exit
+  codes.
+- [docs/config.md](docs/config.md): every `rotate.yaml` field with its
+  default, environment variables and name conventions.
+- [docs/security.md](docs/security.md): the four safety guarantees, the
+  audit log, fingerprints, file permissions and the limits.
+- [docs/non-interactive.md](docs/non-interactive.md): `--confirm`,
+  `--replacement-from-env`, `--json`, exit codes for scripts, and a
+  scheduled GitHub Actions workflow.
 
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Everything requested was done. |
-| 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. |
-| 2 | Bad arguments, bad configuration, or a subcommand that is not implemented yet. |
-| 3 | Work is pending: `rotate apply` recorded a revoke waiting for its overlap window, or `rotate status` found a rotation that is pending, failed, needs rollback or waits for a revoke by hand. |
-| 4 | `rotate apply`: the replacement is live and verified, but rotate cannot revoke the old secret; delete it by hand as the summary says, then re-run `rotate apply` to record it. When several rotations end differently, 1 wins over 4, 4 over 3 and 3 over 2. |
-| 101 | rotate panicked. This is a bug; the message is redacted like all other output. |
+`0` done, `1` a step failed (the old secret still works unless the output
+says otherwise), `2` bad arguments or configuration (nothing changed), `3`
+work pending, `4` revoke the old secret by hand. Details per command:
+[docs/usage.md](docs/usage.md#9-exit-codes) and, for scripts,
+[docs/non-interactive.md](docs/non-interactive.md#exit-codes).
 
 ## Documentation
 
+- [docs/usage.md](docs/usage.md): the usage guide.
+- [docs/config.md](docs/config.md): the `rotate.yaml` reference.
+- [docs/security.md](docs/security.md): the security model and its limits.
+- [docs/non-interactive.md](docs/non-interactive.md): scripts, CI and exit
+  codes.
 - [docs/requirements.md](docs/requirements.md): requirements, threat model
   and recorded decisions.
 - [docs/report-formats.md](docs/report-formats.md): the TruffleHog and
   gitleaks fields rotate reads.
-- [docs/rotate.example.yaml](docs/rotate.example.yaml): every config option
-  with its default.
+- [docs/rotate.example.yaml](docs/rotate.example.yaml): an annotated
+  `rotate.yaml` with every option.
 - [docs/providers.md](docs/providers.md): what rotate automates for each
   provider and consumer, what is manual or unsupported, and what to prepare
   before an incident.

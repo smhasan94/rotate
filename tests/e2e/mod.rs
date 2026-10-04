@@ -112,6 +112,9 @@ pub struct State {
     /// Every `SimulatePrincipalPolicy` request, as `(principal, actions,
     /// resources)`.
     pub simulations: Vec<(String, Vec<String>, Vec<String>)>,
+    /// Answer `SimulatePrincipalPolicy` with this status and an error whose
+    /// message is this text (SHA-293).
+    pub simulate_error: Option<(u16, String)>,
 }
 
 /// An AWS account with one IAM user and one Secrets Manager entry.
@@ -130,6 +133,7 @@ impl AwsModel {
             ops: Vec::new(),
             policy: None,
             simulations: Vec::new(),
+            simulate_error: None,
         })))
     }
 
@@ -483,6 +487,18 @@ impl Respond for AwsModel {
         if signer != state.operator {
             return query_error(403, "AccessDenied");
         }
+        if action == "SimulatePrincipalPolicy" {
+            if let Some((status, message)) = state.simulate_error.clone() {
+                return xml(
+                    status,
+                    format!(
+                        "<ErrorResponse><Error><Type>Receiver</Type><Code>ServiceFailure</Code>\
+                         <Message>{message}</Message></Error><RequestId>req-s</RequestId>\
+                         </ErrorResponse>"
+                    ),
+                );
+            }
+        }
         let simulation_denied = action == "SimulatePrincipalPolicy" && state.policy.is_none();
         if simulation_denied || !state.allows(&format!("iam:{action}")) {
             return query_error(403, "AccessDenied");
@@ -519,6 +535,9 @@ pub struct GithubState {
     pub deny_put: bool,
     /// Answer `GET .../public-key` with 403 (SHA-270).
     pub deny_public_key: bool,
+    /// Answer `GET .../public-key` with this status and JSON `message`
+    /// (SHA-293).
+    pub public_key_error: Option<(u16, String)>,
     /// The `x-oauth-scopes` header of every answer, as for a classic token.
     pub scopes: Option<String>,
     /// Every request, as `METHOD path`.
@@ -549,6 +568,7 @@ impl GithubModel {
             puts: Vec::new(),
             deny_put: false,
             deny_public_key: false,
+            public_key_error: None,
             scopes: None,
             ops: Vec::new(),
         })))
@@ -642,6 +662,9 @@ impl GithubModel {
                 )
             }
             ("GET", "/public-key") => {
+                if let Some((status, message)) = state.public_key_error.clone() {
+                    return gh_error(status, &message);
+                }
                 if state.deny_public_key {
                     return gh_error(403, "Resource not accessible by personal access token");
                 }
