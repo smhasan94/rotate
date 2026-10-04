@@ -158,6 +158,9 @@ pub struct AuditEvent {
     pub consumer: Option<String>,
     /// How the replacement was obtained, on `create` entries (SHA-257).
     pub replacement_mode: Option<ReplacementMode>,
+    /// `Some(true)` on a `create` entry whose replacement is broader than
+    /// the leaked credential (SHA-291); `None` otherwise.
+    pub scope_widened: Option<bool>,
     /// Which undo, on `rollback` entries (SHA-259).
     pub action: Option<RollbackAction>,
     /// The step.
@@ -184,6 +187,7 @@ impl AuditEvent {
             replacement_fingerprint: None,
             consumer: None,
             replacement_mode: None,
+            scope_widened: None,
             action: None,
             step,
             outcome,
@@ -206,6 +210,12 @@ impl AuditEvent {
     /// Sets how the replacement was obtained.
     pub fn with_mode(mut self, mode: ReplacementMode) -> Self {
         self.replacement_mode = Some(mode);
+        self
+    }
+
+    /// Marks the replacement as broader than the leaked credential.
+    pub fn with_scope_widened(mut self) -> Self {
+        self.scope_widened = Some(true);
         self
     }
 
@@ -248,6 +258,11 @@ pub struct AuditEntry {
     /// `automatic` or `manual`, on `create` entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_mode: Option<ReplacementMode>,
+    /// `true` on a `create` entry whose replacement is broader than the
+    /// leaked credential (SHA-291), for example an OpenAI service account
+    /// with all permissions. Absent otherwise and in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_widened: Option<bool>,
     /// `restore_old`, `restore_consumer` or `revoke_replacement`, on
     /// `rollback` entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,6 +405,7 @@ impl AuditLog {
             replacement_fingerprint: event.replacement_fingerprint,
             consumer: event.consumer,
             replacement_mode: event.replacement_mode,
+            scope_widened: event.scope_widened,
             action: event.action,
             step: event.step,
             outcome: event.outcome,

@@ -59,6 +59,7 @@ fn openai_provider(
         config.api_url.as_str(),
         rotate::provider::openai::AdminKey::Env(config.admin_key_env.clone()),
     )
+    .with_allow_broader_replacement(config.allow_broader_replacement)
 }
 
 /// The npm token provider (SHA-261) for the configured registry. The

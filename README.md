@@ -98,8 +98,8 @@ What works now:
   confirmed by check_valid"), with no state-changing call. While it still
   works the re-run makes only that check and exits 4 again.
 - Manual replacement mode, for providers whose API cannot mint a
-  replacement (GitHub and npm tokens, and OpenAI keys without an Admin API
-  key). Apply prints what to create, then
+  replacement (GitHub and npm tokens, and OpenAI keys unless you opt in to
+  a broader replacement). Apply prints what to create, then
   asks you to paste the new secret with terminal echo turned off. It is
   accepted only once the provider confirms it belongs to the same account
   as the leaked one; a wrong paste is asked for again, up to three times,
@@ -174,8 +174,14 @@ What works now:
   identified by prefix and checked with `GET /v1/models`. With an Admin API
   key in `OPENAI_ADMIN_KEY` (or the variable `providers.openai.admin_key_env`
   names), the plan shows the key's project, name, owner, created and last
-  used times; apply creates a service account in the same project for the
-  replacement, checks the new key is listed there, and deletes the leaked
+  used times. By default apply asks you to paste a new key with Restricted
+  permissions matching the leaked one, because a replacement rotate creates
+  is a service account with all permissions in the project, which may be
+  broader. With `--allow-broader-replacement` (or
+  `providers.openai.allow_broader_replacement: true`) apply creates that
+  service account instead, and the plan and audit log mark the scope
+  widening. Either way apply checks the new key is listed in the same
+  project, and deletes the leaked
   key (a user key by id; a service-account key by deleting its service
   account when that is its only key). Rollback deletes the replacement's
   service account. Without an admin key apply runs in manual mode and

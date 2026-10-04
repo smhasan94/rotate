@@ -32,6 +32,10 @@ pub const PLAN_JSON_VERSION: u32 = 1;
 /// Replacement wording for a provider in manual mode (decision D1).
 pub const MANUAL_REPLACEMENT: &str = "manual: you will be asked to paste the new secret";
 
+/// How the replacement row continues in manual mode when the provider's
+/// automatic replacement would widen scope (SHA-291).
+pub const MANUAL_NOT_WIDER: &str = "automatic replacement is off because";
+
 /// Skip reason for a secret whose rotation already finished (SHA-258).
 pub const ALREADY_ROTATED: &str = "already rotated";
 
@@ -86,6 +90,10 @@ pub struct PlannedRotation {
     pub scope_error: Option<String>,
     /// Whether the provider mints the replacement or the operator pastes it.
     pub replacement_mode: ReplacementMode,
+    /// Why the provider's automatic replacement would be broader than the
+    /// leaked credential (SHA-291); see
+    /// [`Provider::scope_widening`](crate::provider::Provider::scope_widening).
+    pub scope_widening: Option<&'static str>,
     /// Every place the secret is used.
     pub consumers: Vec<PlannedConsumer>,
     /// Consumers whose lookup failed.
@@ -214,10 +222,17 @@ pub fn revoke_action(provider: &str) -> &'static str {
 }
 
 impl PlannedRotation {
-    /// The replacement step as shown in the plan.
+    /// The replacement step as shown in the plan. In manual mode it says
+    /// why when an automatic replacement would widen scope (SHA-291).
     pub fn replacement_text(&self) -> String {
         match self.replacement_mode {
-            ReplacementMode::Manual => MANUAL_REPLACEMENT.to_owned(),
+            ReplacementMode::Manual => match self.scope_widening {
+                Some(why) => format!(
+                    "{MANUAL_REPLACEMENT} ({MANUAL_NOT_WIDER} {why}; {})",
+                    opt_in_hint(self.provider)
+                ),
+                None => MANUAL_REPLACEMENT.to_owned(),
+            },
             ReplacementMode::Automatic => match &self.scope {
                 Some(scope) => format!(
                     "create a new {} credential for {}",
@@ -225,6 +240,15 @@ impl PlannedRotation {
                 ),
                 None => format!("create a new {} credential", self.provider),
             },
+        }
+    }
+
+    /// The scope-widening note when the replacement rotate creates is
+    /// broader than the leaked credential: automatic mode only.
+    pub fn widens_scope(&self) -> Option<&'static str> {
+        match self.replacement_mode {
+            ReplacementMode::Automatic => self.scope_widening,
+            ReplacementMode::Manual => None,
         }
     }
 
@@ -239,6 +263,14 @@ impl PlannedRotation {
         self.replacement_mode == ReplacementMode::Manual
             || self.blockers.iter().any(|b| b == MANUAL_REVOKE_BLOCKER)
             || self.not_updatable().next().is_some()
+    }
+}
+
+/// How to opt in to a broader automatic replacement for `provider`.
+fn opt_in_hint(provider: &str) -> String {
+    match provider_name(provider) {
+        Some(ProviderName::Openai) => crate::provider::openai::OPT_IN_HINT.to_owned(),
+        _ => "opt in with --allow-broader-replacement".to_owned(),
     }
 }
 
@@ -342,6 +374,7 @@ pub async fn build(
             replacement_mode: providers
                 .get(provider)
                 .map_or(ReplacementMode::Automatic, |p| p.replacement_mode()),
+            scope_widening: providers.get(provider).and_then(|p| p.scope_widening()),
             consumers: planned,
             lookup_errors,
             revoke_action: manual_revoke.unwrap_or_else(|| revoke_action(provider)),
@@ -663,6 +696,9 @@ fn render_with_header(plan: &Plan, title: &str, note: &str) -> String {
             field(&mut out, "state:", &state);
         }
         field(&mut out, "replacement:", &r.replacement_text());
+        if let Some(note) = r.widens_scope() {
+            let _ = writeln!(out, "  scope widening: {note}");
+        }
         if r.consumers.is_empty() && r.lookup_errors.is_empty() {
             field(&mut out, "consumers:", "none found");
         } else {
@@ -775,6 +811,7 @@ struct ScopeView<'a> {
 struct ReplacementView {
     mode: &'static str,
     action: String,
+    scope_widening: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -828,6 +865,7 @@ pub fn render_json(plan: &Plan) -> String {
                         ReplacementMode::Manual => "manual",
                     },
                     action: r.replacement_text(),
+                    scope_widening: r.widens_scope(),
                 },
                 consumers: r
                     .consumers

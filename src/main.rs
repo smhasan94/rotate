@@ -101,6 +101,15 @@ fn install_logging(verbose: u8) {
         tracing::subscriber::set_global_default(rotate::redact::subscriber(level, std::io::stderr));
 }
 
+/// `config` with `--allow-broader-replacement` (SHA-291) applied: the flag
+/// turns `providers.openai.allow_broader_replacement` on for this run and
+/// never off.
+fn opt_in(config: &Config, allow_broader_replacement: bool) -> Config {
+    let mut config = config.clone();
+    config.providers.openai.allow_broader_replacement |= allow_broader_replacement;
+    config
+}
+
 /// Runs one subcommand. Errors are printed, redacted, by `main` with exit 1.
 fn run(
     console: &mut Console,
@@ -126,9 +135,13 @@ fn run(
         match &command {
             Command::Plan(args) => {
                 let check = args.check_permissions;
+                let config = &opt_in(config, args.allow_broader_replacement);
                 return Ok(plan(console, findings, input, config, json, check));
             }
-            Command::Apply(args) => return Ok(apply(console, findings, args, config)),
+            Command::Apply(args) => {
+                let config = &opt_in(config, args.allow_broader_replacement);
+                return Ok(apply(console, findings, args, config));
+            }
             Command::Rollback(args) => return Ok(rollback(console, findings, args, config)),
             _ => {}
         }

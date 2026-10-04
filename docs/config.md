@@ -104,6 +104,7 @@ providers:
   openai:
     admin_key_env: ROTATE_OPENAI_ADMIN_KEY
     api_url: https://openai-proxy.example.com
+    allow_broader_replacement: true
 ```
 
 [rotate.example.yaml](rotate.example.yaml) is the same file with a comment
@@ -293,3 +294,17 @@ Type: URL, without `/v1`.
 Default: `https://api.openai.com`
 
 OpenAI API base URL.
+
+### `providers.openai.allow_broader_replacement`
+
+Type: boolean.
+Default: `false`
+
+With an Admin API key, rotate can create the replacement itself as a project
+service-account key, but that key gets all permissions: the Admin API cannot
+read or copy the leaked key's restrictions. By default rotate therefore uses
+manual mode for OpenAI and asks you to create a restricted key and paste it.
+Set this to `true` (or pass `--allow-broader-replacement` to `plan` or
+`apply`) to let rotate create the broader key; the plan then shows a
+`scope widening` note and the audit log records `scope_widened: true`. See
+[permissions.md](permissions.md).
