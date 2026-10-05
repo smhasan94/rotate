@@ -209,7 +209,7 @@ Every confirmed rotation is taken through these steps, in this order:
    one-time password to delete tokens gets a hidden prompt here (or
    `ROTATE_NPM_OTP`); see [permissions.md](permissions.md).
 
-apply takes every rotation through create, update, verify and the revoke
+`rotate apply` takes every rotation through create, update, verify and the revoke
 gate first, then revokes the old secrets, last of all. GitHub tokens go to
 GitHub's credential revocation API together, in one request per 1000
 tokens (GitHub allows 60 such requests an hour), and apply says so on
