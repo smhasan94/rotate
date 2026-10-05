@@ -218,7 +218,13 @@ From GitHub: Actions, then `live`, then Run workflow. Approve the run when
 GitHub asks (the `live-tests` environment waits for you). It takes about 10
 minutes; most of it is building.
 
-From your machine (optional):
+From your machine, with one command that asks for the token:
+
+```sh
+bash scripts/live-run.sh
+```
+
+Or by hand:
 
 To run the live tests from your machine, export the same names in one shell
 session. Do not put them in a dotfile or in a `.env` file in the repository.
