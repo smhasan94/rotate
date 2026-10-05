@@ -106,14 +106,17 @@ Three kinds of test, and where each lives:
   `rec.mark_read_only(|req| ...)`. Use `common::TestDirs::new()` for a temp
   working directory with `.rotate/`.
 - **Live tests** call real provider APIs. Name them `live_*`, mark them
-  `#[ignore]`, and start the body with `live_guard!();`. They run only with:
+  `#[ignore]`, start the body with `live_guard!();`, and read each variable
+  with `common::live_env` or `live_require!`, which skip naming what is
+  missing. They run only with:
 
   ```sh
   ROTATE_LIVE_TESTS=1 cargo test --all-features -- --ignored live_
   ```
 
-  Default CI never sets that variable and asserts the live tests show as
-  ignored.
+  Default CI never sets that variable and asserts every live test shows as
+  ignored. The GitHub live tests also run from the manual `live` workflow;
+  setup is in `docs/live-tests.md`.
 
 Never print a request body or a secret in a test: recorded calls show
 `body_len` in `Debug`, and assertion messages name calls by method and path.

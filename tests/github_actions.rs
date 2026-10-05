@@ -713,26 +713,3 @@ async fn conformance() {
     .await
     .assert_ok();
 }
-
-// ---- live -----------------------------------------------------------------
-
-/// Read-only: lists the Actions secrets of `ROTATE_LIVE_GITHUB_REPO`
-/// (`owner/repo`) with the operator token from the environment.
-#[tokio::test]
-#[ignore]
-async fn live_github_actions_find() {
-    common::live_guard!();
-    let Some(repo) = common::require_env("ROTATE_LIVE_GITHUB_REPO") else {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "skipped: ROTATE_LIVE_GITHUB_REPO not set"
-        );
-        return;
-    };
-    let cfg = config(&[repo.as_str()]);
-    let c = GithubActionsConsumer::from_config(&cfg, &Default::default());
-    let probe = token(format!("live-probe-{}", "n5"));
-    let found = c.find(&secret_ref("npm", &probe, &cfg)).await;
-    assert!(found.is_ok(), "{}", found.unwrap_err());
-}

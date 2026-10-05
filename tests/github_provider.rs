@@ -924,22 +924,13 @@ async fn conformance_manual_mode() {
     }
 }
 
-fn live_env(name: &str) -> Option<String> {
-    let value = common::require_env(name);
-    if value.is_none() {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "skipped: {name} not set");
-    }
-    value
-}
-
 // Live, read-only: a real token from the environment is valid and its
 // scope names a login.
 #[tokio::test]
 #[ignore]
 async fn live_github_check_valid_and_scope() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_GITHUB_TOKEN") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_GITHUB_TOKEN") else {
         return;
     };
     let p = GithubProvider::new("https://api.github.com");
@@ -957,7 +948,7 @@ async fn live_github_check_valid_and_scope() {
 #[ignore]
 async fn live_github_revoke() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_GITHUB_REVOKE_TOKEN") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_GITHUB_REVOKE_TOKEN") else {
         return;
     };
     let p = GithubProvider::new("https://api.github.com");
