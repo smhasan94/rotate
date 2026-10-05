@@ -78,13 +78,16 @@ jobs:
         run: |
           cargo build --locked
           ci/smoke.sh target/debug/rotate
-      - name: live tests are ignored by default (SHA-216 T3)
-        # ROTATE_LIVE_TESTS is never set in CI, so the live smoke test must
+      - name: live tests are ignored by default (SHA-216 T3, SHA-268 T1)
+        # ROTATE_LIVE_TESTS is never set in CI, so every `live_` test must
         # show up as ignored, never as run.
         shell: bash
         run: |
-          grep -E "^test live_smoke .* ignored" test.log
-          ! grep -E "^test live_smoke .* ok" test.log
+          defined=$(grep -rhoE --exclude-dir=common "fn live_[a-z0-9_]+" tests | sort -u | wc -l)
+          ignored=$(grep -E "^test live_[a-z0-9_]+ \.\.\. ignored" test.log | sort -u | wc -l)
+          echo "live tests defined: $defined, reported ignored: $ignored"
+          [ "$defined" -gt 0 ] && [ "$defined" -eq "$ignored" ]
+          ! grep -E "^test live_[a-z0-9_]+ \.\.\. (ok|FAILED)" test.log
 
   deny:
     name: deny (${{ matrix.os }})

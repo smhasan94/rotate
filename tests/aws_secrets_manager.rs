@@ -413,7 +413,7 @@ async fn conformance_suite_passes() {
 #[ignore]
 async fn live_secrets_manager_find_is_read_only() {
     common::live_guard!();
-    let Some(id) = common::require_env("ROTATE_LIVE_SM_SECRET") else {
+    let Some(id) = common::live_env("ROTATE_LIVE_SM_SECRET") else {
         return;
     };
     let sm = SecretsManagerConsumer::new(names(&[id.as_str()]), None);

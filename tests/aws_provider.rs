@@ -1431,15 +1431,6 @@ async fn conformance_full() {
     }
 }
 
-fn live_env(name: &str) -> Option<String> {
-    let value = common::require_env(name);
-    if value.is_none() {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "skipped: {name} not set");
-    }
-    value
-}
-
 // Live: a real key pair from the environment. Read-only calls; scope with
 // the operator's default credential chain.
 #[tokio::test]
@@ -1447,8 +1438,8 @@ fn live_env(name: &str) -> Option<String> {
 async fn live_aws_check_valid_and_scope() {
     common::live_guard!();
     let (Some(id), Some(value)) = (
-        live_env("ROTATE_LIVE_AWS_ACCESS_KEY_ID"),
-        live_env("ROTATE_LIVE_AWS_SECRET_ACCESS_KEY"),
+        common::live_env("ROTATE_LIVE_AWS_ACCESS_KEY_ID"),
+        common::live_env("ROTATE_LIVE_AWS_SECRET_ACCESS_KEY"),
     ) else {
         return;
     };
@@ -1471,8 +1462,8 @@ async fn live_aws_check_valid_and_scope() {
 async fn live_aws_rotate_round_trip() {
     common::live_guard!();
     let (Some(id), Some(value)) = (
-        live_env("ROTATE_LIVE_AWS_ACCESS_KEY_ID"),
-        live_env("ROTATE_LIVE_AWS_SECRET_ACCESS_KEY"),
+        common::live_env("ROTATE_LIVE_AWS_ACCESS_KEY_ID"),
+        common::live_env("ROTATE_LIVE_AWS_SECRET_ACCESS_KEY"),
     ) else {
         return;
     };

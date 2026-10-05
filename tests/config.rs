@@ -93,3 +93,45 @@ fn valid_config_reaches_the_subcommand() {
         .code(2)
         .stderr(predicate::str::contains("elsewhere/state.json"));
 }
+
+// SHA-287 T1 (AC1, AC4): plain http to a non-loopback host stops every
+// command with exit 2, naming the field and the rule, before any state
+// file or provider is touched.
+#[test]
+fn sha287_t1_http_endpoint_exits_2_before_anything() {
+    for (field, yaml) in [
+        (
+            "providers.aws.endpoint_url",
+            "providers:\n  aws:\n    endpoint_url: http://api.example.com\n",
+        ),
+        (
+            "providers.github.api_url",
+            "providers:\n  github:\n    api_url: http://api.example.com\n",
+        ),
+        (
+            "providers.npm.registry",
+            "providers:\n  npm:\n    registry: http://api.example.com\n",
+        ),
+        (
+            "providers.openai.api_url",
+            "providers:\n  openai:\n    api_url: http://api.example.com\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rotate.yaml"), yaml).unwrap();
+        for subcommand in ["plan", "apply", "rollback", "status"] {
+            rotate_in(dir.path())
+                .arg(subcommand)
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains(format!(
+                    "rotate.yaml: {field} at line"
+                )))
+                .stderr(predicate::str::contains("only https:// is accepted"));
+        }
+        assert!(
+            !dir.path().join(".rotate").exists(),
+            "{field}: a state directory was created"
+        );
+    }
+}

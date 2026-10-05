@@ -15,7 +15,10 @@ use async_trait::async_trait;
 use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use rotate::apply::{self, Executor, ReplacementSource, RunResult, Terminal};
+use rotate::apply::{
+    self, Executor, Prompt, PromptError, PromptOtp, ReplacementSource, RunResult, ScriptedPrompt,
+    Terminal,
+};
 use rotate::assess::{self, AssessOptions};
 use rotate::audit::AuditLog;
 use rotate::config::ConsumersConfig;
@@ -26,8 +29,9 @@ use rotate::finding::{Finding, SourceLocation};
 use rotate::plan;
 use rotate::provider::npm::{
     token_key, NpmProvider, GUIDE_NO_OPERATOR, GUIDE_OPERATOR_IS_LEAKED, GUIDE_OTHER_USER,
-    GUIDE_OTP, GUIDE_SESSION_TOKEN, NOT_VISIBLE,
+    GUIDE_OTP, GUIDE_OTP_REJECTED, GUIDE_SESSION_TOKEN, NOT_VISIBLE,
 };
+use rotate::provider::otp::{Chain, EnvOtp, OtpError, OtpSource};
 use rotate::provider::{
     Credential, Identity, Provider, ProviderError, ProviderRegistry, ReplacementMode,
     RestoreOutcome, Validity,
@@ -777,9 +781,14 @@ async fn pipeline_with(
     operator: &str,
     overlap: &str,
 ) -> Pipeline {
+    pipeline_of(provider(rec, Some(operator)), leaked, overlap).await
+}
+
+/// [`pipeline`] around a given provider.
+async fn pipeline_of(npm: NpmProvider, leaked: &str, overlap: &str) -> Pipeline {
     let dir = tempfile::tempdir().unwrap();
     let mut providers = ProviderRegistry::new();
-    providers.register(Arc::new(provider(rec, Some(operator))));
+    providers.register(Arc::new(npm));
     let gha = Arc::new(MockConsumer::new("github-actions").matching(
         SecretValue::from(leaked).fingerprint(),
         ConsumerMatch::by_value("gha:acme/app:NPM_TOKEN"),
@@ -1164,15 +1173,6 @@ async fn conformance_manual_mode() {
     }
 }
 
-fn live_env(name: &str) -> Option<String> {
-    let value = common::require_env(name);
-    if value.is_none() {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "skipped: {name} not set");
-    }
-    value
-}
-
 // Live, read-only: a real token from the environment is valid and its
 // scope names a user. With `ROTATE_NPM_TOKEN` set to a session token of
 // the same account, the scope also shows the token's settings.
@@ -1180,7 +1180,7 @@ fn live_env(name: &str) -> Option<String> {
 #[ignore]
 async fn live_npm_check_valid_and_scope() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_NPM_TOKEN") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_NPM_TOKEN") else {
         return;
     };
     let p = NpmProvider::new("https://registry.npmjs.org");
@@ -1200,10 +1200,10 @@ async fn live_npm_check_valid_and_scope() {
 #[ignore]
 async fn live_npm_revoke() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_NPM_REVOKE_TOKEN") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_NPM_REVOKE_TOKEN") else {
         return;
     };
-    if live_env("ROTATE_NPM_TOKEN").is_none() {
+    if common::live_env("ROTATE_NPM_TOKEN").is_none() {
         return;
     }
     let p = NpmProvider::new("https://registry.npmjs.org");
@@ -1217,4 +1217,415 @@ async fn live_npm_revoke() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     panic!("the token still works a minute after revoke");
+}
+
+// ---------------------------------------------------------------------------
+// SHA-288: one-time password on token delete
+// ---------------------------------------------------------------------------
+
+/// A source that always returns `code`, counting the calls and keeping the
+/// questions.
+#[derive(Default)]
+struct FixedOtp {
+    code: String,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl FixedOtp {
+    fn new(code: &str) -> Arc<Self> {
+        Arc::new(Self {
+            code: code.to_owned(),
+            asked: std::sync::Mutex::default(),
+        })
+    }
+
+    fn questions(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl OtpSource for FixedOtp {
+    async fn one_time_password(&self, question: &str) -> Result<SecretValue, OtpError> {
+        self.asked.lock().unwrap().push(question.to_owned());
+        Ok(SecretValue::from(self.code.as_str()))
+    }
+}
+
+/// A source that must never be asked.
+struct PanicOtp;
+
+#[async_trait]
+impl OtpSource for PanicOtp {
+    async fn one_time_password(&self, _: &str) -> Result<SecretValue, OtpError> {
+        panic!("the one-time password source was asked without a challenge");
+    }
+}
+
+/// A terminal that keeps what is written to it.
+#[derive(Clone, Default)]
+struct SharedTerm(Arc<std::sync::Mutex<String>>);
+
+impl Terminal for SharedTerm {
+    fn stdout(&mut self, text: &str) {
+        self.0.lock().unwrap().push_str(text);
+    }
+
+    fn stderr(&mut self, text: &str) {
+        self.0.lock().unwrap().push_str(text);
+    }
+}
+
+/// A DELETE without `npm-otp` gets npm's OTP challenge; one carrying
+/// `npm-otp: <code>` (when `code` is given) is accepted with 204.
+async fn mount_otp_delete(rec: &CallRecorder, code: Option<&str>) {
+    if let Some(code) = code {
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+            .and(header("npm-otp", code))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(1)
+            .mount(rec.server())
+            .await;
+    }
+    Mock::given(method("DELETE"))
+        .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("www-authenticate", "OTP")
+                .set_body_json(serde_json::json!({ "error": "otp required" })),
+        )
+        .with_priority(2)
+        .mount(rec.server())
+        .await;
+}
+
+/// Every DELETE received, as (authorization, npm-otp) headers.
+async fn delete_headers(rec: &CallRecorder) -> Vec<(String, Option<String>)> {
+    rec.server()
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE")
+        .map(|r| {
+            let get = |name: &str| {
+                r.headers
+                    .get(name)
+                    .map(|v| v.to_str().unwrap_or("").to_owned())
+            };
+            (get("authorization").unwrap_or_default(), get("npm-otp"))
+        })
+        .collect()
+}
+
+/// A provider for one leaked granular token listed by `operator`, with
+/// `whoami` for the operator answering "alice".
+async fn otp_setup(rec: &CallRecorder, tag: &str) -> (String, String) {
+    let leaked = npm_token(&format!("{tag}Lk"));
+    let operator = npm_token(&format!("{tag}Op"));
+    mount_list(rec, &operator, serde_json::json!([granular_entry(&leaked)])).await;
+    mount_whoami(rec, &operator, "alice").await;
+    (leaked, operator)
+}
+
+// SHA-288 T1 (AC1): ROTATE_NPM_OTP answers the challenge; the retry
+// carries `npm-otp` and the operator bearer.
+#[tokio::test]
+async fn sha288_t1_env_otp_retries_delete_with_npm_otp_header() {
+    let rec = CallRecorder::start().await;
+    let (leaked, operator) = otp_setup(&rec, "t1").await;
+    mount_otp_delete(&rec, Some("123456")).await;
+    let var = "ROTATE_TEST_NPM_OTP_T1";
+    std::env::set_var(var, "123456");
+    let p = provider(&rec, Some(&operator)).with_otp_source(Arc::new(EnvOtp::new(var)));
+    p.revoke(&cred(&leaked)).await.unwrap();
+    std::env::remove_var(var);
+    assert_eq!(
+        delete_headers(&rec).await,
+        [
+            (bearer(&operator), None),
+            (bearer(&operator), Some("123456".to_owned())),
+        ]
+    );
+}
+
+// SHA-288 T2 (AC2): the hidden prompt is asked once, names the npm user,
+// never shows the code, and the retry carries what was typed.
+#[tokio::test]
+async fn sha288_t2_prompted_otp_is_asked_once_and_never_shown() {
+    let rec = CallRecorder::start().await;
+    let (leaked, operator) = otp_setup(&rec, "t2").await;
+    mount_otp_delete(&rec, Some("246813")).await;
+    let term = SharedTerm::default();
+    let prompt = ScriptedPrompt::new(["246813"]);
+    let source = PromptOtp::new(Box::new(prompt), Box::new(term.clone()));
+    let p = provider(&rec, Some(&operator)).with_otp_source(Arc::new(source));
+    p.revoke(&cred(&leaked)).await.unwrap();
+    let shown = term.0.lock().unwrap().clone();
+    assert_eq!(shown.matches("One-time password").count(), 1, "{shown}");
+    assert!(shown.contains("npm user alice"), "{shown}");
+    assert!(shown.contains("(input is hidden)"), "{shown}");
+    assert!(!shown.contains("246813"), "{shown}");
+    assert_eq!(
+        delete_headers(&rec).await[1],
+        (bearer(&operator), Some("246813".to_owned()))
+    );
+}
+
+// SHA-288 T3 (AC3): no source: one DELETE, no lookup of the user, and the
+// error names the one-time password and the tokens page.
+#[tokio::test]
+async fn sha288_t3_no_otp_source_sends_one_delete() {
+    let rec = CallRecorder::start().await;
+    let (leaked, operator) = otp_setup(&rec, "t3").await;
+    mount_otp_delete(&rec, None).await;
+    let err = provider(&rec, Some(&operator))
+        .revoke(&cred(&leaked))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("one-time password"), "{text}");
+    assert!(text.contains("none was available"), "{text}");
+    assert!(
+        text.contains("https://www.npmjs.com/settings/<username>/tokens")
+            || text.contains("token settings"),
+        "{text}"
+    );
+    assert_eq!(err.guidance(), Some(GUIDE_OTP));
+    assert_eq!(delete_headers(&rec).await.len(), 1);
+    assert!(
+        !signed_with(&rec, &operator)
+            .await
+            .contains(&"GET /-/whoami".to_owned()),
+        "the user was looked up without a source"
+    );
+}
+
+// SHA-288 T4 (AC4): the retry is challenged too (or answered with a plain
+// 401): no third DELETE, and the error says the code was rejected.
+#[tokio::test]
+async fn sha288_t4_second_challenge_is_rejected_without_third_delete() {
+    for plain_401 in [false, true] {
+        let rec = CallRecorder::start().await;
+        let (leaked, operator) = otp_setup(&rec, "t4").await;
+        if plain_401 {
+            Mock::given(method("DELETE"))
+                .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+                .and(header("npm-otp", "135791"))
+                .respond_with(
+                    ResponseTemplate::new(401)
+                        .set_body_json(serde_json::json!({ "error": "Unauthorized" })),
+                )
+                .with_priority(1)
+                .mount(rec.server())
+                .await;
+        }
+        mount_otp_delete(&rec, None).await;
+        let source = FixedOtp::new("135791");
+        let p = provider(&rec, Some(&operator)).with_otp_source(source.clone());
+        let err = p.revoke(&cred(&leaked)).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("rejected the one-time password"), "{text}");
+        assert!(!text.contains("135791"), "{text}");
+        assert_eq!(err.guidance(), Some(GUIDE_OTP_REJECTED));
+        assert_eq!(
+            delete_headers(&rec).await.len(),
+            2,
+            "plain 401: {plain_401}"
+        );
+        assert_eq!(source.questions().len(), 1);
+    }
+}
+
+// SHA-288 T5 (AC5): no challenge, no question and no user lookup.
+#[tokio::test]
+async fn sha288_t5_no_challenge_never_asks() {
+    let rec = CallRecorder::start().await;
+    let (leaked, operator) = otp_setup(&rec, "t5").await;
+    mount_delete(&rec, 204).await;
+    let p = provider(&rec, Some(&operator)).with_otp_source(Arc::new(PanicOtp));
+    p.revoke(&cred(&leaked)).await.unwrap();
+    assert_eq!(delete_headers(&rec).await, [(bearer(&operator), None)]);
+    assert!(!signed_with(&rec, &operator)
+        .await
+        .contains(&"GET /-/whoami".to_owned()));
+}
+
+// SHA-288 T6 (AC6): rollback's revoke_replacement retries with the code.
+#[tokio::test]
+async fn sha288_t6_revoke_replacement_retries_with_otp() {
+    let rec = CallRecorder::start().await;
+    let (_, operator) = otp_setup(&rec, "t6").await;
+    mount_otp_delete(&rec, Some("975310")).await;
+    let p = provider(&rec, Some(&operator)).with_otp_source(FixedOtp::new("975310"));
+    p.revoke_replacement(UUID).await.unwrap();
+    let paths: Vec<String> = deletes(&rec).await.into_iter().map(|(p, _)| p).collect();
+    let path = format!("/-/npm/v1/tokens/token/{UUID}");
+    assert_eq!(paths, [path.clone(), path]);
+    assert_eq!(delete_headers(&rec).await[1].1.as_deref(), Some("975310"));
+}
+
+// SHA-288 T7 (AC7): the variable serves one DELETE; a second challenge in
+// the same run, with no terminal, fails without reusing it.
+#[tokio::test]
+async fn sha288_t7_env_otp_is_single_use() {
+    let rec = CallRecorder::start().await;
+    let (leaked, operator) = otp_setup(&rec, "t7").await;
+    mount_otp_delete(&rec, Some("112233")).await;
+    let var = "ROTATE_TEST_NPM_OTP_T7";
+    std::env::set_var(var, "112233");
+    struct NoTerminal;
+    impl Prompt for NoTerminal {
+        fn read_line(&mut self) -> Result<String, PromptError> {
+            Err(PromptError::NoTerminal)
+        }
+        fn read_secret(
+            &mut self,
+            _: &str,
+            _: &mut dyn Terminal,
+        ) -> Result<SecretValue, PromptError> {
+            Err(PromptError::NoTerminalForSecret)
+        }
+    }
+    let chain = Chain(vec![
+        Arc::new(EnvOtp::new(var)),
+        Arc::new(PromptOtp::new(
+            Box::new(NoTerminal),
+            Box::new(SharedTerm::default()),
+        )),
+    ]);
+    let p = provider(&rec, Some(&operator)).with_otp_source(Arc::new(chain));
+    p.revoke(&cred(&leaked)).await.unwrap();
+    let err = p.revoke_replacement(UUID).await.unwrap_err();
+    assert!(std::env::var(var).is_ok(), "the variable was cleared");
+    std::env::remove_var(var);
+    assert_eq!(err.guidance(), Some(GUIDE_OTP));
+    let headers = delete_headers(&rec).await;
+    assert_eq!(headers.len(), 3, "{headers:?}");
+    assert_eq!(headers[1].1.as_deref(), Some("112233"));
+    assert_eq!(headers[2].1, None);
+}
+
+// SHA-288 T8 (AC8), in-process half: a full apply where the delete is
+// challenged, once with the variable and once with the prompt, and a
+// seven-digit canary code below the redactor's minimum length. Neither the
+// code nor any token reaches the terminal, the TRACE log, the audit log,
+// the state file or the outcome.
+#[tokio::test]
+async fn sha288_t8_otp_never_in_output_logs_audit_or_state() {
+    let capture = trace_capture();
+    for via_prompt in [false, true] {
+        let code = if via_prompt { "7351902" } else { "7351903" };
+        let rec = CallRecorder::start().await;
+        let leaked = npm_token(if via_prompt { "t8LkP" } else { "t8LkE" });
+        let operator = npm_token(if via_prompt { "t8OpP" } else { "t8OpE" });
+        let replacement = npm_token(if via_prompt { "t8NwP" } else { "t8NwE" });
+        mount_whoami(&rec, &leaked, "alice").await;
+        mount_whoami(&rec, &replacement, "alice").await;
+        mount_whoami(&rec, &operator, "alice").await;
+        mount_list(
+            &rec,
+            &operator,
+            serde_json::json!([granular_entry(&leaked)]),
+        )
+        .await;
+        mount_otp_delete(&rec, Some(code)).await;
+        let var = format!("ROTATE_TEST_NPM_OTP_T8_{via_prompt}");
+        let term_q = SharedTerm::default();
+        let source: Arc<dyn OtpSource> = if via_prompt {
+            Arc::new(PromptOtp::new(
+                Box::new(ScriptedPrompt::new([code])),
+                Box::new(term_q.clone()),
+            ))
+        } else {
+            std::env::set_var(&var, code);
+            Arc::new(EnvOtp::new(var.as_str()))
+        };
+        let npm = provider(&rec, Some(&operator)).with_otp_source(source);
+        let mut p = pipeline_of(npm, &leaked, "0s").await;
+        let mut term = Term::default();
+        let outcome = Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_manual(
+                ReplacementSource::Supplied(Some(SecretValue::from(replacement.as_str()))),
+                &mut term,
+            )
+            .run(&p.plan.rotations[0])
+            .await;
+        std::env::remove_var(&var);
+        assert!(
+            matches!(outcome.result, RunResult::Revoked),
+            "{:?}",
+            outcome.result
+        );
+        assert_eq!(delete_headers(&rec).await[1].1.as_deref(), Some(code));
+        let audit = std::fs::read_to_string(p.dir.path().join("audit.jsonl")).unwrap();
+        let state = std::fs::read_to_string(p.dir.path().join("state.json")).unwrap();
+        let summary = apply::render_summary(std::slice::from_ref(&outcome));
+        let logs = capture.contents();
+        let question = term_q.0.lock().unwrap().clone();
+        for value in [
+            code,
+            leaked.as_str(),
+            operator.as_str(),
+            replacement.as_str(),
+        ] {
+            for (label, text) in [
+                ("stdout", &term.out),
+                ("stderr", &term.err),
+                ("question", &question),
+                ("summary", &summary),
+                ("audit log", &audit),
+                ("state file", &state),
+                ("logs", &logs),
+                ("outcome", &format!("{outcome:?}")),
+            ] {
+                assert!(!text.contains(value), "a value in the {label}");
+            }
+        }
+    }
+}
+
+// SHA-288 T9 (AC1, AC3): the provider conformance suite passes with an OTP
+// source against a registry that challenges every DELETE without a code
+// (the no-source half is `conformance_manual_mode`).
+#[tokio::test]
+async fn sha288_t9_conformance_with_otp_source() {
+    let report = provider_suite(|| async {
+        let rec = CallRecorder::start().await;
+        let live = npm_token("t9Live");
+        let unknown = npm_token("t9Unkn");
+        let operator = npm_token("t9Oper");
+        mount_whoami(&rec, &live, "dave").await;
+        mount_whoami(&rec, &operator, "dave").await;
+        mount_whoami_status(&rec, &unknown, 401).await;
+        mount_list(&rec, &operator, serde_json::json!([granular_entry(&live)])).await;
+        mount_otp_delete(&rec, Some("864200")).await;
+        ProviderFixture {
+            provider: Arc::new(
+                provider(&rec, Some(&operator)).with_otp_source(FixedOtp::new("864200")),
+            ),
+            live: cred(&live),
+            identity: Identity("dave".into()),
+            unknown: cred(&unknown),
+            probe: Box::new(RecorderProbe(rec)),
+        }
+    })
+    .await;
+    report.assert_ok();
+    for name in ["idempotent_revoke", "restore_outcome", "errors_redacted"] {
+        assert_eq!(
+            report.outcome(name),
+            Some(&Outcome::Passed),
+            "{name}: {report}"
+        );
+    }
+}
+
+#[test]
+fn debug_hides_the_otp_source() {
+    let p = NpmProvider::new("http://127.0.0.1:1").with_otp_source(FixedOtp::new("5550123"));
+    let shown = format!("{p:?}");
+    assert!(shown.contains("otp: \"[set]\""), "{shown}");
+    assert!(!shown.contains("5550123"), "{shown}");
 }

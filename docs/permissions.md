@@ -275,11 +275,15 @@ and last 4 characters) or, for older tokens, by the sha512 key. If two
 entries fit the redacted form, rotate does not guess and asks you to delete
 the token by hand.
 
-npm may ask for a one-time password to delete a token. rotate does not send
-one: the revoke fails and names the page to delete the token on
-(`https://www.npmjs.com/settings/<user>/tokens`). Revoke is the last step,
-so the consumers already hold the new token. A deleted token cannot be
-restored, so rollback cannot bring it back.
+npm may ask for a one-time password to delete a token. rotate asks for it
+only then, at the delete: first `ROTATE_NPM_OTP` (used for one delete in a
+run, so set a fresh code just before), then a hidden prompt on the terminal
+that names the npm user (one read-only `GET /-/whoami` signed with your
+operator token). It retries the delete once with the `npm-otp` header. With
+no code, or one npm rejects, the revoke fails and names the page to delete
+the token on (`https://www.npmjs.com/settings/<user>/tokens`). Revoke is
+the last step, so the consumers already hold the new token. A deleted token
+cannot be restored, so rollback cannot bring it back.
 
 npm creates tokens only with the account password and a one-time password,
 so apply runs in manual replacement mode: it names the granular token page

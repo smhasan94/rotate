@@ -295,7 +295,10 @@ fn rollback_after_apply_restores_in_order() {
         out.contains(&format!("reactivate with restore {restore_ref}")),
         "{out}"
     );
-    assert!(out.contains("Rollback: 1 rolled back, 0 failed."), "{out}");
+    assert!(
+        out.contains("Rollback: 1 rolled back, 0 with the old secret still revoked, 0 failed."),
+        "{out}"
+    );
 }
 
 // T2 (AC2)
@@ -317,7 +320,8 @@ fn restore_unsupported_still_restores_consumers() {
     let (mut run, id) = applied(value);
     run.set(|s| s["providers"] = json!({ "npm": { "restore": "unsupported" } }));
     let output = run.rollback(&["--confirm", &id]);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    // SHA-290 T1 (AC1): same actions, exit 1.
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let mutations = run.mutations();
     assert_eq!(mutations.len(), 4, "{mutations:?}");
     assert!(mutations[0].starts_with("npm.restore("));
@@ -336,9 +340,114 @@ fn restore_unsupported_still_restores_consumers() {
         "{err}"
     );
     assert!(err.contains("it stays revoked"), "{err}");
-    assert!(stdout(&output).contains("warning: the old secret was not reactivated"));
-    assert_eq!(run.rotation(&id)["step"], "rolled_back");
+    let out = stdout(&output);
+    assert!(
+        out.contains("Rollback: 0 rolled back, 1 with the old secret still revoked, 0 failed."),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "{id}: npm: the old secret stays revoked (npm cannot reactivate a revoked credential); {GHA}, {SM} now hold a revoked secret; create a new credential and run rotate apply again"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("warning:"), "{out}");
+    let rotation = run.rotation(&id);
+    assert_eq!(rotation["step"], "rolled_back");
+    assert_eq!(rotation["rollback"]["old_still_revoked"], true);
     assert_eq!(run.rollback_audit()[0]["outcome"], "skipped");
+}
+
+/// Two updated consumers holding the replacement, as apply leaves them.
+fn updated_consumers() -> Value {
+    json!([
+        { "consumer": "github-actions", "consumer_ref": GHA, "status": "updated", "holds": "secret" },
+        { "consumer": "aws-secrets-manager", "consumer_ref": SM, "status": "updated", "holds": "secret" }
+    ])
+}
+
+// SHA-290 T2 (AC2): revoked with no restore handle (GitHub, npm, OpenAI):
+// consumers restored, replacement revoked, exit 1. A second rollback has
+// nothing to do and exits 0 with no call.
+#[test]
+fn revoked_without_restore_ref_exits_1() {
+    let value = "npm_rollback_290_t2_value";
+    let mut run = Run::new(value);
+    run.seed(json!([record(
+        "rot-290t2",
+        value,
+        "revoked",
+        updated_consumers()
+    )]));
+    run.consumers_hold(REPLACEMENT, REPLACEMENT);
+    let output = run.rollback(&["--confirm", "rot-290t2"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("rollback will exit 1"), "{out}");
+    assert!(
+        out.contains("Rollback: 0 rolled back, 1 with the old secret still revoked, 0 failed."),
+        "{out}"
+    );
+    assert!(
+        out.contains("rot-290t2: npm: the old secret stays revoked (the provider gave no handle to reactivate it)"),
+        "{out}"
+    );
+    assert_eq!(
+        run.mutations(),
+        [
+            format!("github-actions.restore({GHA})"),
+            format!("aws-secrets-manager.restore({SM})"),
+            format!("npm.revoke_replacement({REPLACEMENT_REF})"),
+        ]
+    );
+    assert_eq!(run.rotation("rot-290t2")["step"], "rolled_back");
+
+    // The call log holds one process's calls.
+    let again = run.rollback(&["--confirm", "rot-290t2"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert!(
+        stdout(&again).contains("already rolled back"),
+        "{}",
+        stdout(&again)
+    );
+    assert!(run.calls().is_empty(), "{:?}", run.calls());
+}
+
+// SHA-290: a rollback interrupted after the skipped restore_old resumes,
+// says the old secret stays revoked, and exits 1 when it finishes.
+#[test]
+fn resumed_rollback_keeps_old_revoked() {
+    let value = "npm_rollback_290_resume_value";
+    let mut run = Run::new(value);
+    run.seed(json!([record(
+        "rot-290rs",
+        value,
+        "revoked",
+        updated_consumers()
+    )]));
+    run.consumers_hold(REPLACEMENT, REPLACEMENT);
+    run.set(|s| s["consumers"][1]["fail"] = json!({ "restore": "503 unavailable" }));
+    let first = run.rollback(&["--confirm", "rot-290rs"]);
+    assert_eq!(first.status.code(), Some(1), "{}", stderr(&first));
+    let rotation = run.rotation("rot-290rs");
+    assert_eq!(rotation["step"], "revoked");
+    assert_eq!(rotation["rollback"]["old_still_revoked"], true);
+
+    run.set(|s| {
+        s["consumers"][1].as_object_mut().unwrap().remove("fail");
+    });
+    let second = run.rollback(&["--confirm", "rot-290rs"]);
+    assert_eq!(second.status.code(), Some(1), "{}", stderr(&second));
+    let out = stdout(&second);
+    assert!(
+        out.contains("stays revoked: an earlier run could not reactivate it"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Rollback: 0 rolled back, 1 with the old secret still revoked, 0 failed."),
+        "{out}"
+    );
+    assert_eq!(run.rotation("rot-290rs")["step"], "rolled_back");
 }
 
 // T4 (AC4)

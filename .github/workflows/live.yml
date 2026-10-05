@@ -1,0 +1,63 @@
+# Live tests against the real GitHub API (SHA-268). Manual dispatch only;
+# every run waits for the maintainer's approval in the `live-tests`
+# environment, which holds the credentials. Setup: docs/live-tests.md.
+name: live
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Test name filter"
+        default: "live_"
+        type: string
+      omit:
+        description: "Variable to unset before the preflight (self-test)"
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+# Live runs share one secret in the test repository.
+concurrency:
+  group: live-tests
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    environment: live-tests
+    timeout-minutes: 30
+    env:
+      # The consumer reads ROTATE_GITHUB_TOKEN; the kept provider check
+      # reads ROTATE_LIVE_GITHUB_TOKEN. Both carry the same token.
+      ROTATE_GITHUB_TOKEN: ${{ secrets.ROTATE_LIVE_GITHUB_TOKEN }}
+      ROTATE_LIVE_GITHUB_TOKEN: ${{ secrets.ROTATE_LIVE_GITHUB_TOKEN }}
+      ROTATE_LIVE_GITHUB_REPO: ${{ vars.ROTATE_LIVE_GITHUB_REPO }}
+      ROTATE_LIVE_GITHUB_SECRET: ${{ vars.ROTATE_LIVE_GITHUB_SECRET }}
+      ROTATE_LIVE_GITHUB_WORKFLOW: ${{ vars.ROTATE_LIVE_GITHUB_WORKFLOW }}
+      FILTER: ${{ inputs.filter }}
+      OMIT: ${{ inputs.omit }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: preflight
+        shell: bash
+        run: |
+          if [ -n "$OMIT" ]; then unset "$OMIT"; fi
+          for name in ROTATE_GITHUB_TOKEN ROTATE_LIVE_GITHUB_REPO; do
+            if [ -z "${!name:-}" ]; then
+              echo "live: $name is not set in environment live-tests" >&2
+              exit 1
+            fi
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features --tests
+      - name: live tests
+        timeout-minutes: 15
+        shell: bash
+        run: ROTATE_LIVE_TESTS=1 cargo test --all-features -- --ignored "$FILTER" --nocapture

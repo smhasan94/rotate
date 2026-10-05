@@ -73,6 +73,9 @@ pub struct Plan {
     pub rotations: Vec<PlannedRotation>,
     /// Secrets that will not, with the reason.
     pub skipped: Vec<Skipped>,
+    /// Warnings about the whole run, shown right after the header: today
+    /// one per endpoint that differs from its default (SHA-287).
+    pub warnings: Vec<String>,
 }
 
 /// One secret that apply would rotate.
@@ -372,6 +375,7 @@ pub async fn build(
         overlap_window,
         rotations: Vec::new(),
         skipped: Vec::new(),
+        warnings: Vec::new(),
     };
     for item in assessed {
         let provider = match &item.disposition {
@@ -780,6 +784,9 @@ fn render_at(plan: &Plan, title: &str, note: &str, now: OffsetDateTime) -> Strin
         plan.rotations.len(),
         plan.skipped.len()
     );
+    for warning in &plan.warnings {
+        let _ = writeln!(out, "warning: {warning}");
+    }
     for r in &plan.rotations {
         out.push('\n');
         let _ = writeln!(
@@ -913,6 +920,7 @@ struct PlanView<'a> {
     overlap_window: String,
     rotations: Vec<RotationView<'a>>,
     skipped: Vec<SkippedView<'a>>,
+    warnings: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -1067,6 +1075,7 @@ pub fn render_json(plan: &Plan) -> String {
                 sources: s.sources.iter().map(ToString::to_string).collect(),
             })
             .collect(),
+        warnings: &plan.warnings,
     };
     serde_json::to_string_pretty(&view).expect("the view holds only strings, lists and numbers")
 }

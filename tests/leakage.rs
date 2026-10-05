@@ -2,7 +2,7 @@
 //! mode; afterwards everything the process could have written is searched
 //! for every canary in every encoding.
 //!
-//! - [`Sweep`] holds the needles (raw, URL-encoded, lower and upper hex,
+//! - [`Sweep`] (in `tests/common/sweep.rs`) holds the needles (raw, URL-encoded, lower and upper hex,
 //!   standard and URL-safe base64 at each byte alignment) and searches
 //!   buffers, file names and whole directory trees. A hit names the place
 //!   and byte offset, never the bytes.
@@ -31,281 +31,20 @@
 mod common;
 mod e2e;
 
-use std::collections::HashMap;
-use std::fmt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 use base64::Engine as _;
 use rotate::secret::SecretValue;
 use serde_json::{json, Value};
 
+use crate::common::sweep::{
+    assert_no_hits, assert_private_state, canary, canary_of, rng, Canary, Hit, Sweep,
+};
 use crate::e2e::{E2e, E2eValues};
-
-// ---------------------------------------------------------------------------
-// Canaries
-// ---------------------------------------------------------------------------
-
-/// The alphabet of an AWS secret access key. `/` and `+` make the
-/// URL-encoded form differ from the raw one.
-const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+";
-
-/// A fresh pseudo-random generator per call: clock, process id and a
-/// counter, mixed with splitmix64.
-fn rng() -> impl FnMut() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let mut state = nanos
-        ^ (u64::from(std::process::id()) << 32)
-        ^ COUNTER
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9);
-    move || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
-/// A unique canary of `len` chars from [`ALPHABET`], always holding a `/`
-/// and a `+`.
-fn canary_of(len: usize) -> String {
-    assert!(len >= 8);
-    let mut next = rng();
-    let mut bytes: Vec<u8> = (0..len)
-        .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
-        .collect();
-    bytes[3] = b'/';
-    bytes[len - 4] = b'+';
-    String::from_utf8(bytes).unwrap()
-}
-
-/// A unique 32-char canary.
-fn canary() -> String {
-    canary_of(32)
-}
-
-/// A value to search for, with the name failures use for it.
-#[derive(Clone)]
-struct Canary {
-    label: String,
-    value: String,
-}
-
-impl Canary {
-    fn new(label: &str, value: &str) -> Self {
-        Self {
-            label: label.to_owned(),
-            value: value.to_owned(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The sweep
-// ---------------------------------------------------------------------------
-
-/// One match: where, and which canary in which encoding. Never the bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Hit {
-    place: String,
-    offset: usize,
-    label: String,
-    encoding: &'static str,
-}
-
-impl fmt::Display for Hit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} at byte {}: {} ({})",
-            self.place, self.offset, self.label, self.encoding
-        )
-    }
-}
-
-/// The part of the base64 encoding of `value` that does not depend on its
-/// neighbours when it starts `align` bytes into a 3-byte group: what any
-/// base64 blob holding `value` at that alignment contains.
-fn base64_core(engine: &base64::engine::GeneralPurpose, value: &[u8], align: usize) -> String {
-    let mut padded = vec![0u8; align];
-    padded.extend_from_slice(value);
-    let encoded = engine.encode(&padded);
-    let start = (align * 8).div_ceil(6);
-    let end = (padded.len() * 8) / 6;
-    encoded[start..end].to_owned()
-}
-
-/// Every encoding of `value` the sweep looks for.
-fn encodings(value: &str) -> Vec<(&'static str, String)> {
-    let bytes = value.as_bytes();
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let mut out = vec![
-        ("raw", value.to_owned()),
-        ("url-encoded", urlencoding::encode(value).into_owned()),
-        ("hex", hex.clone()),
-        ("HEX", hex.to_uppercase()),
-    ];
-    for align in 0..3 {
-        out.push(("base64", base64_core(&STANDARD, bytes, align)));
-        out.push(("base64url", base64_core(&URL_SAFE, bytes, align)));
-    }
-    out
-}
-
-/// Searches buffers and directory trees for every canary in every
-/// encoding, with one regex alternation (Aho-Corasick underneath).
-struct Sweep {
-    regex: regex::bytes::Regex,
-    needles: HashMap<Vec<u8>, (String, &'static str)>,
-}
-
-impl Sweep {
-    fn new(canaries: &[Canary]) -> Self {
-        let mut needles = HashMap::new();
-        let mut patterns = Vec::new();
-        for canary in canaries {
-            for (encoding, needle) in encodings(&canary.value) {
-                if needles.contains_key(needle.as_bytes()) {
-                    continue;
-                }
-                patterns.push(regex::escape(&needle));
-                needles.insert(needle.into_bytes(), (canary.label.clone(), encoding));
-            }
-        }
-        let regex = regex::bytes::RegexBuilder::new(&patterns.join("|"))
-            .unicode(false)
-            .size_limit(1 << 26)
-            .build()
-            .unwrap();
-        Self { regex, needles }
-    }
-
-    /// Every match in `bytes`, labelled `place`.
-    fn scan(&self, place: &str, bytes: &[u8]) -> Vec<Hit> {
-        self.regex
-            .find_iter(bytes)
-            .map(|m| {
-                let (label, encoding) = &self.needles[m.as_bytes()];
-                Hit {
-                    place: place.to_owned(),
-                    offset: m.start(),
-                    label: label.clone(),
-                    encoding,
-                }
-            })
-            .collect()
-    }
-
-    /// Every match in the names and contents of the files under `root`,
-    /// except those under a `skip` path. Symlinks are not followed; files
-    /// are read in parallel.
-    fn scan_dir(&self, root: &Path, skip: &[PathBuf]) -> Vec<Hit> {
-        let mut files = Vec::new();
-        let mut hits = Vec::new();
-        let mut dirs = vec![root.to_path_buf()];
-        while let Some(dir) = dirs.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => panic!("cannot list {}: {err}", dir.display()),
-            };
-            for entry in entries {
-                let path = entry.unwrap().path();
-                if skip.iter().any(|s| path.starts_with(s)) {
-                    continue;
-                }
-                let name = path.file_name().unwrap().as_encoded_bytes();
-                hits.extend(self.scan(&format!("name of {}", path.display()), name));
-                let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
-                if kind.is_dir() {
-                    dirs.push(path);
-                } else if kind.is_file() {
-                    files.push(path);
-                }
-            }
-        }
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let chunk = files.len().div_ceil(threads).max(1);
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = files
-                .chunks(chunk)
-                .map(|paths| {
-                    scope.spawn(move || {
-                        let mut found = Vec::new();
-                        for path in paths {
-                            let bytes = std::fs::read(path).unwrap_or_else(|err| {
-                                panic!("cannot read {}: {err}", path.display())
-                            });
-                            found.extend(self.scan(&path.display().to_string(), &bytes));
-                        }
-                        found
-                    })
-                })
-                .collect();
-            for worker in workers {
-                hits.extend(worker.join().unwrap());
-            }
-        });
-        hits
-    }
-}
-
-/// Fails with every hit by place, offset, canary and encoding.
-fn assert_no_hits(what: &str, hits: &[Hit]) {
-    if hits.is_empty() {
-        return;
-    }
-    let list: Vec<String> = hits.iter().map(|h| format!("  {h}")).collect();
-    panic!(
-        "LEAK: {} canary match(es) after {what}:\n{}",
-        hits.len(),
-        list.join("\n")
-    );
-}
-
-/// Every file under `<work>/.rotate` is 0600 and the directory 0700 (AC3).
-/// Returns the file names found.
-fn assert_private_state(work: &Path) -> Vec<String> {
-    let dir = work.join(".rotate");
-    let Ok(meta) = std::fs::metadata(&dir) else {
-        return Vec::new();
-    };
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o700,
-        "{} is not 0700",
-        dir.display()
-    );
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let entry = entry.unwrap();
-        let meta = std::fs::symlink_metadata(entry.path()).unwrap();
-        assert!(
-            meta.file_type().is_file(),
-            "{} is not a regular file",
-            entry.path().display()
-        );
-        assert_eq!(
-            meta.permissions().mode() & 0o777,
-            0o600,
-            "{} is not 0600",
-            entry.path().display()
-        );
-        names.push(entry.file_name().to_string_lossy().into_owned());
-    }
-    names.sort();
-    names
-}
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
@@ -708,8 +447,51 @@ fn t1_mock_rollback_unsupported_restore() {
     );
     run.consumers_hold(MOCK_REPLACEMENT);
     run.set(|s| s["providers"] = json!({ "npm": { "restore": "unsupported" } }));
-    run.run(&["rollback", "--stdin", "--confirm", &id]);
-    run.run(&["status", "--all"]);
+    // SHA-290 T8 (AC1): the old secret stays revoked, so exit 1.
+    run.expect(1, &["rollback", "--stdin", "--confirm", &id]);
+    assert_eq!(run.step(&id), "rolled_back");
+    let status = run.expect(0, &["status", "--all"]);
+    assert!(
+        text(&status.stdout).contains("the old secret stays revoked"),
+        "{}",
+        shown(&status)
+    );
+    run.expect(0, &["--json", "status", "--all"]);
+}
+
+// SHA-290 T8 (AC2): a rotation revoked by hand (no restore handle) rolled
+// back: consumers restored, replacement revoked, exit 1; every run swept.
+#[test]
+fn sha290_t8_rollback_after_revoke_by_hand_exits_1() {
+    let mut run = MockRun::new();
+    let said = echoing_instructions(&run, "manual_revoke");
+    run.set(|s| s["providers"] = json!({ "npm": { "manual_revoke": said } }));
+    let id = run.planned_id();
+    run.expect(
+        4,
+        &["--overlap", "0s", "apply", "--stdin", "--confirm", &id],
+    );
+    // Deleted by hand: apply records it revoked, with no handle.
+    run.set(|s| s["providers"]["npm"]["validity"] = json!("invalid"));
+    run.expect(0, &["apply", "--stdin", "--confirm", &id]);
+    assert_eq!(run.step(&id), "revoked");
+
+    let providers = run.scenario["providers"].clone();
+    run.consumers_hold(MOCK_REPLACEMENT);
+    run.set(|s| s["providers"] = providers);
+    let output = run.expect(1, &["rollback", "--stdin", "--confirm", &id]);
+    let out = text(&output.stdout);
+    assert!(out.contains("rollback will exit 1"), "{}", shown(&output));
+    assert!(
+        out.contains("1 with the old secret still revoked"),
+        "{}",
+        shown(&output)
+    );
+    assert_eq!(run.step(&id), "rolled_back");
+    run.expect(0, &["status", "--all"]);
+    run.expect(0, &["--json", "status", "--all"]);
+    // Finished: a second rollback has nothing to do.
+    run.expect(0, &["rollback", "--stdin", "--confirm", &id]);
 }
 
 // T1 (AC1): the panic and error paths. `__test-console` prints, fails or
@@ -1131,7 +913,12 @@ async fn sha294_t2_reapply_during_the_overlap_window() {
             !table.contains("will not create a replacement"),
             "{label}: {table}"
         );
-        assert!(!table.contains("warning:"), "{label}: {table}");
+        // No scope warning in the rotation block; the run-level endpoint
+        // warnings under the header (SHA-287) are expected here.
+        assert!(
+            !table.lines().any(|l| l.starts_with("  warning:")),
+            "{label}: {table}"
+        );
         for consumer_ref in &refs {
             let row = table
                 .lines()
@@ -1530,4 +1317,246 @@ fn sweep_finds_every_encoding_at_every_alignment() {
     assert!(sweep.scan("s", b"nothing to see").is_empty());
     let hit = &sweep.scan("place", value.as_bytes())[0];
     assert!(!hit.to_string().contains(&value));
+}
+
+// ---------------------------------------------------------------------------
+// SHA-287 T8 (AC3): a credential in an endpoint URL's user info
+// ---------------------------------------------------------------------------
+
+/// A canary as the password (and user name) in each endpoint field's URL:
+/// the config is refused (exit 2) and the canary appears nowhere, in
+/// stdout, stderr at `-vvv` with `RUST_LOG=trace`, or any file rotate
+/// wrote. The config sits under `inputs/`, which the sweep skips.
+#[test]
+fn sha287_t8_userinfo_canary_stays_out_of_every_output() {
+    // URL-safe canaries, so they really are the URL's user info: `/` or
+    // `+` would end the authority and make them part of the path.
+    let url_safe =
+        |c: String| -> String { c.chars().filter(char::is_ascii_alphanumeric).collect() };
+    let password = url_safe(canary());
+    let user = url_safe(canary());
+    assert!(password.len() >= 16 && user.len() >= 16);
+    let sweep = Sweep::new(&[
+        Canary::new("URL password", &password),
+        Canary::new("URL user name", &user),
+    ]);
+    let urls = [
+        format!("https://{user}:{password}@api.example.com"),
+        format!("http://{user}:{password}@localhost:4873"),
+        format!("https://:{password}@api.example.com"),
+    ];
+    let templates = [
+        "providers:\n  aws:\n    endpoint_url: \"{}\"\n",
+        "providers:\n  github:\n    api_url: \"{}\"\n",
+        "providers:\n  npm:\n    registry: \"{}\"\n",
+        "providers:\n  openai:\n    api_url: \"{}\"\n",
+    ];
+    for template in templates {
+        for url in &urls {
+            let run = MockRun::new();
+            let config = run.path("inputs/rotate.yaml");
+            std::fs::write(&config, template.replace("{}", url)).unwrap();
+            let config = config.to_str().unwrap();
+            let output = run.expect(2, &["--config", config, "plan", "--stdin"]);
+            assert!(
+                text(&output.stderr).contains("must not embed credentials"),
+                "{}",
+                shown(&output)
+            );
+            let mut hits = sweep.scan("stdout", &output.stdout);
+            hits.extend(sweep.scan("stderr", &output.stderr));
+            hits.extend(sweep.scan_dir(run.root.path(), &[run.path("inputs")]));
+            assert_no_hits("a config with credentials in a URL", &hits);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-288 T8 (AC8): the npm one-time password through the binary
+// ---------------------------------------------------------------------------
+
+/// An `npm_` token built from canary characters: 36 alphanumerics.
+fn npm_canary() -> String {
+    let body: String = canary_of(96)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(36)
+        .collect();
+    assert_eq!(body.len(), 36);
+    format!("npm_{body}")
+}
+
+/// The release code path of `rotate apply` with the real npm plugin against
+/// a wiremock registry that challenges the token delete: once with the code
+/// in `ROTATE_NPM_OTP`, once typed at the (scripted) hidden prompt. The
+/// code is seven canary digits, under the redactor's minimum length, so
+/// this proves rotate never formats it. Every run is swept: stdout, stderr
+/// at `-vvv` with `RUST_LOG=trace`, and every file it wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha288_t8_npm_otp_runs_are_clean() {
+    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for via_prompt in [false, true] {
+        let leaked = npm_canary();
+        let operator = npm_canary();
+        let replacement = npm_canary();
+        let code: String = format!("{}", 1_000_000 + (rng()() % 9_000_000));
+        let sweep = Sweep::new(&[
+            Canary::new("old secret", &leaked),
+            Canary::new("operator token", &operator),
+            Canary::new("replacement", &replacement),
+            Canary::new("one-time password", &code),
+        ]);
+
+        let server = MockServer::start().await;
+        for (token, user) in [
+            (&leaked, "alice"),
+            (&operator, "alice"),
+            (&replacement, "alice"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/-/whoami"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "username": user })))
+                .mount(&server)
+                .await;
+        }
+        let redacted = format!("{}...{}", &leaked[..8], &leaked[leaked.len() - 4..]);
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/tokens"))
+            .and(header(
+                "authorization",
+                format!("Bearer {operator}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "objects": [{
+                    "key": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "token": redacted,
+                    "readonly": false,
+                    "bypass_2fa": false,
+                    "created": "2026-09-01T00:00:00.000Z",
+                    "revoked": null
+                }],
+                "total": 1,
+                "urls": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+            .and(header("npm-otp", code.as_str()))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", "OTP")
+                    .set_body_json(json!({ "error": "otp required" })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["work", "home", "tmp", "inputs"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        let work = root.path().join("work");
+        let inputs = root.path().join("inputs");
+        let config = inputs.join("rotate.yaml");
+        std::fs::write(
+            &config,
+            format!("providers:\n  npm:\n    registry: {}\n", server.uri()),
+        )
+        .unwrap();
+        let mut scenario = json!({ "real_plugins": true, "prompt": "panic" });
+        if via_prompt {
+            scenario["npm_otp"] = json!({ "answers": [code] });
+        }
+        let scenario_path = inputs.join("scenario.json");
+        std::fs::write(&scenario_path, scenario.to_string()).unwrap();
+
+        let run = |args: &[&str]| -> Output {
+            let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rotate"));
+            cmd.env_clear()
+                .current_dir(&work)
+                .env("HOME", root.path().join("home"))
+                .env("TMPDIR", root.path().join("tmp"))
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                .env("ROTATE_ACTOR", "leak@runner")
+                .env("ROTATE_TEST_SCENARIO", &scenario_path)
+                .env("ROTATE_NPM_TOKEN", &operator)
+                .env("NEW_NPM_TOKEN", &replacement)
+                .env("RUST_LOG", "trace");
+            if !via_prompt {
+                cmd.env("ROTATE_NPM_OTP", &code);
+            }
+            let mut child = cmd
+                .arg("-vvv")
+                .arg("--config")
+                .arg(&config)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                use std::io::Write;
+                let mut pipe = child.stdin.take().unwrap();
+                let _ = pipe.write_all(format!("{leaked}\n").as_bytes());
+            }
+            let output = child.wait_with_output().unwrap();
+            let label = args.join(" ");
+            let mut hits = sweep.scan(&format!("`{label}` stdout"), &output.stdout);
+            hits.extend(sweep.scan(&format!("`{label}` stderr"), &output.stderr));
+            hits.extend(sweep.scan_dir(root.path(), std::slice::from_ref(&inputs)));
+            assert_no_hits(&format!("`rotate {label}` (prompt: {via_prompt})"), &hits);
+            output
+        };
+
+        let plan = run(&["--json", "plan", "--stdin"]);
+        assert_eq!(plan.status.code(), Some(0), "{}", shown(&plan));
+        let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+        let id = plan["rotations"][0]["rotation_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no rotation planned: {plan}"))
+            .to_owned();
+        let output = run(&[
+            "--overlap",
+            "0s",
+            "apply",
+            "--stdin",
+            "--confirm",
+            &id,
+            "--replacement-from-env",
+            "NEW_NPM_TOKEN",
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{}", shown(&output));
+        if via_prompt {
+            assert!(
+                text(&output.stderr).contains("One-time password for npm user alice"),
+                "{}",
+                shown(&output)
+            );
+        }
+        let deletes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .collect();
+        assert_eq!(deletes.len(), 2, "prompt: {via_prompt}");
+        assert!(deletes[0].headers.get("npm-otp").is_none());
+        assert_eq!(
+            deletes[1].headers.get("npm-otp").unwrap().to_str().unwrap(),
+            code
+        );
+        assert_private_state(&work);
+    }
 }

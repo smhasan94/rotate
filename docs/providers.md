@@ -64,7 +64,7 @@ or Manual.
 | `verify_replacement` | Unsupported | none | A pasted token is never stored. A rotation that stopped before verify is marked `needs_rollback`. |
 | `revoke` | Automated | none | `POST /credentials/revoke`, unauthenticated. `ghs_` installation tokens and legacy 40-hex tokens are not accepted by that API and are never revoked; `ghs_` tokens expire within an hour. |
 | `revoke_replacement` | Manual | none | Rollback cannot revoke a pasted token and tells you to revoke it on GitHub by hand. |
-| `restore` | Unsupported | none | GitHub cannot reactivate a revoked token. Rollback restores consumers only. |
+| `restore` | Unsupported | none | GitHub cannot reactivate a revoked token. Rollback restores consumers only and exits 1. |
 
 ### npm access tokens (`npm`)
 
@@ -82,9 +82,9 @@ plan shows a revoke blocker naming `ROTATE_NPM_TOKEN`.
 | `create_replacement` | Manual | none | npm creates tokens only with the account password and a one-time password. Apply names the granular token page and the settings to copy, then asks you to paste it. |
 | `verify` | Automated | none | `GET /-/whoami` with the pasted token; the user must match. |
 | `verify_replacement` | Unsupported | none | A pasted token is never stored. A rotation that stopped before verify is marked `needs_rollback`. |
-| `revoke` | Automated | npm session token | Deletes the token by the id in your token list, so it needs the list and a session token; a granular token cannot list. An account that asks for a one-time password, or a granular token with 2FA bypass (403), makes the delete fail; rotate names the page to delete it on. |
-| `revoke_replacement` | Manual | npm session token | A pasted replacement has no token id, so rollback tells you to delete it by hand. |
-| `restore` | Unsupported | none | npm cannot bring back a deleted token. Rollback restores consumers only. |
+| `revoke` | Automated | npm session token | Deletes the token by the id in your token list, so it needs the list and a session token; a granular token cannot list. When the account asks for a one-time password, rotate takes one from `ROTATE_NPM_OTP` (one delete) or a hidden prompt on the terminal and retries once with `npm-otp`; without a code, with a rejected one, or with a granular token with 2FA bypass (403), the delete fails and rotate names the page to delete it on. |
+| `revoke_replacement` | Manual | npm session token | A pasted replacement has no token id, so rollback tells you to delete it by hand. A replacement with a token id is deleted like `revoke`, one-time password included. |
+| `restore` | Unsupported | none | npm cannot bring back a deleted token. Rollback restores consumers only and exits 1. |
 
 ### OpenAI API keys (`openai`)
 
@@ -98,7 +98,7 @@ plan shows a revoke blocker naming `ROTATE_NPM_TOKEN`.
 | `verify_replacement` | Unsupported | none | Not implemented for OpenAI. A rotation that stopped before verify is marked `needs_rollback`. |
 | `revoke` | Automated; Manual without admin key | OpenAI admin key | Deletes a user-owned key by id, or a service-account key by deleting its service account when that is the account's only key. Otherwise, and without an admin key, the plan shows a manual revoke and apply stops at revoke. |
 | `revoke_replacement` | Automated; Manual without admin key or opt-in | OpenAI admin key | Deletes the service account rotate created. A pasted replacement is revoked by hand. |
-| `restore` | Unsupported | none | OpenAI cannot bring back a deleted key. Rollback restores consumers only. |
+| `restore` | Unsupported | none | OpenAI cannot bring back a deleted key. Rollback restores consumers only and exits 1. |
 
 ## Consumers
 
@@ -162,7 +162,8 @@ entry encrypted with a customer managed KMS key also needs `kms:Decrypt` and
   uses). It lasts two hours, so an unattended run cannot keep one: run
   `npm login` shortly before. A granular access token does not work.
 - [ ] Know whether the account asks for a one-time password to delete
-  tokens; if it does, plan to delete the leaked token on npmjs.com.
+  tokens; if it does, run apply on a terminal to type the code when asked,
+  or set `ROTATE_NPM_OTP` to a fresh code right before the run.
 - [ ] Access to the account's website login and one-time password, to create
   the replacement granular token.
 
@@ -193,12 +194,15 @@ entry encrypted with a customer managed KMS key also needs `kms:Decrypt` and
 - GitHub `ghs_` installation tokens are not revocable through the credential
   revocation API. rotate checks and describes them but never revokes or
   replaces them.
-- npm: deleting a token often needs a one-time password, which rotate does
-  not send, and the token list accepts only an `npm login` session token.
+- npm: deleting a token often needs a one-time password, valid about 30
+  seconds; rotate asks for it only at the delete, so an unattended run needs
+  `ROTATE_NPM_OTP` set just before, and the token list accepts only an
+  `npm login` session token.
 - OpenAI: a service-account key is removed only by deleting its service
   account, and only when it is that account's only key. Admin keys are not
   rotated.
 - Only AWS can resume at verify after the process exits; for the others the
   rotation is marked `needs_rollback`.
 - Only AWS can restore a revoked secret. For the others, rollback puts the
-  old value back in consumers but the old secret stays revoked.
+  old value back in consumers but the old secret stays revoked, and
+  rollback exits 1.

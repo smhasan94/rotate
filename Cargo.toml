@@ -1,6 +1,6 @@
 [package]
 name = "rotate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -52,6 +52,9 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
+# Parses endpoint URLs for the https-or-loopback rule (SHA-287). Already in
+# the tree through reqwest.
+url = "2"
 zeroize = { version = "1", features = ["alloc", "derive"] }
 
 [dev-dependencies]

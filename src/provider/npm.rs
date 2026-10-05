@@ -25,15 +25,25 @@
 //! npm cannot create a token without the account password and a one-time
 //! password, so the provider runs in manual replacement mode (decision D1).
 //! A deleted token cannot be reactivated, so [`NpmProvider::restore`] is
-//! always `Unsupported`. Deleting a token may need a one-time password;
-//! that is out of scope, and revoke fails naming the page to delete it on.
+//! always `Unsupported`.
+//!
+//! An account with 2FA on writes answers the delete with a one-time
+//! password challenge (SHA-288). Only then does the provider ask its
+//! [`OtpSource`] for a code: [`OTP_VAR`] (used for one delete), else a
+//! hidden prompt on the terminal; it names the npm user in the question
+//! (one read-only `GET /-/whoami` signed with the operator token) and
+//! retries the delete once with the `npm-otp` header, marked sensitive.
+//! Without a code, or when npm rejects it, revoke fails naming the page to
+//! delete the token on. A six-digit code is shorter than the redactor's
+//! minimum, so it is never formatted anywhere and is dropped right after
+//! the retry.
 //!
 //! Nothing happens at construction: the HTTP client is built and the
 //! operator token read on first use. Error text carries the endpoint, the
 //! status and npm's capped `error` or `message`, never a token.
 
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -44,6 +54,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha512};
 use zeroize::Zeroizing;
 
+use super::otp::{OtpError, OtpSource};
 use super::{
     Confidence, Credential, Identity, Provider, ProviderError, Replacement, ReplacementMode,
     RestoreOutcome, Revoked, Scope, Validity,
@@ -58,6 +69,10 @@ pub const NAME: &str = "npm";
 /// preference (FR24). The rotate-specific one wins: in CI, `NPM_TOKEN` is
 /// often the very token being rotated.
 pub const TOKEN_VARS: [&str; 2] = ["ROTATE_NPM_TOKEN", "NPM_TOKEN"];
+
+/// The variable a one-time password for one token delete can come from
+/// (SHA-288). Read only when npm asks, and used once.
+pub const OTP_VAR: &str = "ROTATE_NPM_OTP";
 
 /// Scope line, and the start of the revoke error, when the operator's token
 /// list has no entry for the leaked token (AC5).
@@ -95,9 +110,14 @@ pub const GUIDE_SESSION_TOKEN: &str = "use a fresh `npm login` session token as 
      ROTATE_NPM_TOKEN, or delete the leaked token on the Access Tokens page of the npm website";
 
 /// Revoke guidance when npm asked for a one-time password.
-pub const GUIDE_OTP: &str = "npm requires a one-time password to delete tokens for this account \
-     and rotate does not send one; delete the leaked token on the Access Tokens page of the npm \
-     website";
+pub const GUIDE_OTP: &str = "npm requires a one-time password to delete tokens for this account; \
+     re-run rotate apply on a terminal to type one, or set ROTATE_NPM_OTP to a fresh code for one \
+     run, or delete the leaked token on the Access Tokens page of the npm website";
+
+/// Revoke guidance when npm rejected the one-time password (SHA-288).
+pub const GUIDE_OTP_REJECTED: &str = "npm rejected the one-time password; re-run rotate apply \
+     with a fresh code (typed at the prompt or in ROTATE_NPM_OTP), or delete the leaked token on \
+     the Access Tokens page of the npm website";
 
 /// Revoke guidance when the leaked token belongs to another npm user.
 pub const GUIDE_OTHER_USER: &str = "the leaked token belongs to another npm user; delete it on \
@@ -186,6 +206,8 @@ fn body_len(token: &[u8]) -> Option<usize> {
 enum NpmError {
     /// The token has bytes that cannot go in an HTTP header.
     InvalidToken,
+    /// The one-time password has bytes that cannot go in an HTTP header.
+    InvalidOtp,
     /// HTTP 429.
     RateLimited { retry_after: Option<Duration> },
     /// Any other non-success status, with npm's message.
@@ -205,6 +227,9 @@ impl fmt::Display for NpmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NpmError::InvalidToken => f.write_str("the npm token is not a valid HTTP header value"),
+            NpmError::InvalidOtp => {
+                f.write_str("the one-time password is not a valid HTTP header value")
+            }
             NpmError::RateLimited { .. } => f.write_str("rate limited by npm"),
             NpmError::Status {
                 status, message, ..
@@ -457,6 +482,8 @@ pub struct NpmProvider {
     base: String,
     operator: OnceLock<Option<SecretValue>>,
     http: OnceLock<Result<reqwest::Client, String>>,
+    /// Where a one-time password comes from when npm asks (SHA-288).
+    otp: Option<Arc<dyn OtpSource>>,
 }
 
 impl fmt::Debug for NpmProvider {
@@ -469,6 +496,14 @@ impl fmt::Debug for NpmProvider {
         f.debug_struct("NpmProvider")
             .field("base", &self.base)
             .field("operator", &operator)
+            .field(
+                "otp",
+                &if self.otp.is_some() {
+                    "[set]"
+                } else {
+                    "[none]"
+                },
+            )
             .finish()
     }
 }
@@ -483,6 +518,16 @@ impl NpmProvider {
             base: registry_url.trim_end_matches('/').to_owned(),
             operator: OnceLock::new(),
             http: OnceLock::new(),
+            otp: None,
+        }
+    }
+
+    /// Asks `source` for a one-time password when npm challenges a token
+    /// delete (SHA-288). Without one, the delete fails on a challenge.
+    pub fn with_otp_source(self, source: Arc<dyn OtpSource>) -> Self {
+        Self {
+            otp: Some(source),
+            ..self
         }
     }
 
@@ -534,18 +579,20 @@ impl NpmProvider {
             .map_err(|e| NpmError::Transport(e.clone()))
     }
 
-    /// Sends one request signed with `token` to an absolute `url` and
-    /// returns the response when its status is a success.
+    /// Sends one request signed with `token` to an absolute `url`, with
+    /// `npm-otp` when `otp` is given, and returns the response when its
+    /// status is a success.
     async fn send(
         &self,
         method: Method,
         url: &str,
         token: &SecretValue,
+        otp: Option<&SecretValue>,
     ) -> Result<Response, NpmError> {
         let response = self
             .http()?
             .request(method, url)
-            .headers(headers(token)?)
+            .headers(headers(token, otp)?)
             .send()
             .await
             .map_err(|e| NpmError::Transport(e.without_url().to_string()))?;
@@ -561,7 +608,7 @@ impl NpmProvider {
         url: &str,
         token: &SecretValue,
     ) -> Result<T, NpmError> {
-        let response = self.send(Method::GET, url, token).await?;
+        let response = self.send(Method::GET, url, token, None).await?;
         let bytes = response
             .bytes()
             .await
@@ -673,35 +720,95 @@ impl NpmProvider {
             )));
         }
         let url = format!("{}/-/npm/v1/tokens/token/{key}", self.base);
-        match self.send(Method::DELETE, &url, operator).await {
+        match self.send(Method::DELETE, &url, operator, None).await {
             Ok(_) | Err(NpmError::Status { status: 404, .. }) => Ok(()),
             Err(NpmError::Status {
                 status: 401,
                 otp: true,
                 ..
-            }) => Err(ProviderError::Permanent(format!(
-                "{DELETE}: npm requires a one-time password to delete tokens for this account; \
-                 rotate does not send one. Delete the token at {}",
+            }) => self.delete_with_otp(&url, operator, user).await,
+            Err(err) => Err(self.delete_error(err, user)),
+        }
+    }
+
+    /// npm challenged the delete for a one-time password (SHA-288): ask the
+    /// source, naming the npm user, and retry once with `npm-otp`. A second
+    /// 401 means npm rejected the code; there is no third request.
+    async fn delete_with_otp(
+        &self,
+        url: &str,
+        operator: &SecretValue,
+        user: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let Some(source) = &self.otp else {
+            return Err(self.otp_unavailable(user));
+        };
+        let who = match user {
+            Some(user) => Some(user.to_owned()),
+            None => self.whoami(operator).await.ok(),
+        };
+        let user = who.as_deref();
+        let question = match user {
+            Some(user) => format!(
+                "One-time password for npm user {user} to delete the token (input is hidden), \
+                 then press Enter: "
+            ),
+            None => "One-time password for the npm operator account to delete the token (input \
+                     is hidden), then press Enter: "
+                .to_owned(),
+        };
+        let code = match source.one_time_password(&question).await {
+            Ok(code) => code,
+            Err(OtpError::NoSource) => return Err(self.otp_unavailable(user)),
+            Err(OtpError::Failed(why)) => {
+                return Err(ProviderError::Permanent(format!(
+                "{DELETE}: could not read the one-time password ({why}); delete the token at {}",
                 self.tokens_page(user)
             ))
-            .with_guidance(GUIDE_OTP)),
-            Err(err @ NpmError::Status { status: 403, .. }) if bypass_refusal(&err) => {
-                Err(ProviderError::Permanent(format!(
+                .with_guidance(GUIDE_OTP))
+            }
+        };
+        let retried = self.send(Method::DELETE, url, operator, Some(&code)).await;
+        drop(code);
+        match retried {
+            Ok(_) | Err(NpmError::Status { status: 404, .. }) => Ok(()),
+            Err(NpmError::Status { status: 401, .. }) => Err(ProviderError::Permanent(format!(
+                "{DELETE}: npm rejected the one-time password (401); delete the token at {}",
+                self.tokens_page(user)
+            ))
+            .with_guidance(GUIDE_OTP_REJECTED)),
+            Err(err) => Err(self.delete_error(err, user)),
+        }
+    }
+
+    /// The delete needs a one-time password and none was available.
+    fn otp_unavailable(&self, user: Option<&str>) -> ProviderError {
+        ProviderError::Permanent(format!(
+            "{DELETE}: npm requires a one-time password to delete tokens for this account and \
+             none was available. Delete the token at {}",
+            self.tokens_page(user)
+        ))
+        .with_guidance(GUIDE_OTP)
+    }
+
+    /// A failed delete other than a one-time password challenge.
+    fn delete_error(&self, err: NpmError, user: Option<&str>) -> ProviderError {
+        match err {
+            err @ NpmError::Status { status: 403, .. } if bypass_refusal(&err) => {
+                ProviderError::Permanent(format!(
                     "{DELETE}: {err}. A granular token that bypasses 2FA cannot delete tokens; use \
                      an npm login session token as ROTATE_NPM_TOKEN, or delete the token at {}",
                     self.tokens_page(user)
                 ))
-                .with_guidance(GUIDE_SESSION_TOKEN))
+                .with_guidance(GUIDE_SESSION_TOKEN)
             }
-            Err(err @ NpmError::Status { status: 403, .. }) => {
-                Err(ProviderError::Permanent(format!(
-                    "{DELETE}: {err}. The operator token may not delete tokens; use an npm login \
-                     session token as ROTATE_NPM_TOKEN, or delete the token at {}",
-                    self.tokens_page(user)
-                ))
-                .with_guidance(GUIDE_SESSION_TOKEN))
-            }
-            Err(err) => Err(op_error(DELETE, err)),
+            err @ NpmError::Status { status: 403, .. } => ProviderError::Permanent(format!(
+                "{DELETE}: {err}. The operator token may not delete tokens; use an npm login \
+                 session token as ROTATE_NPM_TOKEN, or delete the token at {}",
+                self.tokens_page(user)
+            ))
+            .with_guidance(GUIDE_SESSION_TOKEN),
+            err => op_error(DELETE, err),
         }
     }
 }
@@ -717,8 +824,9 @@ fn bypass_refusal(err: &NpmError) -> bool {
     }
 }
 
-/// `Authorization: Bearer <token>` (sensitive) plus the standard headers.
-fn headers(token: &SecretValue) -> Result<HeaderMap, NpmError> {
+/// `Authorization: Bearer <token>` (sensitive) plus the standard headers,
+/// and `npm-otp` (sensitive) when a one-time password is given.
+fn headers(token: &SecretValue, otp: Option<&SecretValue>) -> Result<HeaderMap, NpmError> {
     let mut value = token.expose_secret(|t| {
         let mut bytes = Zeroizing::new(Vec::with_capacity(t.len() + 7));
         bytes.extend_from_slice(b"Bearer ");
@@ -733,6 +841,13 @@ fn headers(token: &SecretValue) -> Result<HeaderMap, NpmError> {
         USER_AGENT,
         HeaderValue::from_static(concat!("rotate/", env!("CARGO_PKG_VERSION"))),
     );
+    if let Some(otp) = otp {
+        let mut value = otp.expose_secret(|code| {
+            HeaderValue::from_bytes(code).map_err(|_| NpmError::InvalidOtp)
+        })?;
+        value.set_sensitive(true);
+        headers.insert("npm-otp", value);
+    }
     Ok(headers)
 }
 
@@ -1395,6 +1510,31 @@ mod tests {
             p.revoke_replacement("manual").await,
             Err(ProviderError::Unsupported(_))
         ));
+    }
+
+    /// SHA-288: `npm-otp` is sent marked sensitive, like the bearer token,
+    /// so no `Debug` of the request shows it.
+    #[test]
+    fn headers_mark_otp_sensitive() {
+        let token = SecretValue::from(tok(BODY));
+        let code = SecretValue::from("3141592");
+        let map = headers(&token, Some(&code)).unwrap();
+        let otp = map.get("npm-otp").unwrap();
+        assert!(otp.is_sensitive());
+        assert_eq!(otp.as_bytes(), b"3141592");
+        assert!(!format!("{map:?}").contains("3141592"));
+        assert!(headers(&token, None).unwrap().get("npm-otp").is_none());
+    }
+
+    #[test]
+    fn invalid_otp_bytes_are_refused() {
+        let token = SecretValue::from(tok(BODY));
+        let code = SecretValue::from("12\n34");
+        assert_eq!(
+            headers(&token, Some(&code)).unwrap_err(),
+            NpmError::InvalidOtp
+        );
+        assert!(!NpmError::InvalidOtp.to_string().contains("12"));
     }
 
     #[tokio::test]

@@ -466,3 +466,60 @@ fn apply_json_is_refused() {
     assert_eq!(output.status.code(), Some(2));
     assert!(run.calls().is_empty());
 }
+
+// SHA-287 T6 (AC7): with a non-default endpoint, apply prints the same
+// warning line before it asks for the rotation id. stdout and stderr share
+// one append-mode file, so the two streams land in write order.
+#[test]
+fn sha287_t6_apply_warns_before_the_question() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let run = Run::new("npm_applycli_287_t6_value");
+    std::fs::write(
+        run.file("rotate.yaml"),
+        "providers:\n  npm:\n    registry: https://npm.example.com\n",
+    )
+    .unwrap();
+    let id = run.planned_id();
+    run.scenario(json!({ "prompt": { "answers": [id] } }));
+
+    let merged = run.file("merged.txt");
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&merged)
+        .unwrap();
+    let err = out.try_clone().unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rotate"))
+        .current_dir(run.path())
+        .env_remove("ROTATE_CONFIG")
+        .env_remove("ROTATE_STATE_FILE")
+        .env_remove("ROTATE_AUDIT_LOG")
+        .env_remove("ROTATE_OVERLAP")
+        .env("ROTATE_ACTOR", "ci@runner")
+        .env("ROTATE_TEST_SCENARIO", run.file("scenario.json"))
+        .args(["apply", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{}\n", run.value).as_bytes())
+        .unwrap();
+    let status = child.wait().unwrap();
+    let text = std::fs::read_to_string(&merged).unwrap();
+    assert_eq!(status.code(), Some(0), "{text}");
+    let warning = text
+        .find("warning: providers.npm.registry is https://npm.example.com (default https://registry.npmjs.org)")
+        .unwrap_or_else(|| panic!("no endpoint warning: {text}"));
+    let question = text
+        .find("Type the rotation id")
+        .unwrap_or_else(|| panic!("no question: {text}"));
+    assert!(warning < question, "{text}");
+    assert_eq!(run.state()["rotations"][0]["step"], "revoked");
+}
