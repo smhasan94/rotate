@@ -23,6 +23,9 @@ use tempfile::TempDir;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+#[cfg(unix)]
+pub mod sweep;
+
 /// Decides that a request is read-only even though its HTTP method is one
 /// that normally changes state. Needed because AWS sends every call as a
 /// POST, including `GetCallerIdentity` and `ListAccessKeys`.
@@ -194,6 +197,29 @@ pub fn live_enabled() -> bool {
 pub fn require_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
+
+/// [`require_env`] for a live test: prints `skipped: <NAME> not set` to
+/// stderr when the variable is absent, so the run names what is missing.
+pub fn live_env(name: &str) -> Option<String> {
+    let value = require_env(name);
+    if value.is_none() {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "skipped: {name} not set");
+    }
+    value
+}
+
+/// `let Some(v) = live_env(NAME) else { return }`: binds a variable a live
+/// test needs, or returns naming it.
+macro_rules! live_require {
+    ($name:expr) => {
+        match $crate::common::live_env($name) {
+            Some(value) => value,
+            None => return,
+        }
+    };
+}
+pub(crate) use live_require;
 
 /// Return early from a live test unless `ROTATE_LIVE_TESTS=1`.
 ///

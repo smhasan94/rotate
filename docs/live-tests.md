@@ -16,9 +16,13 @@ touches a real workload.
 
 ## What the tests change
 
-Each run overwrites one Actions secret in a private test repository. It then
-dispatches a workflow there that prints a fingerprint of the secret (never
-the value), and finally restores the secret.
+Each run sets one Actions secret in a private test repository to a random
+test value, overwrites it with a second random value, and then restores the
+first. After each write it dispatches a workflow there that prints a
+fingerprint of the secret (never the value) and compares it with the
+expected one. A second test fails on purpose right after the overwrite and
+checks that the first value was put back. The secret keeps the last test
+value between runs; its value does not matter.
 
 If a run fails partway, the harness still restores the secret. If that
 restore itself fails, the run's error ends with `left behind: ...`, and
@@ -208,9 +212,13 @@ The protection rules include `required_reviewers`. The secret list has
 exactly `ROTATE_LIVE_GITHUB_TOKEN`. The variable list has
 `ROTATE_LIVE_GITHUB_REPO` set to `<you>/rotate-live`.
 
-## Step 4 (later): run locally
+## Step 4: run the tests
 
-This step works only once the tests exist (SHA-268). Until then, skip it.
+From GitHub: Actions, then `live`, then Run workflow. Approve the run when
+GitHub asks (the `live-tests` environment waits for you). It takes about 10
+minutes; most of it is building.
+
+From your machine (optional):
 
 To run the live tests from your machine, export the same names in one shell
 session. Do not put them in a dotfile or in a `.env` file in the repository.
@@ -224,6 +232,9 @@ export ROTATE_LIVE_GITHUB_REPO="$LIVE_GH_OWNER/rotate-live"
 
 ROTATE_LIVE_TESTS=1 RUSTUP_TOOLCHAIN=1.99.0 cargo test --all-features -- --ignored live_github
 ```
+
+`live_github` also runs the two kept provider checks below; the revoke one
+skips unless you set its variable.
 
 To test the restore path by hand, set `ROTATE_LIVE_FAIL_AFTER=update`. The
 run then fails on purpose right after it overwrites the secret.

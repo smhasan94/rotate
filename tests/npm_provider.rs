@@ -1173,15 +1173,6 @@ async fn conformance_manual_mode() {
     }
 }
 
-fn live_env(name: &str) -> Option<String> {
-    let value = common::require_env(name);
-    if value.is_none() {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "skipped: {name} not set");
-    }
-    value
-}
-
 // Live, read-only: a real token from the environment is valid and its
 // scope names a user. With `ROTATE_NPM_TOKEN` set to a session token of
 // the same account, the scope also shows the token's settings.
@@ -1189,7 +1180,7 @@ fn live_env(name: &str) -> Option<String> {
 #[ignore]
 async fn live_npm_check_valid_and_scope() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_NPM_TOKEN") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_NPM_TOKEN") else {
         return;
     };
     let p = NpmProvider::new("https://registry.npmjs.org");
@@ -1209,10 +1200,10 @@ async fn live_npm_check_valid_and_scope() {
 #[ignore]
 async fn live_npm_revoke() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_NPM_REVOKE_TOKEN") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_NPM_REVOKE_TOKEN") else {
         return;
     };
-    if live_env("ROTATE_NPM_TOKEN").is_none() {
+    if common::live_env("ROTATE_NPM_TOKEN").is_none() {
         return;
     }
     let p = NpmProvider::new("https://registry.npmjs.org");

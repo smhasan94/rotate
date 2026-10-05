@@ -995,22 +995,13 @@ async fn conformance_manual_mode() {
     }
 }
 
-fn live_env(name: &str) -> Option<String> {
-    let value = common::require_env(name);
-    if value.is_none() {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), "skipped: {name} not set");
-    }
-    value
-}
-
 // Live, read-only: a real key from the environment is valid; with an admin
 // key its scope names a project.
 #[tokio::test]
 #[ignore]
 async fn live_openai_check_valid_and_scope() {
     common::live_guard!();
-    let Some(value) = live_env("ROTATE_LIVE_OPENAI_KEY") else {
+    let Some(value) = common::live_env("ROTATE_LIVE_OPENAI_KEY") else {
         return;
     };
     let admin = match common::require_env("OPENAI_ADMIN_KEY") {
@@ -1033,8 +1024,8 @@ async fn live_openai_check_valid_and_scope() {
 async fn live_openai_replacement_cycle() {
     common::live_guard!();
     let (Some(value), Some(admin)) = (
-        live_env("ROTATE_LIVE_OPENAI_KEY"),
-        live_env("OPENAI_ADMIN_KEY"),
+        common::live_env("ROTATE_LIVE_OPENAI_KEY"),
+        common::live_env("OPENAI_ADMIN_KEY"),
     ) else {
         return;
     };
