@@ -322,8 +322,9 @@ fn plan(
 }
 
 /// `rotate apply` (SHA-254): re-plans from the same input, prints the plan,
-/// asks for confirmation (or takes `--confirm`), then runs each confirmed
-/// rotation through the executor: create, update consumers, verify, revoke.
+/// asks for confirmation (or takes `--confirm`), then runs the confirmed
+/// rotations through the executor: create, update consumers and verify for
+/// each, then the revokes, last, batched per provider (SHA-286).
 /// The state lock is held for the whole run. Nothing state-changing happens
 /// before every confirmation is in and the audit log is open. The plan, and
 /// with it every credential, lives until the summary is printed, so the
@@ -485,11 +486,7 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
                 .iter()
                 .filter_map(|s| executor.confirm_revoked_by_hand(s)),
         );
-        runtime.block_on(async {
-            for rotation in &requested {
-                outcomes.push(executor.run(rotation).await);
-            }
-        });
+        outcomes.extend(runtime.block_on(executor.run_all(&requested)));
     } else {
         outcomes.extend(requested.iter().filter_map(|r| {
             apply::eligibility_in(r, &store)
