@@ -13,7 +13,10 @@
 //! Revoke uses GitHub's credential revocation API, `POST
 //! /credentials/revoke`, which takes up to 1000 tokens per request and
 //! must be called without authentication: GitHub answers an authenticated
-//! request with 403. So this provider needs no operator token at all. The
+//! request with 403. So this provider needs no operator token at all.
+//! GitHub allows 60 such requests an hour, so apply revokes every token of
+//! a run through [`GithubProvider::revoke_batch`], one request per 1000
+//! (SHA-286). The
 //! API accepts `ghp_`, `github_pat_`, `gho_`, `ghu_` and `ghr_` tokens;
 //! installation tokens (`ghs_`) are not on that list and are refused.
 //! Revoked tokens cannot be reactivated, so [`GithubProvider::restore`]
@@ -201,21 +204,28 @@ impl GithubProvider {
             revocable(token, &self.web_url())?;
         }
         for batch in tokens.chunks(REVOKE_BATCH) {
-            let body = revoke_body(batch);
-            match self
-                .client
-                .post_as("/credentials/revoke", &body, Auth::Anonymous)
-                .await
-            {
-                Ok(_) => {}
-                Err(GithubError::Status {
-                    status: 422,
-                    message,
-                }) if message.to_ascii_lowercase().contains("already revoked") => {}
-                Err(err) => return Err(op_error(REVOKE, err)),
-            }
+            self.revoke_chunk(batch).await?;
         }
         Ok(())
+    }
+
+    /// One `POST /credentials/revoke` with every token in `tokens` (at most
+    /// [`REVOKE_BATCH`], each already checked with `revocable`), without
+    /// authentication. GitHub saying they were already revoked is `Ok`.
+    async fn revoke_chunk(&self, tokens: &[&SecretValue]) -> Result<(), ProviderError> {
+        let body = revoke_body(tokens);
+        match self
+            .client
+            .post_as("/credentials/revoke", &body, Auth::Anonymous)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(GithubError::Status {
+                status: 422,
+                message,
+            }) if message.to_ascii_lowercase().contains("already revoked") => Ok(()),
+            Err(err) => Err(op_error(REVOKE, err)),
+        }
     }
 
     /// `GET /user` signed with `token`: the login and response headers.
@@ -577,6 +587,66 @@ impl Provider for GithubProvider {
         let token = token(credential)?;
         self.revoke_many(&[token]).await?;
         Ok(Revoked { restore_ref: None })
+    }
+
+    /// Every token GitHub's revocation API accepts goes in one `POST
+    /// /credentials/revoke` per [`REVOKE_BATCH`] (SHA-286); one it does not
+    /// (an installation or legacy-format token, or not a token at all) gets
+    /// its own `Unsupported` result (for an installation token, with
+    /// [`INSTALLATION_UNSUPPORTED`] as guidance) and is left out of the
+    /// request. Each request's result is every token's in it. A
+    /// rate-limited request stops the batch: that result is also every
+    /// later token's, and no later request is sent. Any other error
+    /// applies to its request only.
+    async fn revoke_batch(
+        &self,
+        credentials: &[&Credential],
+    ) -> Vec<Result<Revoked, ProviderError>> {
+        let web = self.web_url();
+        let mut results: Vec<Option<Result<Revoked, ProviderError>>> =
+            vec![None; credentials.len()];
+        let mut accepted: Vec<(usize, &SecretValue)> = Vec::new();
+        for (i, credential) in credentials.iter().enumerate() {
+            match token(credential).and_then(|t| revocable(t, &web).map(|_| t)) {
+                Ok(t) => accepted.push((i, t)),
+                // The text is rotate's own constant: as guidance it survives
+                // where a resumed revoke keeps only a summary (SHA-298), so
+                // the operator still learns what to do.
+                Err(err) if err.unsupported() == Some(INSTALLATION_UNSUPPORTED) => {
+                    results[i] = Some(Err(err.with_guidance(INSTALLATION_UNSUPPORTED)));
+                }
+                Err(err) => results[i] = Some(Err(err)),
+            }
+        }
+        let mut limited: Option<ProviderError> = None;
+        for chunk in accepted.chunks(REVOKE_BATCH) {
+            let sent = match &limited {
+                Some(err) => Err(err.clone()),
+                None => {
+                    let tokens: Vec<&SecretValue> = chunk.iter().map(|(_, t)| *t).collect();
+                    let sent = self.revoke_chunk(&tokens).await;
+                    if let Err(err) = &sent {
+                        if matches!(err.base(), ProviderError::RateLimited { .. }) {
+                            limited = Some(err.clone());
+                        }
+                    }
+                    sent
+                }
+            };
+            for (i, _) in chunk {
+                results[*i] = Some(sent.clone().map(|()| Revoked { restore_ref: None }));
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|| Err(ProviderError::Permanent(format!("{REVOKE}: no result"))))
+            })
+            .collect()
+    }
+
+    fn revoke_batch_size(&self) -> Option<usize> {
+        Some(REVOKE_BATCH)
     }
 
     /// GitHub cannot reactivate a revoked token.
