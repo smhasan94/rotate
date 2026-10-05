@@ -406,7 +406,7 @@ fn serially<T>(f: impl FnOnce() -> T) -> T {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// T4, T7: update and restore one Actions secret, each proven by dispatch.
+/// T3, T6: update and restore one Actions secret, each proven by dispatch.
 #[test]
 #[ignore]
 fn live_github_actions_update_and_restore() {
@@ -420,7 +420,7 @@ fn live_github_actions_update_and_restore() {
     }
 }
 
-/// T6: a failure right after the update still leaves the seeded value in
+/// T5: a failure right after the update still leaves the seeded value in
 /// place, proven by one more dispatch.
 #[test]
 #[ignore]
@@ -474,7 +474,7 @@ fn t2_skips_naming_the_missing_variable() {
     );
 }
 
-/// T6: the failure message names what cleanup left behind.
+/// T5: the failure message names what cleanup left behind.
 #[test]
 fn run_scenario_reports_leftovers() {
     let left = vec!["github-actions:o/r:S holds a test value (HTTP 500)".to_owned()];
