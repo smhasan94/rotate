@@ -8,16 +8,16 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
-use rotate::apply::{self, Executor, ReplacementSource, RunResult, Terminal};
+use rotate::apply::{self, Executor, ReplacementSource, RunResult, ScriptedPrompt, Terminal};
 use rotate::assess::{self, AssessOptions};
-use rotate::audit::AuditLog;
+use rotate::audit::{AuditLog, AuditStep, Outcome as AuditOutcome};
 use rotate::config::ConsumersConfig;
 use rotate::conformance::{provider_suite, MutationProbe, Outcome, ProviderFixture};
 use rotate::consumer::mock::MockConsumer;
@@ -28,9 +28,10 @@ use rotate::plan;
 use rotate::provider::github::{
     GithubProvider, FINE_GRAINED_NOTE, INSTALLATION_UNSUPPORTED, REVOKE_BATCH,
 };
+use rotate::provider::mock::MockProvider;
 use rotate::provider::{
     Credential, Identity, Provider, ProviderError, ProviderRegistry, ReplacementMode,
-    RestoreOutcome, Validity,
+    RestoreOutcome, Revoked, Validity,
 };
 use rotate::secret::SecretValue;
 use rotate::state::{ConsumerState, ConsumerStatus, StateStore, Step};
@@ -861,6 +862,833 @@ async fn installation_token_apply_stops_at_revoke_manual() {
     ] {
         assert!(!text.contains(leaked.as_str()), "token in {label}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-286: every GitHub token of a run revoked in one request per 1000.
+// ---------------------------------------------------------------------------
+
+/// Several leaked values planned in one registry: the GitHub provider plus
+/// `extra`, one `github-actions` consumer holding every value (ref
+/// `gha:acme/app<i>:GH_TOKEN`), overlap `0s`, ids assigned.
+async fn pipeline_many(
+    rec: &CallRecorder,
+    leaked: &[&str],
+    extra: Vec<Arc<dyn Provider>>,
+) -> Pipeline {
+    let dir = tempfile::tempdir().unwrap();
+    let mut providers = registry(provider(rec));
+    for p in extra {
+        providers.register(p);
+    }
+    let mut gha = MockConsumer::new("github-actions");
+    for (i, value) in leaked.iter().enumerate() {
+        gha = gha.matching(
+            SecretValue::from(*value).fingerprint(),
+            ConsumerMatch::by_value(format!("gha:acme/app{i}:GH_TOKEN")),
+        );
+    }
+    let gha = Arc::new(gha);
+    let mut consumers = ConsumerRegistry::new();
+    consumers.register(gha.clone());
+    // A detector hint names a provider, so a value for `extra` gets none.
+    let findings = leaked
+        .iter()
+        .map(|v| match v.starts_with("mock_") {
+            true => Finding::new(SecretValue::from(*v), "Mock", SourceLocation::file("a.env")),
+            false => finding(v),
+        })
+        .collect();
+    let assessed = assess::assess(findings, &providers, &fast_opts()).await;
+    let mut built = plan::build(
+        assessed,
+        &providers,
+        &consumers,
+        "0s".parse().unwrap(),
+        &ConsumersConfig::default(),
+    )
+    .await;
+    let mut store = StateStore::open(dir.path().join("state.json")).unwrap();
+    plan::assign_ids(&mut built, &mut store).unwrap();
+    let audit = AuditLog::open_as(dir.path().join("audit.jsonl"), "tester@host").unwrap();
+    assert_eq!(
+        built.rotations.len(),
+        leaked.len(),
+        "{}",
+        plan::render_table(&built)
+    );
+    Pipeline {
+        dir,
+        providers,
+        consumers,
+        gha,
+        store,
+        audit,
+        plan: built,
+    }
+}
+
+impl Pipeline {
+    /// The planned rotation of `value`, by fingerprint.
+    fn rotation(&self, value: &str) -> &plan::PlannedRotation {
+        let fp = SecretValue::from(value).fingerprint();
+        self.plan
+            .rotations
+            .iter()
+            .find(|r| r.fingerprint == fp)
+            .expect("planned")
+    }
+
+    fn audit_text(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("audit.jsonl")).unwrap()
+    }
+
+    fn state_text(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("state.json")).unwrap()
+    }
+
+    fn audit_entries(&self) -> Vec<rotate::audit::AuditEntry> {
+        rotate::audit::read_all(&self.dir.path().join("audit.jsonl"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+}
+
+/// The planned rotations of `values` in `plan`, in that order.
+fn pick<'p>(plan: &'p plan::Plan, values: &[&str]) -> Vec<&'p plan::PlannedRotation> {
+    values
+        .iter()
+        .map(|v| {
+            let fp = SecretValue::from(*v).fingerprint();
+            plan.rotations
+                .iter()
+                .find(|r| r.fingerprint == fp)
+                .expect("planned")
+        })
+        .collect()
+}
+
+/// Moves `value`'s record to `verified` with a pasted replacement and its
+/// one consumer updated, as an earlier run would have left it.
+fn seed_verified(p: &mut Pipeline, value: &str) -> String {
+    let rotation = p.rotation(value).clone();
+    let mut record = p.store.get(&rotation.rotation_id).unwrap().clone();
+    record.step = Step::Verified;
+    record.replacement_ref = Some(apply::MANUAL_REF.into());
+    record.replacement_fingerprint =
+        Some(SecretValue::from(format!("{value}-replacement")).fingerprint());
+    record.consumers = rotation
+        .consumers
+        .iter()
+        .map(|c| ConsumerState {
+            consumer: c.consumer.into(),
+            consumer_ref: c.found.consumer_ref.clone(),
+            status: ConsumerStatus::Updated,
+            holds: Some(Holds::Secret),
+        })
+        .collect();
+    p.store.upsert(record).unwrap();
+    rotation.rotation_id
+}
+
+/// Mounts `GET /user` and `GET /user/orgs` for every leaked GitHub token.
+async fn mount_leaked(rec: &CallRecorder, leaked: &[String]) {
+    for value in leaked {
+        mount_user(rec, value, "octocat", Some("repo")).await;
+        mount_orgs(rec, value, &["acme"]).await;
+    }
+}
+
+/// `POST /credentials/revoke` answers 429 with `retry-after: 1800`.
+async fn mount_revoke_limited(rec: &CallRecorder) {
+    Mock::given(method("POST"))
+        .and(path("/credentials/revoke"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "1800")
+                .set_body_json(serde_json::json!({ "message": "rate limited" })),
+        )
+        .with_priority(2)
+        .mount(rec.server())
+        .await;
+}
+
+/// The fixed clock of the rate-limit runs.
+fn fixed_clock() -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp(1_790_000_000).unwrap()
+}
+
+/// What a batch run left behind, for the assertions and the T10 sweep.
+struct BatchRun {
+    p: Pipeline,
+    term: Term,
+    outcomes: Vec<apply::Outcome>,
+    leaked: Vec<String>,
+    replacements: Vec<String>,
+    aws: MockProvider,
+}
+
+/// T1's run: five classic tokens and one mock AWS key, five pasted
+/// replacements, one apply.
+async fn t1_run(rec: &CallRecorder) -> BatchRun {
+    mount_revoke(rec, 202).await;
+    let leaked: Vec<String> = (0..5).map(|i| classic(&format!("t1Lk{i}"))).collect();
+    let replacements: Vec<String> = (0..5).map(|i| classic(&format!("t1Nw{i}"))).collect();
+    mount_leaked(rec, &leaked).await;
+    for value in &replacements {
+        mount_user(rec, value, "octocat", Some("repo")).await;
+    }
+    let aws_value = "mock_aws_sha286_t1_key";
+    let log = rotate::calls::CallLog::new();
+    let aws = MockProvider::new("aws")
+        .identify_prefix("mock_aws_")
+        .log(log.clone());
+    let aws_shared = Arc::new(
+        MockProvider::new("aws")
+            .identify_prefix("mock_aws_")
+            .log(log),
+    );
+    let mut values: Vec<&str> = leaked.iter().map(String::as_str).collect();
+    values.push(aws_value);
+    let mut p = pipeline_many(rec, &values, vec![aws_shared]).await;
+    let mut term = Term::default();
+    let answers: Vec<String> = replacements.clone();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_manual(
+                ReplacementSource::Prompt(Box::new(ScriptedPrompt::new(answers))),
+                &mut term,
+            )
+            .run_all(&requested)
+            .await
+    };
+    BatchRun {
+        p,
+        term,
+        outcomes,
+        leaked,
+        replacements,
+        aws,
+    }
+}
+
+/// T4's run: three seeded rotations, every revoke request rate-limited.
+async fn t4_run(rec: &CallRecorder) -> BatchRun {
+    mount_revoke_limited(rec).await;
+    let leaked: Vec<String> = (0..3).map(|i| classic(&format!("t4Lk{i}"))).collect();
+    mount_leaked(rec, &leaked).await;
+    let values: Vec<&str> = leaked.iter().map(String::as_str).collect();
+    let mut p = pipeline_many(rec, &values, Vec::new()).await;
+    for value in &values {
+        seed_verified(&mut p, value);
+    }
+    let mut term = Term::default();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_clock(fixed_clock)
+            .with_manual(ReplacementSource::Supplied(None), &mut term)
+            .run_all(&requested)
+            .await
+    };
+    BatchRun {
+        p,
+        term,
+        outcomes,
+        leaked,
+        replacements: Vec::new(),
+        aws: MockProvider::new("aws"),
+    }
+}
+
+// SHA-286 T1 (AC1): five GitHub rotations and one AWS rotation in one
+// apply: one unauthenticated POST with exactly the five leaked tokens, one
+// revoke call for the AWS key, six revoked outcomes in input order.
+#[tokio::test]
+async fn sha286_t1_five_github_and_one_aws_revoke_in_one_post() {
+    let rec = CallRecorder::start().await;
+    let run = t1_run(&rec).await;
+    let sent = revokes(&rec).await;
+    assert_eq!(sent.len(), 1, "one request: {sent:?}");
+    let (body, authorized) = &sent[0];
+    assert_eq!(body, &serde_json::json!({ "credentials": run.leaked }));
+    assert!(
+        !authorized,
+        "the revocation API must be called without auth"
+    );
+
+    let aws_rotation = run.p.rotation("mock_aws_sha286_t1_key");
+    let aws_revokes: Vec<_> = run
+        .aws
+        .call_log()
+        .calls()
+        .into_iter()
+        .filter(|c| c.method == "revoke")
+        .collect();
+    assert_eq!(aws_revokes.len(), 1, "{aws_revokes:?}");
+    assert_eq!(
+        aws_revokes[0].fingerprint.as_ref(),
+        Some(&aws_rotation.fingerprint)
+    );
+
+    assert_eq!(run.outcomes.len(), 6);
+    let mut values: Vec<&str> = run.leaked.iter().map(String::as_str).collect();
+    values.push("mock_aws_sha286_t1_key");
+    for (outcome, value) in run.outcomes.iter().zip(&values) {
+        assert_eq!(
+            outcome.fingerprint,
+            SecretValue::from(*value).fingerprint(),
+            "input order"
+        );
+        assert_eq!(outcome.result, RunResult::Revoked, "{value}");
+    }
+    assert_eq!(apply::run_status(&run.outcomes), apply::RunStatus::Done);
+    assert!(
+        run.term
+            .err
+            .contains("revoking 5 github tokens in one request"),
+        "{}",
+        run.term.err
+    );
+    for (i, value) in run.replacements.iter().enumerate() {
+        assert_eq!(
+            run.p.gha.current(&format!("gha:acme/app{i}:GH_TOKEN")),
+            Some(SecretValue::from(value.as_str()).fingerprint())
+        );
+    }
+}
+
+// SHA-286 T2 (AC2): 1001 tokens go in two requests, 1000 then 1.
+#[tokio::test]
+async fn sha286_t2_revoke_batch_chunks_1001_tokens() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let creds: Vec<Credential> = (0..REVOKE_BATCH + 1)
+        .map(|i| cred(&classic(&format!("c{i:05}"))))
+        .collect();
+    let refs: Vec<&Credential> = creds.iter().collect();
+    let results = provider(&rec).revoke_batch(&refs).await;
+    let sizes: Vec<usize> = revokes(&rec)
+        .await
+        .iter()
+        .map(|(body, _)| body["credentials"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, [REVOKE_BATCH, 1]);
+    assert_eq!(results.len(), REVOKE_BATCH + 1);
+    assert!(results
+        .iter()
+        .all(|r| r == &Ok(Revoked { restore_ref: None })));
+}
+
+// SHA-286 T3 (AC3): a batch still writes one revoke entry and one record
+// per rotation, and no token reaches the audit log or the state file.
+#[tokio::test]
+async fn sha286_t3_batch_writes_one_revoke_entry_and_record_each() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let leaked: Vec<String> = (0..3).map(|i| classic(&format!("t3Lk{i}"))).collect();
+    mount_leaked(&rec, &leaked).await;
+    let values: Vec<&str> = leaked.iter().map(String::as_str).collect();
+    let mut p = pipeline_many(&rec, &values, Vec::new()).await;
+    let ids: Vec<String> = values.iter().map(|v| seed_verified(&mut p, v)).collect();
+    let mut term = Term::default();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_manual(ReplacementSource::Supplied(None), &mut term)
+            .run_all(&requested)
+            .await
+    };
+    assert!(outcomes.iter().all(|o| o.result == RunResult::Revoked));
+    assert_eq!(revokes(&rec).await.len(), 1);
+
+    let revoke_entries: Vec<_> = p
+        .audit_entries()
+        .into_iter()
+        .filter(|e| e.step == AuditStep::Revoke)
+        .collect();
+    assert_eq!(revoke_entries.len(), 3, "{revoke_entries:?}");
+    assert!(revoke_entries.iter().all(|e| e.outcome == AuditOutcome::Ok));
+    let mut logged: Vec<(String, String)> = revoke_entries
+        .iter()
+        .map(|e| (e.rotation_id.clone(), e.fingerprint.to_string()))
+        .collect();
+    let mut planned: Vec<(String, String)> = values
+        .iter()
+        .map(|v| {
+            let r = p.rotation(v);
+            (r.rotation_id.clone(), r.fingerprint.to_string())
+        })
+        .collect();
+    logged.sort();
+    planned.sort();
+    assert_eq!(logged, planned);
+    for id in &ids {
+        assert_eq!(p.store.get(id).unwrap().step, Step::Revoked);
+    }
+    let (audit, state) = (p.audit_text(), p.state_text());
+    for value in &leaked {
+        assert!(!audit.contains(value.as_str()), "token in the audit log");
+        assert!(!state.contains(value.as_str()), "token in the state file");
+    }
+}
+
+// SHA-286 T4 (AC4), provider level: a rate-limited request stops the batch;
+// the later chunk is never sent and gets the same error.
+#[tokio::test]
+async fn sha286_t4_rate_limited_chunk_stops_the_batch() {
+    let rec = CallRecorder::start().await;
+    mount_revoke_limited(&rec).await;
+    let creds: Vec<Credential> = (0..REVOKE_BATCH + 1)
+        .map(|i| cred(&classic(&format!("r{i:05}"))))
+        .collect();
+    let refs: Vec<&Credential> = creds.iter().collect();
+    let results = provider(&rec).revoke_batch(&refs).await;
+    assert_eq!(revokes(&rec).await.len(), 1, "the second chunk was sent");
+    assert_eq!(results.len(), REVOKE_BATCH + 1);
+    let limited = Err(ProviderError::RateLimited {
+        retry_after: Some(Duration::from_secs(1800)),
+    });
+    assert!(results.iter().all(|r| r == &limited));
+}
+
+// SHA-286 T4 (AC4), through the executor: every rotation of the batch
+// fails at revoke with the time to re-run, nothing is retried, exit 1.
+#[tokio::test]
+async fn sha286_t4_rate_limited_revoke_fails_every_rotation() {
+    let rec = CallRecorder::start().await;
+    let run = t4_run(&rec).await;
+    assert_eq!(revokes(&rec).await.len(), 1, "nothing is retried");
+    let at = (fixed_clock() + time::Duration::minutes(30))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    for outcome in &run.outcomes {
+        match &outcome.result {
+            RunResult::Failed {
+                step: AuditStep::Revoke,
+                error,
+            } => {
+                assert!(
+                    error.as_str().contains("re-run rotate apply after"),
+                    "{error}"
+                );
+                assert!(error.as_str().contains(&at), "{error}");
+                assert!(error.as_str().contains("(in 30m 0s)"), "{error}");
+            }
+            other => panic!("expected a failed revoke, got {other:?}"),
+        }
+        let stored = run.p.store.get(&outcome.rotation_id).unwrap();
+        assert_eq!(stored.step, Step::Failed);
+        assert_eq!(stored.failed_step, Some(AuditStep::Revoke));
+    }
+    assert_eq!(apply::run_status(&run.outcomes), apply::RunStatus::Failed);
+    let summary = apply::render_summary(&run.outcomes);
+    assert!(summary.contains(&at), "{summary}");
+    assert!(summary.contains("3 failed"), "{summary}");
+}
+
+// SHA-286 T5 (AC5): only rotations that passed their gate enter the batch;
+// pending, held and failed ones are left out.
+#[tokio::test]
+async fn sha286_t5_only_gate_passed_rotations_enter_the_batch() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let leaked: Vec<String> = ["t5Pend", "t5Held", "t5Fail", "t5Redy"]
+        .iter()
+        .map(|t| classic(t))
+        .collect();
+    mount_leaked(&rec, &leaked).await;
+    let failing = classic("t5FailN");
+    let ready = classic("t5RedyN");
+    // Answers the paste check only; verify then gets the catch-all empty
+    // 200, which does not decode.
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .and(header("authorization", bearer(&failing).as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "login": "octocat", "id": 1 })),
+        )
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(rec.server())
+        .await;
+    mount_user(&rec, &ready, "octocat", Some("repo")).await;
+    let values: Vec<&str> = leaked.iter().map(String::as_str).collect();
+    let mut p = pipeline_many(&rec, &values, Vec::new()).await;
+
+    let pending = seed_verified(&mut p, values[0]);
+    let mut record = p.store.get(&pending).unwrap().clone();
+    record.step = Step::PendingRevoke;
+    record.revoke_not_before = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+    p.store.upsert(record).unwrap();
+    // A not-updatable consumer leaves the record verified with that
+    // consumer skipped, so the gate holds the revoke.
+    let held = seed_verified(&mut p, values[1]);
+    let mut record = p.store.get(&held).unwrap().clone();
+    record.consumers[0].status = ConsumerStatus::Skipped;
+    p.store.upsert(record).unwrap();
+
+    let mut term = Term::default();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_manual(
+                ReplacementSource::Prompt(Box::new(ScriptedPrompt::new([
+                    failing.clone(),
+                    ready.clone(),
+                ]))),
+                &mut term,
+            )
+            .run_all(&requested)
+            .await
+    };
+    let sent = revokes(&rec).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, serde_json::json!({ "credentials": [values[3]] }));
+    assert!(
+        matches!(outcomes[0].result, RunResult::PendingRevoke { .. }),
+        "{:?}",
+        outcomes[0].result
+    );
+    assert!(
+        matches!(outcomes[1].result, RunResult::Held { .. }),
+        "{:?}",
+        outcomes[1].result
+    );
+    assert!(
+        matches!(
+            outcomes[2].result,
+            RunResult::Failed {
+                step: AuditStep::Verify,
+                ..
+            }
+        ),
+        "{:?}",
+        outcomes[2].result
+    );
+    assert_eq!(outcomes[3].result, RunResult::Revoked);
+}
+
+// SHA-286 T6 (AC6), provider level: an installation token is refused in
+// place and left out of the request.
+#[tokio::test]
+async fn sha286_t6_revoke_batch_leaves_out_installation_tokens() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let values = [
+        token(["gh", "s_"], "t6Inst"),
+        classic("t6Clas1"),
+        classic("t6Clas2"),
+    ];
+    let creds: Vec<Credential> = values.iter().map(|v| cred(v)).collect();
+    let refs: Vec<&Credential> = creds.iter().collect();
+    let results = provider(&rec).revoke_batch(&refs).await;
+    let sent = revokes(&rec).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].0,
+        serde_json::json!({ "credentials": [values[1], values[2]] })
+    );
+    let refused = results[0].as_ref().unwrap_err();
+    assert_eq!(
+        refused.base(),
+        &ProviderError::Unsupported(INSTALLATION_UNSUPPORTED.into())
+    );
+    assert_eq!(refused.guidance(), Some(INSTALLATION_UNSUPPORTED));
+    assert!(results[1].is_ok() && results[2].is_ok());
+}
+
+// SHA-286 T6 (AC6), through the executor: an installation token whose
+// scope does not name its type reaches the batch, is refused there and
+// ends as a revoke by hand; the others are revoked in one request.
+#[tokio::test]
+async fn sha286_t6_installation_token_in_a_batch_is_by_hand() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let installation = token(["gh", "s_"], "t6InEx");
+    mount_installation(&rec, &installation).await;
+    let others = [classic("t6ExCl1"), classic("t6ExCl2")];
+    mount_leaked(&rec, &others).await;
+    let values = [
+        installation.as_str(),
+        others[0].as_str(),
+        others[1].as_str(),
+    ];
+    let mut p = pipeline_many(&rec, &values, Vec::new()).await;
+    for value in values {
+        seed_verified(&mut p, value);
+    }
+    let fp = SecretValue::from(installation.as_str()).fingerprint();
+    for rotation in &mut p.plan.rotations {
+        if rotation.fingerprint == fp {
+            if let Some(scope) = rotation.scope.as_mut() {
+                scope.lines.retain(|l| !l.starts_with("type: "));
+            }
+        }
+    }
+    assert_eq!(
+        p.providers
+            .get("github")
+            .unwrap()
+            .manual_revoke(p.rotation(&installation).scope.as_ref()),
+        None
+    );
+    let mut term = Term::default();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_manual(ReplacementSource::Supplied(None), &mut term)
+            .run_all(&requested)
+            .await
+    };
+    match &outcomes[0].result {
+        RunResult::RevokeManual { instructions } => {
+            assert!(
+                instructions.as_str().contains(INSTALLATION_UNSUPPORTED),
+                "{instructions}"
+            );
+        }
+        other => panic!("expected a revoke by hand, got {other:?}"),
+    }
+    assert_eq!(outcomes[1].result, RunResult::Revoked);
+    assert_eq!(outcomes[2].result, RunResult::Revoked);
+    let sent = revokes(&rec).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].0,
+        serde_json::json!({ "credentials": [others[0], others[1]] })
+    );
+}
+
+/// Answers `POST /credentials/revoke` with 202 after noting what the audit
+/// log held at that moment: whether every forced rotation has a `force`
+/// entry, and whether any `revoke` entry is `ok` yet.
+struct AuditAtRevoke {
+    audit: std::path::PathBuf,
+    forced: Vec<String>,
+    seen: Arc<Mutex<Option<(bool, bool)>>>,
+}
+
+impl Respond for AuditAtRevoke {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let entries: Vec<rotate::audit::AuditEntry> = rotate::audit::read_all(&self.audit)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let forced = self.forced.iter().all(|id| {
+            entries
+                .iter()
+                .any(|e| &e.rotation_id == id && e.step == AuditStep::Force)
+        });
+        let revoked = entries
+            .iter()
+            .any(|e| e.step == AuditStep::Revoke && e.outcome == AuditOutcome::Ok);
+        *self.seen.lock().unwrap() = Some((forced, revoked));
+        ResponseTemplate::new(202).set_body_json(serde_json::json!({}))
+    }
+}
+
+// SHA-286 T7 (AC7): every `force` entry of a batch is on record before the
+// request is sent.
+#[tokio::test]
+async fn sha286_t7_force_is_recorded_before_the_batch_request() {
+    let rec = CallRecorder::start().await;
+    let leaked: Vec<String> = (0..2).map(|i| classic(&format!("t7Lk{i}"))).collect();
+    mount_leaked(&rec, &leaked).await;
+    let values: Vec<&str> = leaked.iter().map(String::as_str).collect();
+    let mut p = pipeline_many(&rec, &values, Vec::new()).await;
+    let mut ids = Vec::new();
+    for value in &values {
+        let id = seed_verified(&mut p, value);
+        let mut record = p.store.get(&id).unwrap().clone();
+        record.consumers[0].status = ConsumerStatus::Skipped;
+        p.store.upsert(record).unwrap();
+        ids.push(id);
+    }
+    let seen = Arc::new(Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path("/credentials/revoke"))
+        .respond_with(AuditAtRevoke {
+            audit: p.dir.path().join("audit.jsonl"),
+            forced: ids.clone(),
+            seen: seen.clone(),
+        })
+        .with_priority(2)
+        .mount(rec.server())
+        .await;
+    let mut term = Term::default();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_force(true)
+            .with_manual(ReplacementSource::Supplied(None), &mut term)
+            .run_all(&requested)
+            .await
+    };
+    assert!(outcomes.iter().all(|o| o.result == RunResult::Revoked));
+    assert_eq!(revokes(&rec).await.len(), 1);
+    assert_eq!(*seen.lock().unwrap(), Some((true, false)));
+    for id in &ids {
+        assert!(p.store.get(id).unwrap().force);
+    }
+    let steps: Vec<AuditStep> = p
+        .audit_entries()
+        .into_iter()
+        .map(|e| e.step)
+        .filter(|s| matches!(s, AuditStep::Force | AuditStep::Revoke))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            AuditStep::Force,
+            AuditStep::Force,
+            AuditStep::Revoke,
+            AuditStep::Revoke
+        ]
+    );
+}
+
+// SHA-286 T8 (AC8): with --wait, the GitHub group waits once, for the
+// latest window, then sends one request.
+#[tokio::test]
+async fn sha286_t8_wait_sends_one_batch_after_the_latest_window() {
+    let rec = CallRecorder::start().await;
+    mount_revoke(&rec, 202).await;
+    let leaked: Vec<String> = (0..2).map(|i| classic(&format!("t8Lk{i}"))).collect();
+    mount_leaked(&rec, &leaked).await;
+    let values: Vec<&str> = leaked.iter().map(String::as_str).collect();
+    let mut p = pipeline_many(&rec, &values, Vec::new()).await;
+    let started = std::time::Instant::now();
+    let now = time::OffsetDateTime::now_utc();
+    let mut ids = Vec::new();
+    for (i, value) in values.iter().enumerate() {
+        let id = seed_verified(&mut p, value);
+        let mut record = p.store.get(&id).unwrap().clone();
+        record.step = Step::PendingRevoke;
+        record.revoke_not_before = Some(now + time::Duration::seconds(i as i64 + 1));
+        p.store.upsert(record).unwrap();
+        ids.push(id);
+    }
+    let mut term = Term::default();
+    let outcomes = {
+        let requested = pick(&p.plan, &values);
+        Executor::new(&p.providers, &p.consumers, &mut p.store, &mut p.audit)
+            .with_wait(true)
+            .with_manual(ReplacementSource::Supplied(None), &mut term)
+            .run_all(&requested)
+            .await
+    };
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let sent = revokes(&rec).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, serde_json::json!({ "credentials": values }));
+    assert!(outcomes.iter().all(|o| o.result == RunResult::Revoked));
+    for id in &ids {
+        assert_eq!(p.store.get(id).unwrap().step, Step::Revoked);
+    }
+    assert_eq!(term.err.matches("waiting until").count(), 1, "{}", term.err);
+    let notice = term
+        .err
+        .lines()
+        .find(|l| l.contains("waiting until"))
+        .unwrap();
+    assert!(
+        ids.iter().all(|id| notice.contains(id.as_str())),
+        "{notice}"
+    );
+    assert!(
+        term.err.contains("revoking 2 github tokens in one request"),
+        "{}",
+        term.err
+    );
+}
+
+/// Every place a batch run could have written `value`, by label.
+fn places(run: &BatchRun, logs: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("summary", apply::render_summary(&run.outcomes)),
+        ("stdout", run.term.out.clone()),
+        ("stderr", run.term.err.clone()),
+        ("audit log", run.p.audit_text()),
+        ("state file", run.p.state_text()),
+        ("logs", logs.to_owned()),
+        ("outcomes", format!("{:?}", run.outcomes)),
+    ]
+}
+
+/// On the wire, a leaked token is only in the revoke body and in the
+/// `Authorization` of the read-only checks; a replacement only in the
+/// `Authorization` of `GET /user`.
+async fn assert_wire_clean(rec: &CallRecorder, leaked: &[String], replacements: &[String]) {
+    for req in rec.server().received_requests().await.unwrap() {
+        let target = format!("{} {}", req.method, req.url.path());
+        let body = String::from_utf8_lossy(&req.body);
+        let auth = req
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap_or("").to_owned())
+            .unwrap_or_default();
+        for (name, value) in &req.headers {
+            if name.as_str() != "authorization" {
+                let value = value.to_str().unwrap_or("");
+                for secret in leaked.iter().chain(replacements) {
+                    assert!(!value.contains(secret.as_str()), "token in header {name}");
+                }
+            }
+        }
+        for value in leaked {
+            if body.contains(value.as_str()) {
+                assert_eq!(target, "POST /credentials/revoke", "leaked token in a body");
+            }
+            if auth.contains(value.as_str()) {
+                assert!(
+                    target == "GET /user" || target == "GET /user/orgs",
+                    "leaked token signed {target}"
+                );
+            }
+        }
+        for value in replacements {
+            assert!(!body.contains(value.as_str()), "new token in {target} body");
+            if auth.contains(value.as_str()) {
+                assert_eq!(target, "GET /user", "new token signed {target}");
+            }
+        }
+    }
+}
+
+// SHA-286 T10 (AC1, AC4): the T1 and T4 runs under a TRACE capture. No
+// leaked or replacement token appears in the summary, the terminal, the
+// audit log, the state file, the logs or the outcomes' Debug output, and
+// on the wire each appears only where it must.
+#[tokio::test]
+async fn sha286_t10_batch_revoke_never_leaks() {
+    let capture = trace_capture();
+    let rec = CallRecorder::start().await;
+    let t1 = t1_run(&rec).await;
+    assert!(t1.outcomes.iter().all(|o| o.result == RunResult::Revoked));
+    let rec4 = CallRecorder::start().await;
+    let t4 = t4_run(&rec4).await;
+    assert!(t4
+        .outcomes
+        .iter()
+        .all(|o| matches!(o.result, RunResult::Failed { .. })));
+    let logs = capture.contents();
+    assert!(!logs.is_empty(), "the TRACE capture saw nothing");
+
+    let aws_value = "mock_aws_sha286_t1_key".to_owned();
+    for (run, extra) in [(&t1, Some(&aws_value)), (&t4, None)] {
+        let places = places(run, &logs);
+        for value in run.leaked.iter().chain(&run.replacements).chain(extra) {
+            for (label, text) in &places {
+                assert!(!text.contains(value.as_str()), "token in {label}");
+            }
+        }
+    }
+    assert_wire_clean(&rec, &t1.leaked, &t1.replacements).await;
+    assert_wire_clean(&rec4, &t4.leaked, &[]).await;
 }
 
 /// Labels the recorder's state-changing calls by method and path.
