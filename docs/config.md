@@ -44,6 +44,7 @@ Other environment variables rotate reads:
 | `ROTATE_ACTOR` | The actor recorded in the audit log. Default `user@hostname`. |
 | `ROTATE_GITHUB_TOKEN`, then `GITHUB_TOKEN` | Operator token for GitHub Actions secrets. |
 | `ROTATE_NPM_TOKEN`, then `NPM_TOKEN` | Operator token for npm (an `npm login` session token). |
+| `ROTATE_NPM_OTP` | A one-time password for one npm token delete, read only when npm asks for one. Without it rotate asks on the terminal. |
 | `OPENAI_ADMIN_KEY` | OpenAI Admin API key; the name is set by `providers.openai.admin_key_env`. |
 | `AWS_*` | The standard AWS credential chain and region. |
 

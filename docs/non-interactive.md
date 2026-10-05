@@ -105,6 +105,12 @@ jq -e '.rotations | length == 0' plan.json
   resume, `status` and `rollback` need it.
 - `--stdin`, `--provider`, `--format`, `--concurrency`,
   `--check-permissions`, `--verbose`: as in [usage.md](usage.md#8-flags).
+- `ROTATE_NPM_OTP`: a one-time password for an npm account that asks for
+  one to delete a token. It serves one delete and is valid about 30
+  seconds, so mint it moments before the run; it only fits a run that
+  revokes at once (no overlap window, or the re-run after it), not
+  `--wait`. Without it a run with no terminal fails at revoke, naming the
+  page to delete the token on.
 
 Set `ROTATE_ACTOR` so the audit log says which job acted, for example
 `ROTATE_ACTOR=github-actions/acme/api/run-1234`. Without it the actor is

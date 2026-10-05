@@ -205,7 +205,9 @@ For each confirmed rotation, in this order:
 1. **create** the replacement (or, in manual mode, ask you to paste it);
 2. **update** every consumer the plan listed;
 3. **verify** that the replacement works and belongs to the same owner;
-4. **revoke** the old secret, last.
+4. **revoke** the old secret, last. An npm account that asks for a
+   one-time password to delete tokens gets a hidden prompt here (or
+   `ROTATE_NPM_OTP`); see [permissions.md](permissions.md).
 
 State is saved after every step and every step is appended to the audit
 log. If any step before revoke fails, that rotation stops, the old secret is
