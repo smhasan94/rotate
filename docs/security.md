@@ -177,6 +177,11 @@ What rotate does not protect against:
   secret transformed in a way rotate does not know (re-encoded, split
   across writes by another tool) is not recognised. rotate's own output
   never does that, but a wrapper script that echoes the report might.
+- **Short values.** The redactor ignores values shorter than 8 bytes, so it
+  cannot catch a one-time password (npm's are six digits). rotate keeps
+  such a code in zeroized memory, sends it only in a header marked
+  sensitive, never writes it into any message, and drops it after the one
+  request.
 - **Fingerprints of weak secrets.** The fingerprint is an unsalted digest.
   It is safe for the four providers' random tokens; it would not be safe
   for a short or guessable secret.

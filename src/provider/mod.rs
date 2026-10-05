@@ -11,6 +11,7 @@ pub mod github;
 pub mod mock;
 pub mod npm;
 pub mod openai;
+pub mod otp;
 
 use std::fmt;
 use std::sync::Arc;

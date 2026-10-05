@@ -47,6 +47,7 @@ use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -59,6 +60,7 @@ use crate::console::Console;
 use crate::consumer::ConsumerRegistry;
 use crate::input::{self, ReplacementInputError, REPLACEMENT_MAX};
 use crate::plan::{Plan, PlannedRotation, Skipped};
+use crate::provider::otp::{self, OtpError, OtpSource};
 use crate::provider::{
     Credential, Provider, ProviderError, ProviderRegistry, Replacement, ReplacementMode, Validity,
 };
@@ -333,6 +335,88 @@ impl Prompt for ScriptedPrompt {
         Ok(SecretValue::from(
             self.answers.pop_front().unwrap_or_default(),
         ))
+    }
+}
+
+/// A one-time password typed at a hidden prompt (SHA-288), for a provider
+/// that npm challenges on a token delete. The read blocks, so it runs on
+/// the blocking pool: the binary's runtime has one thread, and the HTTP
+/// client must keep running. The question goes to stderr like every other
+/// question. No terminal is [`OtpError::NoSource`].
+pub struct PromptOtp {
+    prompt: Arc<Mutex<Box<dyn Prompt + Send>>>,
+    term: Arc<Mutex<Box<dyn Terminal + Send>>>,
+}
+
+impl PromptOtp {
+    /// Asks `prompt`, writing the question to `term`.
+    pub fn new(prompt: Box<dyn Prompt + Send>, term: Box<dyn Terminal + Send>) -> Self {
+        Self {
+            prompt: Arc::new(Mutex::new(prompt)),
+            term: Arc::new(Mutex::new(term)),
+        }
+    }
+
+    /// Asks `prompt`, with the question on stderr.
+    pub fn with_prompt(prompt: Box<dyn Prompt + Send>) -> Self {
+        Self::new(prompt, Box::new(StdTerminal))
+    }
+
+    /// Asks on `/dev/tty`, opened only when a code is needed, with the
+    /// question on stderr.
+    pub fn tty() -> Self {
+        Self::with_prompt(Box::new(TtyPrompt::new()))
+    }
+}
+
+impl fmt::Debug for PromptOtp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PromptOtp").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl OtpSource for PromptOtp {
+    async fn one_time_password(&self, question: &str) -> Result<SecretValue, OtpError> {
+        let prompt = Arc::clone(&self.prompt);
+        let term = Arc::clone(&self.term);
+        let question = question.to_owned();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut prompt = prompt.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut term = term.lock().unwrap_or_else(PoisonError::into_inner);
+            prompt.read_secret(&question, &mut **term)
+        })
+        .await
+        .map_err(|_| OtpError::Failed("the one-time password prompt stopped".to_owned()))?;
+        match read {
+            Ok(typed) => {
+                let code = typed.expose_secret(|b| SecretValue::new(b.trim_ascii().to_vec()));
+                drop(typed);
+                otp::check(code, "the typed one-time password is empty or not usable")
+            }
+            Err(PromptError::NoTerminal | PromptError::NoTerminalForSecret) => {
+                Err(OtpError::NoSource)
+            }
+            Err(err) => Err(OtpError::Failed(err.to_string())),
+        }
+    }
+}
+
+/// The process's stdout and stderr as a [`Terminal`], each message
+/// redacted, for a prompt that has no [`Console`] to borrow.
+struct StdTerminal;
+
+impl Terminal for StdTerminal {
+    fn stdout(&mut self, text: &str) {
+        let mut out = crate::redact::RedactingWriter::new(io::stdout());
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+    }
+
+    fn stderr(&mut self, text: &str) {
+        let mut err = crate::redact::RedactingWriter::new(io::stderr());
+        let _ = err.write_all(text.as_bytes());
+        let _ = err.flush();
     }
 }
 
@@ -2305,6 +2389,47 @@ mod tests {
     }
 
     // SHA-258: where each recorded step resumes.
+    /// SHA-288: no terminal is "no source", so a chain falls through to
+    /// the plain failure; a typed code is trimmed; an empty one is refused.
+    #[tokio::test]
+    async fn prompt_otp_without_terminal_is_no_source() {
+        struct Gone;
+        impl Prompt for Gone {
+            fn read_line(&mut self) -> Result<String, PromptError> {
+                Err(PromptError::NoTerminal)
+            }
+            fn read_secret(
+                &mut self,
+                _: &str,
+                _: &mut dyn Terminal,
+            ) -> Result<SecretValue, PromptError> {
+                Err(PromptError::NoTerminalForSecret)
+            }
+        }
+        #[derive(Default)]
+        struct Quiet;
+        impl Terminal for Quiet {
+            fn stdout(&mut self, _: &str) {}
+            fn stderr(&mut self, _: &str) {}
+        }
+        let none = PromptOtp::new(Box::new(Gone), Box::new(Quiet));
+        assert_eq!(
+            none.one_time_password("q").await.unwrap_err(),
+            OtpError::NoSource
+        );
+        let typed = PromptOtp::new(
+            Box::new(ScriptedPrompt::new([" 271828\r"])),
+            Box::new(Quiet),
+        );
+        let code = typed.one_time_password("q").await.unwrap();
+        assert!(code.expose_secret(|b| b == b"271828"));
+        let empty = PromptOtp::new(Box::new(ScriptedPrompt::new([""])), Box::new(Quiet));
+        assert!(matches!(
+            empty.one_time_password("q").await.unwrap_err(),
+            OtpError::Failed(_)
+        ));
+    }
+
     #[test]
     fn resume_points() {
         let mut r = Rotation::new("rot-1", "npm", fp("npm_resume_points"));

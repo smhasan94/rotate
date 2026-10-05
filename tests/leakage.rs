@@ -708,8 +708,51 @@ fn t1_mock_rollback_unsupported_restore() {
     );
     run.consumers_hold(MOCK_REPLACEMENT);
     run.set(|s| s["providers"] = json!({ "npm": { "restore": "unsupported" } }));
-    run.run(&["rollback", "--stdin", "--confirm", &id]);
-    run.run(&["status", "--all"]);
+    // SHA-290 T8 (AC1): the old secret stays revoked, so exit 1.
+    run.expect(1, &["rollback", "--stdin", "--confirm", &id]);
+    assert_eq!(run.step(&id), "rolled_back");
+    let status = run.expect(0, &["status", "--all"]);
+    assert!(
+        text(&status.stdout).contains("the old secret stays revoked"),
+        "{}",
+        shown(&status)
+    );
+    run.expect(0, &["--json", "status", "--all"]);
+}
+
+// SHA-290 T8 (AC2): a rotation revoked by hand (no restore handle) rolled
+// back: consumers restored, replacement revoked, exit 1; every run swept.
+#[test]
+fn sha290_t8_rollback_after_revoke_by_hand_exits_1() {
+    let mut run = MockRun::new();
+    let said = echoing_instructions(&run, "manual_revoke");
+    run.set(|s| s["providers"] = json!({ "npm": { "manual_revoke": said } }));
+    let id = run.planned_id();
+    run.expect(
+        4,
+        &["--overlap", "0s", "apply", "--stdin", "--confirm", &id],
+    );
+    // Deleted by hand: apply records it revoked, with no handle.
+    run.set(|s| s["providers"]["npm"]["validity"] = json!("invalid"));
+    run.expect(0, &["apply", "--stdin", "--confirm", &id]);
+    assert_eq!(run.step(&id), "revoked");
+
+    let providers = run.scenario["providers"].clone();
+    run.consumers_hold(MOCK_REPLACEMENT);
+    run.set(|s| s["providers"] = providers);
+    let output = run.expect(1, &["rollback", "--stdin", "--confirm", &id]);
+    let out = text(&output.stdout);
+    assert!(out.contains("rollback will exit 1"), "{}", shown(&output));
+    assert!(
+        out.contains("1 with the old secret still revoked"),
+        "{}",
+        shown(&output)
+    );
+    assert_eq!(run.step(&id), "rolled_back");
+    run.expect(0, &["status", "--all"]);
+    run.expect(0, &["--json", "status", "--all"]);
+    // Finished: a second rollback has nothing to do.
+    run.expect(0, &["rollback", "--stdin", "--confirm", &id]);
 }
 
 // T1 (AC1): the panic and error paths. `__test-console` prints, fails or
@@ -1131,7 +1174,12 @@ async fn sha294_t2_reapply_during_the_overlap_window() {
             !table.contains("will not create a replacement"),
             "{label}: {table}"
         );
-        assert!(!table.contains("warning:"), "{label}: {table}");
+        // No scope warning in the rotation block; the run-level endpoint
+        // warnings under the header (SHA-287) are expected here.
+        assert!(
+            !table.lines().any(|l| l.starts_with("  warning:")),
+            "{label}: {table}"
+        );
         for consumer_ref in &refs {
             let row = table
                 .lines()
@@ -1530,4 +1578,246 @@ fn sweep_finds_every_encoding_at_every_alignment() {
     assert!(sweep.scan("s", b"nothing to see").is_empty());
     let hit = &sweep.scan("place", value.as_bytes())[0];
     assert!(!hit.to_string().contains(&value));
+}
+
+// ---------------------------------------------------------------------------
+// SHA-287 T8 (AC3): a credential in an endpoint URL's user info
+// ---------------------------------------------------------------------------
+
+/// A canary as the password (and user name) in each endpoint field's URL:
+/// the config is refused (exit 2) and the canary appears nowhere, in
+/// stdout, stderr at `-vvv` with `RUST_LOG=trace`, or any file rotate
+/// wrote. The config sits under `inputs/`, which the sweep skips.
+#[test]
+fn sha287_t8_userinfo_canary_stays_out_of_every_output() {
+    // URL-safe canaries, so they really are the URL's user info: `/` or
+    // `+` would end the authority and make them part of the path.
+    let url_safe =
+        |c: String| -> String { c.chars().filter(char::is_ascii_alphanumeric).collect() };
+    let password = url_safe(canary());
+    let user = url_safe(canary());
+    assert!(password.len() >= 16 && user.len() >= 16);
+    let sweep = Sweep::new(&[
+        Canary::new("URL password", &password),
+        Canary::new("URL user name", &user),
+    ]);
+    let urls = [
+        format!("https://{user}:{password}@api.example.com"),
+        format!("http://{user}:{password}@localhost:4873"),
+        format!("https://:{password}@api.example.com"),
+    ];
+    let templates = [
+        "providers:\n  aws:\n    endpoint_url: \"{}\"\n",
+        "providers:\n  github:\n    api_url: \"{}\"\n",
+        "providers:\n  npm:\n    registry: \"{}\"\n",
+        "providers:\n  openai:\n    api_url: \"{}\"\n",
+    ];
+    for template in templates {
+        for url in &urls {
+            let run = MockRun::new();
+            let config = run.path("inputs/rotate.yaml");
+            std::fs::write(&config, template.replace("{}", url)).unwrap();
+            let config = config.to_str().unwrap();
+            let output = run.expect(2, &["--config", config, "plan", "--stdin"]);
+            assert!(
+                text(&output.stderr).contains("must not embed credentials"),
+                "{}",
+                shown(&output)
+            );
+            let mut hits = sweep.scan("stdout", &output.stdout);
+            hits.extend(sweep.scan("stderr", &output.stderr));
+            hits.extend(sweep.scan_dir(run.root.path(), &[run.path("inputs")]));
+            assert_no_hits("a config with credentials in a URL", &hits);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-288 T8 (AC8): the npm one-time password through the binary
+// ---------------------------------------------------------------------------
+
+/// An `npm_` token built from canary characters: 36 alphanumerics.
+fn npm_canary() -> String {
+    let body: String = canary_of(96)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(36)
+        .collect();
+    assert_eq!(body.len(), 36);
+    format!("npm_{body}")
+}
+
+/// The release code path of `rotate apply` with the real npm plugin against
+/// a wiremock registry that challenges the token delete: once with the code
+/// in `ROTATE_NPM_OTP`, once typed at the (scripted) hidden prompt. The
+/// code is seven canary digits, under the redactor's minimum length, so
+/// this proves rotate never formats it. Every run is swept: stdout, stderr
+/// at `-vvv` with `RUST_LOG=trace`, and every file it wrote.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha288_t8_npm_otp_runs_are_clean() {
+    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for via_prompt in [false, true] {
+        let leaked = npm_canary();
+        let operator = npm_canary();
+        let replacement = npm_canary();
+        let code: String = format!("{}", 1_000_000 + (rng()() % 9_000_000));
+        let sweep = Sweep::new(&[
+            Canary::new("old secret", &leaked),
+            Canary::new("operator token", &operator),
+            Canary::new("replacement", &replacement),
+            Canary::new("one-time password", &code),
+        ]);
+
+        let server = MockServer::start().await;
+        for (token, user) in [
+            (&leaked, "alice"),
+            (&operator, "alice"),
+            (&replacement, "alice"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/-/whoami"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "username": user })))
+                .mount(&server)
+                .await;
+        }
+        let redacted = format!("{}...{}", &leaked[..8], &leaked[leaked.len() - 4..]);
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/tokens"))
+            .and(header(
+                "authorization",
+                format!("Bearer {operator}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "objects": [{
+                    "key": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "token": redacted,
+                    "readonly": false,
+                    "bypass_2fa": false,
+                    "created": "2026-09-01T00:00:00.000Z",
+                    "revoked": null
+                }],
+                "total": 1,
+                "urls": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+            .and(header("npm-otp", code.as_str()))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/-/npm/v1/tokens/token/"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", "OTP")
+                    .set_body_json(json!({ "error": "otp required" })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["work", "home", "tmp", "inputs"] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        let work = root.path().join("work");
+        let inputs = root.path().join("inputs");
+        let config = inputs.join("rotate.yaml");
+        std::fs::write(
+            &config,
+            format!("providers:\n  npm:\n    registry: {}\n", server.uri()),
+        )
+        .unwrap();
+        let mut scenario = json!({ "real_plugins": true, "prompt": "panic" });
+        if via_prompt {
+            scenario["npm_otp"] = json!({ "answers": [code] });
+        }
+        let scenario_path = inputs.join("scenario.json");
+        std::fs::write(&scenario_path, scenario.to_string()).unwrap();
+
+        let run = |args: &[&str]| -> Output {
+            let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("rotate"));
+            cmd.env_clear()
+                .current_dir(&work)
+                .env("HOME", root.path().join("home"))
+                .env("TMPDIR", root.path().join("tmp"))
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                .env("ROTATE_ACTOR", "leak@runner")
+                .env("ROTATE_TEST_SCENARIO", &scenario_path)
+                .env("ROTATE_NPM_TOKEN", &operator)
+                .env("NEW_NPM_TOKEN", &replacement)
+                .env("RUST_LOG", "trace");
+            if !via_prompt {
+                cmd.env("ROTATE_NPM_OTP", &code);
+            }
+            let mut child = cmd
+                .arg("-vvv")
+                .arg("--config")
+                .arg(&config)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                use std::io::Write;
+                let mut pipe = child.stdin.take().unwrap();
+                let _ = pipe.write_all(format!("{leaked}\n").as_bytes());
+            }
+            let output = child.wait_with_output().unwrap();
+            let label = args.join(" ");
+            let mut hits = sweep.scan(&format!("`{label}` stdout"), &output.stdout);
+            hits.extend(sweep.scan(&format!("`{label}` stderr"), &output.stderr));
+            hits.extend(sweep.scan_dir(root.path(), std::slice::from_ref(&inputs)));
+            assert_no_hits(&format!("`rotate {label}` (prompt: {via_prompt})"), &hits);
+            output
+        };
+
+        let plan = run(&["--json", "plan", "--stdin"]);
+        assert_eq!(plan.status.code(), Some(0), "{}", shown(&plan));
+        let plan: Value = serde_json::from_slice(&plan.stdout).unwrap();
+        let id = plan["rotations"][0]["rotation_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no rotation planned: {plan}"))
+            .to_owned();
+        let output = run(&[
+            "--overlap",
+            "0s",
+            "apply",
+            "--stdin",
+            "--confirm",
+            &id,
+            "--replacement-from-env",
+            "NEW_NPM_TOKEN",
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{}", shown(&output));
+        if via_prompt {
+            assert!(
+                text(&output.stderr).contains("One-time password for npm user alice"),
+                "{}",
+                shown(&output)
+            );
+        }
+        let deletes: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .collect();
+        assert_eq!(deletes.len(), 2, "prompt: {via_prompt}");
+        assert!(deletes[0].headers.get("npm-otp").is_none());
+        assert_eq!(
+            deletes[1].headers.get("npm-otp").unwrap().to_str().unwrap(),
+            code
+        );
+        assert_private_state(&work);
+    }
 }

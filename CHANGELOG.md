@@ -6,6 +6,64 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-05
+
+Safety fixes found after the first release, and npm one-time passwords.
+Two changes can affect scripts: `rotate rollback` now exits 1 when the
+restored consumers are left holding a revoked secret, and an `http://`
+endpoint URL to a host other than loopback is now refused.
+
+### Added
+
+- npm accounts that ask for a one-time password to delete tokens: at the
+  delete, rotate takes a code from `ROTATE_NPM_OTP` (one delete per run) or
+  a hidden prompt on the terminal naming the npm user, and retries once
+  with the `npm-otp` header. Rollback's delete of a replacement does the
+  same. Without a code, or with one npm rejects, the revoke still fails
+  safely, naming the page to delete the token on.
+
+### Changed
+
+- `rotate rollback` exits 1 when the old secret could not be reactivated
+  (GitHub, npm and OpenAI tokens, or after a revoke by hand): the restored
+  consumers hold a revoked secret. The summary counts such rotations apart
+  ("with the old secret still revoked") and names the consumers, the plan
+  warns before you confirm, `rotate status` says so in the hint, and an
+  interrupted rollback finished by a re-run exits 1 too. It used to exit 0
+  with only a warning.
+
+### Security
+
+- Endpoint URLs in `rotate.yaml` (`providers.aws.endpoint_url`,
+  `providers.github.api_url`, `providers.npm.registry`,
+  `providers.openai.api_url`) must be `https://`, except `http://` to a
+  loopback host, and must not carry a user name or password. A tampered
+  config could otherwise send new secrets and operator tokens in clear
+  text. The error never repeats the URL.
+- `rotate plan` and `rotate apply` print a `warning:` line for each
+  endpoint that differs from its default, before apply asks for
+  confirmation; `plan --json` adds a `warnings` array.
+
+### Known limits
+
+- Not yet tested against the live services: every test runs against mock
+  servers built from the providers' documentation. Run `rotate plan` first
+  and review the plan before `rotate apply`.
+- GitHub and npm tokens are rotated in manual replacement mode: you create
+  the new token and paste it. OpenAI keys are manual too, unless you opt in
+  to a broader replacement.
+- npm revoke needs an `npm login` session token as the operator token,
+  which lasts two hours. An account that asks for a one-time password
+  needs a terminal or `ROTATE_NPM_OTP` at the moment of the revoke, so an
+  unattended run with an overlap window cannot revoke it.
+- AWS keys are deactivated, not deleted. After a rollback the replacement
+  key stays inactive on the IAM user; delete it yourself.
+- OpenAI keys without an Admin API key, GitHub App installation tokens and
+  legacy-format GitHub tokens end in revoke by hand.
+- Each GitHub token is revoked with its own request; GitHub allows 60 an
+  hour, so an incident with more tokens than that needs several runs.
+- No `--json` for `apply` or `rollback` yet. No Windows build.
+
 ## [0.1.0] - 2026-10-04
 
 The first release: the MVP flow end to end, from a scanner report to a
@@ -76,5 +134,6 @@ revoked secret, for four providers and two consumers.
   needs `rotate rollback`, then `rotate apply` again.
 - No `--json` for `apply` or `rollback` yet. No Windows build.
 
-[Unreleased]: https://github.com/smhasan94/rotate/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/smhasan94/rotate/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/smhasan94/rotate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/smhasan94/rotate/releases/tag/v0.1.0

@@ -15,9 +15,9 @@ OpenAI API keys.
 
 ## Status
 
-v0.1.0 is the first release: the MVP flow end to end, with prebuilt Linux
-and macOS binaries (see [Install](#install)). What changed in each version
-is in [CHANGELOG.md](CHANGELOG.md).
+The latest release is v0.2.0. v0.1.0 was the first: the MVP flow end to
+end, with prebuilt Linux and macOS binaries (see [Install](#install)). What
+changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 What works now:
 
@@ -119,8 +119,10 @@ What works now:
   deactivated key), restores the old value in every consumer apply
   updated (consumers whose update failed or was skipped are left alone),
   and revokes the replacement. If the provider cannot reactivate the old
-  secret, consumers are still restored and a warning says the old secret
-  stays revoked; a pasted (manual) replacement has to be revoked by hand.
+  secret, consumers are still restored but hold a revoked secret: the
+  summary says so and rollback exits 1, so create a new credential and run
+  `rotate apply` again. A pasted (manual) replacement has to be revoked by
+  hand.
   Any error stops the rollback at that step, before the replacement is
   revoked, and exits 1; re-running continues from where it stopped without
   repeating a step, and a finished rollback (`rolled_back`) makes no call.
@@ -168,8 +170,9 @@ What works now:
   blocker. Apply
   asks for the new granular token in manual mode, checks it belongs to the
   same user, and deletes the leaked one by its token id. An account that
-  asks for a one-time password to delete tokens makes the revoke fail
-  safely, naming the page to delete it on. See
+  asks for a one-time password to delete tokens gets a hidden prompt at
+  that moment (or the code from `ROTATE_NPM_OTP`); without a code the
+  revoke fails safely, naming the page to delete it on. See
   [docs/permissions.md](docs/permissions.md).
 - OpenAI API keys (`sk-proj-`, `sk-svcacct-` and legacy `sk-` keys) are
   identified by prefix and checked with `GET /v1/models`. With an Admin API
@@ -258,7 +261,7 @@ checksum and installs it in `~/.local/bin`:
 
 <!-- install:start -->
 ```sh
-VERSION=0.1.0
+VERSION=0.2.0
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) TARGET=x86_64-unknown-linux-gnu ;;
   Linux-aarch64) TARGET=aarch64-unknown-linux-gnu ;;

@@ -66,6 +66,26 @@ fn openai_provider(
 /// operator token is read from the environment on first use.
 fn npm_provider(config: &rotate::config::NpmConfig) -> rotate::provider::npm::NpmProvider {
     rotate::provider::npm::NpmProvider::new(config.registry.as_str())
+        .with_otp_source(std::sync::Arc::new(npm_otp_source()))
+}
+
+/// Where a one-time password for an npm token delete comes from (SHA-288):
+/// `ROTATE_NPM_OTP` once, then a hidden prompt on the terminal. Nothing is
+/// read until npm asks.
+fn npm_otp_source() -> rotate::provider::otp::Chain {
+    use rotate::provider::otp::{Chain, EnvOtp};
+    let env = std::sync::Arc::new(EnvOtp::new(rotate::provider::npm::OTP_VAR));
+    Chain(vec![env, otp_prompt()])
+}
+
+/// The terminal half of [`npm_otp_source`]. With `test-providers`, the
+/// scenario's `npm_otp` decides, and without one there is no terminal, so
+/// no test can block on the developer's `/dev/tty`.
+fn otp_prompt() -> std::sync::Arc<dyn rotate::provider::otp::OtpSource> {
+    #[cfg(feature = "test-providers")]
+    return std::sync::Arc::new(scenario::otp_prompt());
+    #[cfg(not(feature = "test-providers"))]
+    std::sync::Arc::new(rotate::apply::PromptOtp::tty())
 }
 
 /// The AWS provider with the configured region and endpoint, if any.
@@ -244,6 +264,9 @@ mod scenario {
         call_log: Option<PathBuf>,
         consumer_state: Option<PathBuf>,
         prompt: Option<serde_json::Value>,
+        /// The npm one-time password prompt (SHA-288), with the grammar of
+        /// `prompt`; absent means no terminal.
+        npm_otp: Option<serde_json::Value>,
         clock_offset_secs: Option<i64>,
         /// Register the real plugins, as a release build does, instead of
         /// mocks (SHA-264). Only `prompt` applies then.
@@ -448,7 +471,20 @@ mod scenario {
 
     pub fn prompt() -> Option<Box<dyn Prompt>> {
         let setup = loaded().scenario.prompt.as_ref()?;
-        Some(match setup {
+        Some(prompt_from(setup))
+    }
+
+    /// The npm one-time password prompt (SHA-288) from `npm_otp`.
+    pub fn otp_prompt() -> rotate::apply::PromptOtp {
+        let prompt = match loaded().scenario.npm_otp.as_ref() {
+            Some(setup) => prompt_from(setup),
+            None => Box::new(NoTty),
+        };
+        rotate::apply::PromptOtp::with_prompt(prompt)
+    }
+
+    fn prompt_from(setup: &serde_json::Value) -> Box<dyn Prompt + Send> {
+        match setup {
             serde_json::Value::String(mode) if mode == "panic" => Box::new(PanicPrompt),
             serde_json::Value::String(mode) if mode == "no_tty" => Box::new(NoTty),
             serde_json::Value::Object(map) if map.contains_key("tty") => {
@@ -469,7 +505,7 @@ mod scenario {
                 Box::new(ScriptedPrompt::new(answers))
             }
             other => panic!("{ENV}: unknown prompt {other}"),
-        })
+        }
     }
 
     pub fn clock() -> Option<fn() -> time::OffsetDateTime> {
