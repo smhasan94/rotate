@@ -22,6 +22,11 @@ All notable changes to rotate are recorded here. The format follows
 - Homebrew: `brew install smhasan94/rotate/rotate` on macOS and Linux.
   Each release updates the formula in the smhasan94/homebrew-rotate tap.
   (SHA-339)
+- A GitHub Action (`uses: smhasan94/rotate@<version>`) that fetches
+  secret-scanning alerts with a token that can read them, runs `rotate
+  plan` on them and writes a job summary. Plan mode only: it makes no
+  state-changing call, and the alert body goes only to rotate's stdin.
+  See docs/github-action.md. (SHA-198)
 
 ### Changed
 
