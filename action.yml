@@ -1,0 +1,102 @@
+# rotate as a composite GitHub Action (SHA-198): fetch secret-scanning
+# alerts with the REST API and pipe them into `rotate plan`. Plan mode only:
+# it changes nothing. Usage, the token and the trigger patterns are in
+# docs/github-action.md.
+#
+# Inputs reach the scripts through `env:` only, never interpolated into
+# `run:` text, so a hostile dispatch payload cannot inject shell.
+name: rotate leaked secrets
+description: Plan the rotation of GitHub secret-scanning alerts with rotate; makes no change.
+author: smhasan94
+branding:
+  icon: refresh-cw
+  color: red
+
+inputs:
+  alert-number:
+    description: "Alert number(s), comma-separated, such as 42 or 42,43. Empty: plan the open alerts of the six supported secret types (first 100)."
+    required: false
+    default: ""
+  repository:
+    description: "owner/repo the alerts belong to."
+    required: false
+    default: ${{ github.repository }}
+  alerts-token:
+    description: "Token with Secret scanning alerts: read on the repository (a GitHub App installation token or a fine-grained PAT). The workflow's GITHUB_TOKEN cannot read alerts."
+    required: true
+  api-url:
+    description: "GitHub REST API base URL. https, or http to a loopback address."
+    required: false
+    default: ${{ github.api_url }}
+  version:
+    description: "rotate release to download and run. Ignored when rotate-binary is set."
+    required: false
+    default: "0.2.0"
+  rotate-binary:
+    description: "Path to a rotate binary to run instead of downloading a release."
+    required: false
+    default: ""
+  config:
+    description: "Path to rotate.yaml. A missing file is an error unless it is the default."
+    required: false
+    default: rotate.yaml
+  mode:
+    description: "plan, the only mode in this version: makes no change. apply is refused."
+    required: false
+    default: plan
+  verbose:
+    description: "rotate log verbosity, 0 to 3 (the number of -v flags). Logs are redacted."
+    required: false
+    default: "0"
+
+outputs:
+  rotation-ids:
+    description: "Comma-separated rotation ids from the plan; empty when there is nothing to rotate."
+    value: ${{ steps.plan.outputs.rotation-ids }}
+  plan-path:
+    description: "Path of plan.json, the `rotate plan --json` output (fingerprints and references only)."
+    value: ${{ steps.plan.outputs.plan-path }}
+  summary-path:
+    description: "Path of the Markdown written to the job summary."
+    value: ${{ steps.plan.outputs.summary-path }}
+  state-dir:
+    description: "Directory holding .rotate/state.json and .rotate/audit.jsonl for this run."
+    value: ${{ steps.plan.outputs.state-dir }}
+  exit-code:
+    description: "rotate's exit code, or the Action's own when rotate did not run."
+    value: ${{ steps.plan.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    # AC6: inputs are checked before any download or API request.
+    - id: inputs
+      shell: bash
+      env:
+        ALERTS_TOKEN: ${{ inputs.alerts-token }}
+        ALERT_NUMBER: ${{ inputs.alert-number }}
+        REPOSITORY: ${{ inputs.repository }}
+        API_URL: ${{ inputs.api-url }}
+        ROTATE_CONFIG_PATH: ${{ inputs.config }}
+        MODE: ${{ inputs.mode }}
+        VERBOSE: ${{ inputs.verbose }}
+      run: bash "$GITHUB_ACTION_PATH/action/run.sh" --check-inputs
+    - id: install
+      shell: bash
+      env:
+        ROTATE_VERSION: ${{ inputs.version }}
+        ROTATE_BINARY: ${{ inputs.rotate-binary }}
+      run: bash "$GITHUB_ACTION_PATH/action/install.sh"
+    - id: plan
+      shell: bash
+      env:
+        ROTATE_BIN: ${{ steps.install.outputs.path }}
+        ALERTS_TOKEN: ${{ inputs.alerts-token }}
+        ALERT_NUMBER: ${{ inputs.alert-number }}
+        REPOSITORY: ${{ inputs.repository }}
+        API_URL: ${{ inputs.api-url }}
+        ROTATE_CONFIG_PATH: ${{ inputs.config }}
+        MODE: ${{ inputs.mode }}
+        VERBOSE: ${{ inputs.verbose }}
+        ROTATE_ACTOR: github-actions/${{ github.repository }}/${{ github.run_id }}
+      run: bash "$GITHUB_ACTION_PATH/action/run.sh"

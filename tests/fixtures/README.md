@@ -18,6 +18,13 @@ output from a scan of a real repository here.
   alert elsewhere, a resolved alert, a base64-encoded alert, a
   webhook-shaped alert without `secret`, and an unsupported
   `github_ssh_private_key` alert whose value is not a key.
+- `alerts-server/` (SHA-198) is a directory tree that
+  `python3 -m http.server` serves as the secret-scanning alerts API for
+  `.github/workflows/action.yml`: `.../alerts/42` is alert 42, which
+  reuses the `ghp_` value of alert 1 in `github_alerts.json`, and
+  `.../alerts/index.html` is the empty list of open key-id alerts
+  (`http.server` drops the query string and redirects `alerts` to
+  `alerts/`).
 - `betterleaks.json`, `betterleaks_v2.json` and `betterleaks_v2.jsonl`
   (SHA-202) are real Betterleaks output for the files of `trufflehog.ndjson`
   (an AWS key pair, a GitHub token and an npm token), from 1.9.0

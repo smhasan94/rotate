@@ -22,6 +22,15 @@ All notable changes to rotate are recorded here. The format follows
 - Homebrew: `brew install smhasan94/rotate/rotate` on macOS and Linux.
   Each release updates the formula in the smhasan94/homebrew-rotate tap.
   (SHA-339)
+- A recorded demo at the top of the README: plan, apply, status and the
+  audit log for a leaked AWS key, simulated with the `test-providers`
+  build. `scripts/demo.sh` runs it, and `docs/demo/demo.tape` re-renders
+  it with vhs. (SHA-340)
+- A GitHub Action (`uses: smhasan94/rotate@<version>`) that fetches
+  secret-scanning alerts with a token that can read them, runs `rotate
+  plan` on them and writes a job summary. Plan mode only: it makes no
+  state-changing call, and the alert body goes only to rotate's stdin.
+  See docs/github-action.md. (SHA-198)
 - `--format betterleaks`: plan and rotate from a Betterleaks report, as a
   1.x JSON array or a 2.x JSON or JSON lines report, from a file or piped
   to `--stdin`. Betterleaks pairs each AWS key id with its secret key
