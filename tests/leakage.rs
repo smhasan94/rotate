@@ -1832,3 +1832,125 @@ fn sha337_t3_github_alert_fixture_is_swept_clean() {
         shown(&refused)
     );
 }
+
+// ---------------------------------------------------------------------------
+// SHA-202 T2 (AC2): Betterleaks reports
+// ---------------------------------------------------------------------------
+
+/// The Betterleaks fixtures: the 1.9.0 JSON array, the 2.0.0-rc.1 JSON
+/// report and its JSON lines.
+const BETTERLEAKS: [(&str, &str); 3] = [
+    (
+        "betterleaks.json",
+        include_str!("fixtures/betterleaks.json"),
+    ),
+    (
+        "betterleaks_v2.json",
+        include_str!("fixtures/betterleaks_v2.json"),
+    ),
+    (
+        "betterleaks_v2.jsonl",
+        include_str!("fixtures/betterleaks_v2.jsonl"),
+    ),
+];
+
+/// Every secret in the Betterleaks fixtures. The AWS key id is not secret
+/// and is left out.
+const BETTERLEAKS_VALUES: [(&str, &str); 3] = [
+    (
+        "aws secret access key component",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    ),
+    ("github-pat", "ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake0001"),
+    (
+        "npm-access-token",
+        "npm_FAKEfakeFAKEfakeFAKEfakeFAKEfake0002",
+    ),
+];
+
+/// Each fixture through `plan` at `-vvv` with `RUST_LOG=trace` (table from
+/// the file, JSON from stdin), then the v2 report through `apply --all`:
+/// no value reaches stdout, stderr (the trace log), the state file, the
+/// audit log or the call log. A truncated report is refused the same way.
+#[test]
+fn sha202_t2_betterleaks_fixtures_are_swept_clean() {
+    let canaries: Vec<Canary> = BETTERLEAKS_VALUES
+        .iter()
+        .map(|(label, value)| Canary::new(label, value))
+        .collect();
+    let mut run = MockRun::new();
+    run.sweep = Sweep::new(&canaries);
+    run.set(|s| {
+        s["consumers"] = json!([]);
+        s["prompt"] = json!({ "answers": ["all"] });
+    });
+    let stdin_args = ["plan", "--stdin", "--format", "betterleaks"];
+
+    for (name, fixture) in BETTERLEAKS {
+        let file = run.path(&format!("inputs/{name}"));
+        std::fs::write(&file, fixture).unwrap();
+        let table = run.expect(
+            0,
+            &["plan", file.to_str().unwrap(), "--format", "betterleaks"],
+        );
+        assert!(
+            text(&table.stdout).contains("Plan: 3 to rotate, 0 skipped."),
+            "{name}: {}",
+            shown(&table)
+        );
+        let mut json_args = vec!["--json"];
+        json_args.extend(stdin_args);
+        let json_plan = run.run_full(&json_args, Some(fixture), &[], true);
+        assert_eq!(json_plan.status.code(), Some(0), "{}", shown(&json_plan));
+        let plan: Value = serde_json::from_slice(&json_plan.stdout).unwrap();
+        let providers: Vec<&str> = plan["rotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(providers, ["aws", "github", "npm"], "{name}: {plan}");
+    }
+
+    let v2 = BETTERLEAKS[1].1;
+    let applied = run.run_full(
+        &[
+            "--overlap",
+            "0s",
+            "apply",
+            "--stdin",
+            "--format",
+            "betterleaks",
+            "--all",
+        ],
+        Some(v2),
+        &[],
+        true,
+    );
+    assert_eq!(applied.status.code(), Some(0), "{}", shown(&applied));
+    let files = assert_private_state(&run.work());
+    assert!(files.contains(&"state.json".to_owned()), "{files:?}");
+    assert!(files.contains(&"audit.jsonl".to_owned()), "{files:?}");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(run.work().join(".rotate/state.json")).unwrap())
+            .unwrap();
+    let steps: Vec<&str> = state["rotations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["step"].as_str().unwrap())
+        .collect();
+    assert_eq!(steps, ["revoked"; 3], "{}", shown(&applied));
+    run.expect(0, &["--json", "status", "--all"]);
+
+    // Truncated right after the GitHub value: refused by line and column.
+    let github = BETTERLEAKS_VALUES[1].1;
+    let cut = v2.find(github).unwrap() + github.len() + 1;
+    let refused = run.run_full(&stdin_args, Some(&v2[..cut]), &[], true);
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    assert!(
+        text(&refused.stderr).contains("betterleaks report is not valid JSON at line"),
+        "{}",
+        shown(&refused)
+    );
+}
