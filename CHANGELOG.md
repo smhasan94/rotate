@@ -36,6 +36,11 @@ All notable changes to rotate are recorded here. The format follows
   to `--stdin`. Betterleaks pairs each AWS key id with its secret key
   itself; rotate uses that pair and skips a finding with several candidate
   secret keys or a redacted value. (SHA-202)
+- The GitHub Action's `mode: apply`, for a job behind an environment
+  approval: it fetches the alerts again and runs `rotate apply --confirm
+  <ids> --wait` on the plan job's state, waits out the overlap window up
+  to `max-wait`, writes a summary for each outcome and uploads the audit
+  log as an artifact (`upload-audit`). See docs/github-action.md. (SHA-338)
 
 ### Changed
 

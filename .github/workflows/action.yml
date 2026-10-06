@@ -4,7 +4,10 @@
 # tests/fixtures/alerts-server/. A following step checks the outputs, that
 # the mocks saw no state-changing call, that only GET requests reached the
 # alerts server, and that the fixture's value is in none of the files the
-# Action wrote. No credentials, no network beyond the loopback.
+# Action wrote. Then (SHA-338) the plan's state goes through an artifact
+# upload and download and `mode: apply` rotates the planned secret with
+# the mocks, uploading the audit log, checked the same way. No
+# credentials, no network beyond the loopback and the artifact service.
 name: action
 
 on:
@@ -118,5 +121,105 @@ jobs:
           jq -r .secret "$fixture" > "$dir/fixture-value"
           if grep -rqFf "$dir/fixture-value" "$RUNNER_TEMP/rotate"; then
             echo "the alert value was written under RUNNER_TEMP/rotate"
+            exit 1
+          fi
+
+      # SHA-338: the apply job of docs/github-action.md, in the same job to
+      # spare a second build. The plan's state goes through a real
+      # artifact upload and download, then the Action applies the planned
+      # rotation and uploads the audit log (on Linux; macOS checks
+      # upload-audit: false).
+      - name: upload the plan state (the state artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}
+          path: ${{ steps.plan.outputs.state-dir }}
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+      - name: a fresh runner temp, and the apply scenario
+        shell: bash
+        env:
+          PLAN: ${{ steps.plan.outputs.plan-path }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/t7"
+          fingerprint=$(jq -r '.rotations[0].fingerprint' "$PLAN")
+          rm -rf "$RUNNER_TEMP/rotate"
+          # GH_TOKEN in GitHub Actions holds the leaked token; a prompt
+          # fails the run.
+          jq -n --arg fp "$fingerprint" --arg log "$dir/apply-calls.jsonl" '{
+            call_log: $log,
+            prompt: "panic",
+            consumers: [{ name: "github-actions",
+              matches: [{ fingerprint: $fp, ref: "gha:acme/api:GH_TOKEN", method: "by_name" }] }]
+          }' > "$dir/scenario.json"
+      - name: download the plan state
+        uses: actions/download-artifact@v4
+        with:
+          name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/rotate-plan-state
+      - id: apply
+        uses: ./
+        with:
+          mode: apply
+          alert-number: "42"
+          repository: acme/api
+          alerts-token: not-a-token
+          api-url: http://127.0.0.1:8642
+          rotate-binary: target/debug/rotate
+          version: ""
+          config: ${{ runner.temp }}/t7/rotate.yaml
+          verbose: "3"
+          confirm: ${{ steps.plan.outputs.rotation-ids }}
+          state-dir: ${{ runner.temp }}/rotate-plan-state
+          overlap: 3s
+          upload-audit: ${{ matrix.os == 'ubuntu-latest' }}
+      - name: download the audit artifact
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/download-artifact@v4
+        with:
+          name: rotate-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rotate-audit
+      - name: apply outputs, audit log and leak check (SHA-338)
+        shell: bash
+        env:
+          ID: ${{ steps.plan.outputs.rotation-ids }}
+          SUMMARY: ${{ steps.apply.outputs.summary-path }}
+          STATE_DIR: ${{ steps.apply.outputs.state-dir }}
+          EXIT_CODE: ${{ steps.apply.outputs.exit-code }}
+          AUDIT_UPLOADED: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/t7"
+          echo "exit-code: $EXIT_CODE"
+          [ "$EXIT_CODE" = 0 ]
+          grep -qF "## rotate apply: acme/api" "$SUMMARY"
+          grep -qF "**Done.**" "$SUMMARY"
+          grep -qF "| \`$ID\` |" "$SUMMARY"
+
+          # create, update, verify and revoke, in that order, revoke last,
+          # each ok, in the audit log the apply step leaves.
+          audit="$STATE_DIR/.rotate/audit.jsonl"
+          steps=$(jq -r --arg id "$ID" \
+            'select(.rotation_id == $id and .outcome == "ok") | .step' "$audit" |
+            grep -E '^(create|update|verify|revoke)$' | paste -sd, -)
+          echo "audit steps: $steps"
+          [ "$steps" = create,update,verify,revoke ]
+
+          # Only GET requests reached the alerts server.
+          if grep -E '"[A-Z]+ /' "$dir/server.log" | grep -vE '"GET /'; then
+            echo "a request other than GET reached the alerts API"
+            exit 1
+          fi
+
+          # The value is in no file the Action wrote, the artifacts included.
+          places=("$RUNNER_TEMP/rotate" "$RUNNER_TEMP/rotate-plan-state")
+          if [ "$AUDIT_UPLOADED" = true ]; then
+            cmp "$RUNNER_TEMP/rotate-audit/audit.jsonl" "$audit"
+            places+=("$RUNNER_TEMP/rotate-audit")
+          fi
+          if grep -rqFf "$dir/fixture-value" "${places[@]}"; then
+            echo "the alert value was written to a file or an artifact"
             exit 1
           fi
