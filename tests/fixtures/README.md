@@ -25,6 +25,16 @@ output from a scan of a real repository here.
   `.../alerts/index.html` is the empty list of open key-id alerts
   (`http.server` drops the query string and redirects `alerts` to
   `alerts/`).
+- `betterleaks.json`, `betterleaks_v2.json` and `betterleaks_v2.jsonl`
+  (SHA-202) are real Betterleaks output for the files of `trufflehog.ndjson`
+  (an AWS key pair, a GitHub token and an npm token), from 1.9.0
+  (`dir -f json`) and 2.0.0-rc.1 (`fs -o report.json` and `-o
+  report.jsonl`). The scans ran on throwaway random values, which were then
+  replaced with the values above, and the value-derived fields (`Entropy`,
+  `match.fingerprint`) recomputed; findings are in the TruffleHog fixture's
+  order. Betterleaks itself would drop the AWS pair, whose key id ends in
+  `EXAMPLE`. The 2.x files validate against Betterleaks'
+  `docs/schemas/findings.schema.json`.
 - `trufflehog_malformed.ndjson` line 2 is deliberately truncated JSON. Its
   text is a canary that tests assert never appears in warnings or logs.
 
