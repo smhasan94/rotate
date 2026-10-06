@@ -13,6 +13,12 @@ All notable changes to rotate are recorded here. The format follows
   every rotation has passed create, update, verify and the revoke gate.
   A rate-limited request fails the rotations still to revoke, with the old
   secret still valid and the time to re-run apply. (SHA-286)
+- `--format github-alert`: plan and rotate from GitHub secret-scanning
+  alerts as the REST API returns them, from a file or piped to `--stdin`.
+  AWS key-id and secret-key alerts are paired by location; resolved and
+  secretless alerts are skipped by alert number. (SHA-337)
+- `--stdin --format <FORMAT>` reads a report of that format from stdin.
+  `--provider` cannot be combined with `--format`. (SHA-337)
 
 ### Changed
 
