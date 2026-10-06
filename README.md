@@ -21,8 +21,8 @@ changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 What works now:
 
-- `rotate plan` reads a TruffleHog (`--json`) or gitleaks (`-f json`) report,
-  or one secret with `--stdin`. It dedupes the findings by fingerprint,
+- `rotate plan` reads a TruffleHog (`--json`), gitleaks (`-f json`) or
+  Betterleaks (`--format betterleaks`) report, or one secret with `--stdin`. It dedupes the findings by fingerprint,
   identifies the provider, checks validity with bounded concurrency
   (`--concurrency N`, default 8), and asks every consumer where each valid
   secret is used. For each secret it prints the plan: the replacement to

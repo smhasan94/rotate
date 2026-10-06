@@ -102,9 +102,10 @@ swap it is safe to ignore. [security.md](security.md) has the details.
 Give `rotate plan` the scanner's report. It reads TruffleHog (`trufflehog
 ... --json`, one JSON object per line) and gitleaks (`gitleaks ... -f json`)
 reports and detects which one it is; `--format trufflehog` or `--format
-gitleaks` forces it. GitHub secret-scanning alerts from the REST API are
-read with `--format github-alert`. With `--stdin`, `--format` reads the
-report from stdin instead of a file.
+gitleaks` forces it. Betterleaks reports (1.x and 2.x) are read with
+`--format betterleaks`, and GitHub secret-scanning alerts from the REST API
+with `--format github-alert`. With `--stdin`, `--format` reads the report
+from stdin instead of a file.
 [report-formats.md](report-formats.md) lists the fields it reads.
 
 <!-- test: first-run -->
@@ -424,7 +425,7 @@ Global flags work before or after the command.
 | `-h`, `--help` | all | Help. |
 | `-V`, `--version` | none | Version. |
 | `REPORT` | plan, apply, rollback | The scanner report to read. |
-| `--format <FORMAT>` | plan, apply, rollback | `trufflehog`, `gitleaks` or `github-alert`; the first two are detected when omitted. With `--stdin`, read a report of that format from stdin. |
+| `--format <FORMAT>` | plan, apply, rollback | `trufflehog`, `gitleaks`, `betterleaks` or `github-alert`; the first two are detected when omitted. With `--stdin`, read a report of that format from stdin. |
 | `--stdin` | plan, apply, rollback | Read one secret from stdin instead of a report, or with `--format` a report. |
 | `--provider <NAME>` | plan, apply, rollback | Provider of the `--stdin` secret: `aws`, `github`, `npm` or `openai`. Not with `--format` (exit 2). |
 | `--concurrency <N>` | plan, apply, rollback | Provider checks in flight at once, 1 to 64. Default 8. |
