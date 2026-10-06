@@ -228,7 +228,10 @@ Notes:
 - The runner's `.rotate/` directory is thrown away after the job. That is
   fine for `plan`. A job that runs `apply` must keep the state file (for
   example as a protected artifact or on a persistent runner) so that a
-  pending revoke, a resume or a rollback can find it.
+  pending revoke, a resume or a rollback can find it. The GitHub Action
+  does this for you: its apply mode takes the plan job's state as an
+  artifact and uploads the audit log and state file afterwards
+  ([github-action.md](github-action.md#apply-behind-an-approval)).
 - Prebuilt binaries will be attached to GitHub Releases from the first
   tagged version; download one instead of building with `cargo install`
   once they exist.

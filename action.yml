@@ -1,12 +1,13 @@
-# rotate as a composite GitHub Action (SHA-198): fetch secret-scanning
-# alerts with the REST API and pipe them into `rotate plan`. Plan mode only:
-# it changes nothing. Usage, the token and the trigger patterns are in
-# docs/github-action.md.
+# rotate as a composite GitHub Action: fetch secret-scanning alerts with
+# the REST API and pipe them into `rotate plan` (SHA-198), which changes
+# nothing, or, with `mode: apply` in a job behind an environment approval,
+# into `rotate apply --confirm ... --wait` (SHA-338). Usage, the token, the
+# trigger patterns and the approval workflow are in docs/github-action.md.
 #
 # Inputs reach the scripts through `env:` only, never interpolated into
 # `run:` text, so a hostile dispatch payload cannot inject shell.
 name: rotate leaked secrets
-description: Plan the rotation of GitHub secret-scanning alerts with rotate; makes no change.
+description: Plan the rotation of GitHub secret-scanning alerts with rotate, and apply it behind an environment approval.
 author: smhasan94
 branding:
   icon: refresh-cw
@@ -41,30 +42,58 @@ inputs:
     required: false
     default: rotate.yaml
   mode:
-    description: "plan, the only mode in this version: makes no change. apply is refused."
+    description: "plan (the default) makes no change. apply rotates the confirmed rotations; run it only in a job behind an environment with required reviewers."
     required: false
     default: plan
   verbose:
     description: "rotate log verbosity, 0 to 3 (the number of -v flags). Logs are redacted."
     required: false
     default: "0"
+  overlap:
+    description: "Overlap window between updating the consumers and revoking the old secret, such as 30m (rotate --overlap). Empty: rotate.yaml's overlap_window."
+    required: false
+    default: ""
+  confirm:
+    description: "apply: the rotation ids to apply, comma-separated, from the plan job's rotation-ids output."
+    required: false
+    default: ""
+  state-dir:
+    description: "apply: the directory the plan job's state artifact was downloaded to (it holds .rotate/state.json)."
+    required: false
+    default: ""
+  force:
+    description: "apply: true revokes even if some consumers could not be updated (rotate --force). Recorded in the audit log."
+    required: false
+    default: "false"
+  replacement-env:
+    description: "apply: name of the environment variable holding a replacement you created by hand, for providers in manual replacement mode (rotate --replacement-from-env). One rotation per run."
+    required: false
+    default: ""
+  max-wait:
+    description: "apply: the longest overlap window the step waits out, below the job's timeout-minutes. A longer window: no revoke, exit 3 with the revoke time."
+    required: false
+    default: "5h"
+  upload-audit:
+    description: "apply: upload the state directory's .rotate/ (audit log and state file, fingerprints only) as the artifact rotate-audit-<run id>-<attempt>, kept 30 days. Set false on a public repository."
+    required: false
+    default: "true"
 
 outputs:
   rotation-ids:
-    description: "Comma-separated rotation ids from the plan; empty when there is nothing to rotate."
-    value: ${{ steps.plan.outputs.rotation-ids }}
+    description: "plan: comma-separated rotation ids from the plan; empty when there is nothing to rotate."
+    value: ${{ steps.rotate.outputs.rotation-ids }}
   plan-path:
-    description: "Path of plan.json, the `rotate plan --json` output (fingerprints and references only)."
-    value: ${{ steps.plan.outputs.plan-path }}
+    description: "plan: path of plan.json, the `rotate plan --json` output (fingerprints and references only)."
+    value: ${{ steps.rotate.outputs.plan-path }}
   summary-path:
     description: "Path of the Markdown written to the job summary."
-    value: ${{ steps.plan.outputs.summary-path }}
+    value: ${{ steps.rotate.outputs.summary-path }}
   state-dir:
     description: "Directory holding .rotate/state.json and .rotate/audit.jsonl for this run."
-    value: ${{ steps.plan.outputs.state-dir }}
+    value: ${{ steps.rotate.outputs.state-dir }}
   exit-code:
     description: "rotate's exit code, or the Action's own when rotate did not run."
-    value: ${{ steps.plan.outputs.exit-code }}
+    value: ${{ steps.rotate.outputs.exit-code }}
 
 runs:
   using: composite
@@ -80,6 +109,13 @@ runs:
         ROTATE_CONFIG_PATH: ${{ inputs.config }}
         MODE: ${{ inputs.mode }}
         VERBOSE: ${{ inputs.verbose }}
+        OVERLAP: ${{ inputs.overlap }}
+        CONFIRM: ${{ inputs.confirm }}
+        PLAN_STATE_DIR: ${{ inputs.state-dir }}
+        FORCE: ${{ inputs.force }}
+        REPLACEMENT_ENV: ${{ inputs.replacement-env }}
+        MAX_WAIT: ${{ inputs.max-wait }}
+        UPLOAD_AUDIT: ${{ inputs.upload-audit }}
       run: bash "$GITHUB_ACTION_PATH/action/run.sh" --check-inputs
     - id: install
       shell: bash
@@ -87,7 +123,7 @@ runs:
         ROTATE_VERSION: ${{ inputs.version }}
         ROTATE_BINARY: ${{ inputs.rotate-binary }}
       run: bash "$GITHUB_ACTION_PATH/action/install.sh"
-    - id: plan
+    - id: rotate
       shell: bash
       env:
         ROTATE_BIN: ${{ steps.install.outputs.path }}
@@ -98,5 +134,23 @@ runs:
         ROTATE_CONFIG_PATH: ${{ inputs.config }}
         MODE: ${{ inputs.mode }}
         VERBOSE: ${{ inputs.verbose }}
+        OVERLAP: ${{ inputs.overlap }}
+        CONFIRM: ${{ inputs.confirm }}
+        PLAN_STATE_DIR: ${{ inputs.state-dir }}
+        FORCE: ${{ inputs.force }}
+        REPLACEMENT_ENV: ${{ inputs.replacement-env }}
+        MAX_WAIT: ${{ inputs.max-wait }}
+        UPLOAD_AUDIT: ${{ inputs.upload-audit }}
         ROTATE_ACTOR: github-actions/${{ github.repository }}/${{ github.run_id }}
       run: bash "$GITHUB_ACTION_PATH/action/run.sh"
+    # SHA-338: the audit trail of an apply, kept after the runner is gone,
+    # also when apply failed. Fingerprints, ids and references only.
+    - id: audit
+      if: ${{ always() && inputs.mode == 'apply' && inputs.upload-audit == 'true' && steps.rotate.outputs.state-dir != '' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: rotate-audit-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.rotate.outputs.state-dir }}/.rotate/
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: 30
