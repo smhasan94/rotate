@@ -75,7 +75,8 @@ Three shapes are read, and may be mixed in one input:
   with `schema_version`, `findings` and `scan`.
 - 2.x JSON lines, `-o report.jsonl` or `--jsonl`: one
   `{"schema_version":"1","finding":{...}}` record per line, then a `scan`
-  record, which is ignored.
+  record, which is ignored. Blank lines are fine, and so is a missing
+  `scan` record (a scan that was cut short).
 
 | Finding field | 1.x field | 2.x field |
 |---|---|---|
@@ -103,18 +104,26 @@ and the secret access key from a component:
    2.x) and marked some sets `valid` (`validationStatus` in 1.x,
    `analysis.status` in 2.x), only those sets count.
 2. The pair is used when exactly one distinct secret access key is left.
-3. Otherwise (no candidate, or more than one) the finding is skipped with a
-   warning. rotate never tries a candidate against AWS to find the pair;
-   use `rotate plan --stdin` with `KEY_ID:SECRET`.
+3. Otherwise (no candidate, or more than one, even when several are marked
+   valid) the finding is skipped with a warning. rotate never tries a
+   candidate against AWS to find the pair; use `rotate plan --stdin` with
+   `KEY_ID:SECRET`.
+
+Component sets are read only for `aws-access-token`. On any other rule they
+are ignored, so an unexpected shape there cannot drop the finding; on
+`aws-access-token` it skips the finding as a wrong field type.
 
 A report written with `--redact` holds `REDACTED` instead of each value,
 and with a percentage (`--redact=20`) the start of the value followed by
-`...`. Such entries are skipped with a warning: scan again
-without `--redact` and pipe the report in as above.
+`...`. Such entries are skipped with a warning: scan again without
+`--redact` and pipe the report in as above.
 
-A document that is not valid JSON is refused (exit 2) by line and column
-only, as is a JSON value that is not a 1.x array or a 2.x report, finding
-or scan record.
+A document that is not valid JSON anywhere is refused (exit 2) by line and
+column only. So is one whose first JSON value is not a 1.x array or a 2.x
+report, finding or scan record: the input is not Betterleaks. After at
+least one value that was, a well-formed value of any other kind (a record
+type a later Betterleaks may add) is skipped with a warning naming its
+line, never its content.
 
 ## GitHub secret-scanning alerts
 
