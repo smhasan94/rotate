@@ -1,0 +1,15 @@
+# The README demo's rotate.yaml (SHA-340). The demo runs a test build whose
+# mocks stand in for the consumers, so these entries are illustrative: they
+# are how the two consumers would be configured with a release build.
+overlap_window: 0s
+consumers:
+  github_actions:
+    targets:
+      - acme/api
+  aws_secrets_manager:
+    secrets:
+      - prod/app
+    json_keys: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]
+providers:
+  aws:
+    region: us-east-1
