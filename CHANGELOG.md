@@ -6,6 +6,26 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `rotate apply` revokes every GitHub token of a run together, in one
+  request to GitHub's credential revocation API per 1000 tokens, after
+  every rotation has passed create, update, verify and the revoke gate.
+  A rate-limited request fails the rotations still to revoke, with the old
+  secret still valid and the time to re-run apply. (SHA-286)
+
+### Changed
+
+- An endpoint URL with a query string or fragment, even an empty `?` or
+  `#`, is refused with exit 2. The endpoint warning prints the URL as
+  written, so a token in the query would have reached stderr. (SHA-332)
+
+### Fixed
+
+- The "revoking N github tokens in one request" notice counts only the
+  tokens the request carries, leaving out installation and legacy-format
+  tokens. (SHA-330)
+
 ## [0.2.0] - 2026-10-05
 
 Safety fixes found after the first release, and npm one-time passwords.
