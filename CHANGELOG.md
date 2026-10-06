@@ -26,6 +26,11 @@ All notable changes to rotate are recorded here. The format follows
   audit log for a leaked AWS key, simulated with the `test-providers`
   build. `scripts/demo.sh` runs it, and `docs/demo/demo.tape` re-renders
   it with vhs. (SHA-340)
+- A GitHub Action (`uses: smhasan94/rotate@<version>`) that fetches
+  secret-scanning alerts with a token that can read them, runs `rotate
+  plan` on them and writes a job summary. Plan mode only: it makes no
+  state-changing call, and the alert body goes only to rotate's stdin.
+  See docs/github-action.md. (SHA-198)
 
 ### Changed
 

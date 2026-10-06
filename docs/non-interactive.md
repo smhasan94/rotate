@@ -101,6 +101,10 @@ gh api "repos/$REPO/secret-scanning/alerts/$ALERT" \
   | rotate --json plan --stdin --format github-alert > plan.json
 ```
 
+The GitHub Action in this repository does exactly that, polls the open
+alerts when given no number, and writes the plan to the job summary:
+[github-action.md](github-action.md).
+
 ## Other flags a script uses
 
 - `--force` (apply): revoke even if some consumers could not be updated.

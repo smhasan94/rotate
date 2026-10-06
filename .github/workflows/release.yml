@@ -5,7 +5,8 @@
 # CHANGELOG.md section as its notes. Then it downloads them back and
 # verifies them on Linux and macOS (scripts/verify-release.sh), and runs
 # the README install block on a clean Linux container and on macOS
-# (SHA-271). Once verified, it renders the Homebrew formula from the
+# (SHA-271), and installs it through the GitHub Action's install script
+# on Linux and macOS (SHA-198). Once verified, it renders the Homebrew formula from the
 # published SHA256SUMS and pushes it to smhasan94/homebrew-rotate, then
 # installs rotate from the tap on macOS (SHA-339).
 #
@@ -267,6 +268,34 @@ jobs:
           out=$(scripts/readme-install.sh README.md)
           echo "$out"
           echo "$out" | grep -qx "rotate $VERSION"
+
+  action-install:
+    # SHA-198 T9: action/install.sh, the GitHub Action's install step,
+    # downloads the published release for the runner, checks it against
+    # SHA256SUMS and prints `rotate <version>`, on Linux and macOS.
+    name: Action install (${{ matrix.os }})
+    needs: [version, publish]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install through the Action
+        shell: bash
+        env:
+          ROTATE_VERSION: ${{ needs.version.outputs.version }}
+          ROTATE_BINARY: ""
+        run: |
+          out=$(bash action/install.sh)
+          echo "$out"
+          echo "$out" | grep -qx "rotate $VERSION"
+          bin=$(grep '^path=' "$GITHUB_OUTPUT" | tail -n 1 | cut -d= -f2-)
+          test "$bin" = "$RUNNER_TEMP/rotate/bin/rotate"
+          test "$("$bin" --version)" = "rotate $VERSION"
 
   homebrew:
     # SHA-339 AC3: render Formula/rotate.rb from the published SHA256SUMS,

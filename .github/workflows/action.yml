@@ -1,0 +1,122 @@
+# The GitHub Action end to end (SHA-198 T7): `uses: ./` on Linux and macOS
+# with the test-providers build, a scenario that logs every mock call, and
+# the alerts API played by `python3 -m http.server` on 127.0.0.1 serving
+# tests/fixtures/alerts-server/. A following step checks the outputs, that
+# the mocks saw no state-changing call, that only GET requests reached the
+# alerts server, and that the fixture's value is in none of the files the
+# Action wrote. No credentials, no network beyond the loopback.
+name: action
+
+on:
+  pull_request:
+    paths:
+      - action.yml
+      - action/**
+      - tests/action.rs
+      - tests/fixtures/github_alerts.json
+      - tests/fixtures/alerts-server/**
+      - .github/workflows/action.yml
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: action-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  plan:
+    name: uses ./ (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Mock providers only: this build never ships.
+      - name: cargo build --features test-providers
+        shell: bash
+        run: cargo build --locked --features test-providers
+      - name: version, targets and docs agree (T8, AC8)
+        shell: bash
+        run: cargo test --locked --features test-providers --test action -- sha198_t8
+      - name: scenario, config and the alerts server
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/t7"
+          mkdir -p "$dir"
+          printf '{"call_log":"%s/calls.jsonl"}\n' "$dir" > "$dir/scenario.json"
+          printf 'overlap_window: 1h\n' > "$dir/rotate.yaml"
+          echo "ROTATE_TEST_SCENARIO=$dir/scenario.json" >> "$GITHUB_ENV"
+          cd tests/fixtures/alerts-server
+          nohup python3 -m http.server 8642 --bind 127.0.0.1 > "$dir/server.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8642/repos/acme/api/secret-scanning/alerts/42; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the alerts server did not start"
+          cat "$dir/server.log"
+          exit 1
+      - id: plan
+        uses: ./
+        with:
+          alert-number: "42"
+          repository: acme/api
+          alerts-token: not-a-token
+          api-url: http://127.0.0.1:8642
+          rotate-binary: target/debug/rotate
+          version: ""
+          config: ${{ runner.temp }}/t7/rotate.yaml
+          verbose: "3"
+      - name: outputs, call log and leak check (T7, AC1)
+        shell: bash
+        env:
+          IDS: ${{ steps.plan.outputs.rotation-ids }}
+          PLAN: ${{ steps.plan.outputs.plan-path }}
+          SUMMARY: ${{ steps.plan.outputs.summary-path }}
+          STATE_DIR: ${{ steps.plan.outputs.state-dir }}
+          EXIT_CODE: ${{ steps.plan.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/t7"
+          echo "rotation-ids: $IDS, exit-code: $EXIT_CODE"
+          [[ $IDS =~ ^rot-[0-9a-f]{8}$ ]]
+          [ "$EXIT_CODE" = 0 ]
+          jq -e --arg id "$IDS" '[.rotations[].rotation_id] == [$id]' "$PLAN"
+          grep -qF "$IDS" "$SUMMARY"
+          grep -qF "[#42](https://github.com/acme/api/security/secret-scanning/42)" "$SUMMARY"
+          grep -qF "Dry run: nothing was changed." "$SUMMARY"
+          test -f "$STATE_DIR/.rotate/state.json"
+
+          # The mocks were called, and never to change anything.
+          test -s "$dir/calls.jsonl"
+          if grep -F '"mutating":true' "$dir/calls.jsonl"; then
+            echo "state-changing call in the plan"
+            exit 1
+          fi
+
+          # Only GET requests reached the alerts server.
+          cat "$dir/server.log"
+          if grep -E '"[A-Z]+ /' "$dir/server.log" | grep -vE '"GET /'; then
+            echo "a request other than GET reached the alerts API"
+            exit 1
+          fi
+
+          # The fixture's value is in none of the files the Action wrote.
+          fixture=tests/fixtures/alerts-server/repos/acme/api/secret-scanning/alerts/42
+          jq -r .secret "$fixture" > "$dir/fixture-value"
+          if grep -rqFf "$dir/fixture-value" "$RUNNER_TEMP/rotate"; then
+            echo "the alert value was written under RUNNER_TEMP/rotate"
+            exit 1
+          fi

@@ -9,8 +9,9 @@ published to crates.io (the name `rotate` is taken there).
 1. In one pull request (`chore(release): vX.Y.Z`): set `version` in
    `Cargo.toml` (and `Cargo.lock`), add the `## [X.Y.Z] - <date>` section
    and its link to `CHANGELOG.md`, set `VERSION=X.Y.Z` in the README
-   install block and the `--tag vX.Y.Z` in `docs/usage.md`.
-   `tests/user_docs.rs` fails until all of them name the new version.
+   install block, the `--tag vX.Y.Z` in `docs/usage.md` and the `version`
+   input's default in `action.yml`. `tests/user_docs.rs` and
+   `tests/action.rs` fail until all of them name the new version.
 2. Merge it, then tag the merge commit and push the tag:
 
    ```sh
@@ -33,6 +34,7 @@ published to crates.io (the name `rotate` is taken there).
 | `publish` | Creates the GitHub Release with the four tarballs and `SHA256SUMS`. The only job with write access to this repository. |
 | `verify release` | Downloads the published assets on Linux and macOS, checks every checksum, `rotate --version` and a `rotate plan` smoke run. |
 | `README install` | Runs the README install block on Debian and macOS. |
+| `Action install` | Runs `action/install.sh`, as the GitHub Action does, on Linux and macOS and checks it prints `rotate <version>`. |
 | `homebrew tap` | Updates `Formula/rotate.rb` in the tap (below). |
 | `brew install` | Runs `brew install smhasan94/rotate/rotate` on macOS, checks `rotate --version` prints the new version and runs `brew test`. |
 
