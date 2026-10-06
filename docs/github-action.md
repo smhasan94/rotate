@@ -115,6 +115,37 @@ Without a provider's credentials rotate cannot check that provider's
 secrets; the plan lists them as skipped with the reason, and a consumer
 search that fails is listed with its error.
 
+## Security
+
+**Take `rotate.yaml` from a trusted ref only.** The config decides where
+rotate sends requests: `providers.github.api_url`, `providers.npm.registry`,
+`providers.openai.api_url` and `providers.aws.endpoint_url` can point at
+any https host ([config.md](config.md#endpoint-urls)). rotate checks a
+leaked secret by calling its provider with it, and uses the operator
+credentials in the job, so a `rotate.yaml` written by an attacker could
+send both the leaked value and your operator tokens to the attacker's
+host. The plan prints a warning for every endpoint that is not the
+provider's default, but by then the requests have been made.
+
+- Check out the default branch (the `actions/checkout` default for
+  `workflow_dispatch`, `repository_dispatch` and `schedule`) and point
+  `config` at a file in it.
+- Never run the Action with credentials on `pull_request_target`, or
+  after checking out a pull request's head or any other ref someone
+  outside your team can write to.
+- Keep `alerts-token` and the operator credentials in an environment or
+  repository secret that pull requests from forks cannot read.
+
+**What the download check proves.** `install.sh` compares the tarball with
+the release's `SHA256SUMS`. Both files come from the same GitHub Release,
+so the check detects a corrupted or truncated download, not a release
+whose assets were replaced: whoever can replace the tarball can replace
+`SHA256SUMS` too. The release workflow publishes no signature or build
+attestation today. Until it does, pin the Action by commit SHA, or build
+rotate yourself and pass it in `rotate-binary`. (Follow-up: publish build
+provenance with `actions/attest-build-provenance` and have `install.sh`
+check it with `gh attestation verify` when `gh` is available.)
+
 ## Inputs
 
 | Input | Default | Description |
@@ -125,7 +156,7 @@ search that fails is listed with its error.
 | `api-url` | `${{ github.api_url }}` | GitHub REST API base URL; set for GitHub Enterprise Server. `https`, or `http` to a loopback address only. |
 | `version` | the release the Action is pinned to | rotate release to download. Ignored when `rotate-binary` is set. |
 | `rotate-binary` | `""` | Path to a rotate binary to run instead of downloading one, for self-hosted runners and mirrors. |
-| `config` | `rotate.yaml` | Path to `rotate.yaml`, relative to the workspace. A missing file is an error unless it is the default. |
+| `config` | `rotate.yaml` | Path to `rotate.yaml`, relative to the workspace. A missing file is an error unless it is the default. Take it from a trusted ref only ([Security](#security)). |
 | `mode` | `plan` | `plan`, the only mode for now. `apply` is refused (SHA-338). |
 | `verbose` | `0` | rotate's log verbosity, `0` to `3` (`-v` to `-vvv`). Logs are redacted at every level. |
 
