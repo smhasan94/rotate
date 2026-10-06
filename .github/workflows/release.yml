@@ -5,7 +5,9 @@
 # CHANGELOG.md section as its notes. Then it downloads them back and
 # verifies them on Linux and macOS (scripts/verify-release.sh), and runs
 # the README install block on a clean Linux container and on macOS
-# (SHA-271).
+# (SHA-271). Once verified, it renders the Homebrew formula from the
+# published SHA256SUMS and pushes it to smhasan94/homebrew-rotate, then
+# installs rotate from the tap on macOS (SHA-339).
 #
 # A pull request that changes this workflow, or a manual run, does the same
 # build, smoke test, packaging and checksums but never publishes.
@@ -265,3 +267,104 @@ jobs:
           out=$(scripts/readme-install.sh README.md)
           echo "$out"
           echo "$out" | grep -qx "rotate $VERSION"
+
+  homebrew:
+    # SHA-339 AC3: render Formula/rotate.rb from the published SHA256SUMS,
+    # audit it, and push it to the tap in one commit. The token is a
+    # fine-grained PAT with Contents: write on smhasan94/homebrew-rotate
+    # only (docs/releasing.md). Without it every step after the first is
+    # skipped with a notice and the release still succeeds. Runs after
+    # verify, so a release that fails verification never reaches brew.
+    name: homebrew tap
+    needs: [version, publish, verify]
+    runs-on: macos-latest
+    outputs:
+      current: ${{ steps.push.outputs.current }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - id: token
+        name: tap token
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::notice title=Homebrew tap not updated::The HOMEBREW_TAP_TOKEN secret is not set, so smhasan94/homebrew-rotate was not updated to $VERSION. See docs/releasing.md."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+      - name: render the formula
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir release
+          scripts/render-formula.sh "$VERSION" release/SHA256SUMS > rotate.rb
+          cat rotate.rb
+      - name: brew audit --strict and brew style
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        run: |
+          brew --version
+          brew tap-new --no-git local/rotate-check
+          cp rotate.rb "$(brew --repository local/rotate-check)/Formula/rotate.rb"
+          brew audit --strict --online --formula local/rotate-check/rotate
+          brew style local/rotate-check/rotate
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          repository: smhasan94/homebrew-rotate
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - id: push
+        name: commit and push to the tap (T3)
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        working-directory: tap
+        run: |
+          mkdir -p Formula
+          cp ../rotate.rb Formula/rotate.rb
+          git add Formula/rotate.rb
+          if git diff --cached --quiet; then
+            echo "::notice title=Homebrew tap::smhasan94/homebrew-rotate already has rotate $VERSION"
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit --quiet -m "rotate $VERSION" -m "From $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            git push origin HEAD
+            echo "pushed: $(git log -1 --format='%H %s')"
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+
+  brew-install:
+    # SHA-339 AC4 (T4): install from the tap exactly as the README says and
+    # check the version. Skipped when the tap was not updated.
+    name: brew install (macos)
+    needs: [version, homebrew]
+    if: needs.homebrew.outputs.current == 'true'
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: brew install smhasan94/rotate/rotate
+        shell: bash
+        run: |
+          brew install smhasan94/rotate/rotate
+          out=$("$(brew --prefix)/bin/rotate" --version)
+          echo "$out"
+          if [ "$out" != "rotate $VERSION" ]; then
+            echo "expected 'rotate $VERSION'"
+            exit 1
+          fi
+          brew test smhasan94/rotate/rotate
