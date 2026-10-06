@@ -19,6 +19,9 @@ All notable changes to rotate are recorded here. The format follows
   secretless alerts are skipped by alert number. (SHA-337)
 - `--stdin --format <FORMAT>` reads a report of that format from stdin.
   `--provider` cannot be combined with `--format`. (SHA-337)
+- Homebrew: `brew install smhasan94/rotate/rotate` on macOS and Linux.
+  Each release updates the formula in the smhasan94/homebrew-rotate tap.
+  (SHA-339)
 
 ### Changed
 

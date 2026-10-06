@@ -30,6 +30,8 @@ Prebuilt Linux and macOS binaries (x86_64 and aarch64) are attached to each
 [GitHub Release](https://github.com/smhasan94/rotate/releases) with a
 `SHA256SUMS` file. The [README](../README.md#install) has a copy-paste block
 that downloads the one for your machine, checks its checksum and installs it.
+With Homebrew (macOS, or Linux with Homebrew), the same binaries install
+with `brew install smhasan94/rotate/rotate`.
 
 Or build from source with Rust stable 1.94.1 or newer:
 

@@ -254,6 +254,25 @@ on every pull request.
 
 ## Install
 
+### Homebrew
+
+On macOS, and on Linux with Homebrew:
+
+```sh
+brew install smhasan94/rotate/rotate
+rotate --version
+```
+
+The formula lives in the tap
+[smhasan94/homebrew-rotate](https://github.com/smhasan94/homebrew-rotate)
+and installs the release binaries below, checked against their published
+checksums. Every release updates it; upgrade with
+`brew upgrade smhasan94/rotate/rotate`. Use the full name: Homebrew 6 and
+later only load a formula from a third-party tap that you installed by its
+full name or trusted with `brew trust`.
+
+### Prebuilt binaries
+
 Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are attached to
 each [GitHub Release](https://github.com/smhasan94/rotate/releases), with a
 `SHA256SUMS` file. This downloads the one for your machine, checks its
