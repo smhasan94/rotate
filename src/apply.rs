@@ -1593,11 +1593,16 @@ impl<'a> Executor<'a> {
                 continue;
             }
             if let Some(size) = provider.revoke_batch_size().filter(|s| *s > 0) {
-                for chunk in batch.chunks(size).filter(|c| c.len() > 1) {
-                    self.notice(&format!(
-                        "revoking {} {name} tokens in one request\n",
-                        chunk.len()
-                    ));
+                // SHA-330: only what the requests will carry, chunked as
+                // the provider chunks it.
+                let mut left = batch
+                    .iter()
+                    .filter(|r| provider.batchable(&r.rotation.credential))
+                    .count();
+                while left > 1 {
+                    let sent = left.min(size);
+                    self.notice(&format!("revoking {sent} {name} tokens in one request\n"));
+                    left -= sent;
                 }
             }
             let credentials: Vec<&Credential> =
