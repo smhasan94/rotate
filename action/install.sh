@@ -17,8 +17,13 @@
 # Works with bash 3.2 and both GNU and BSD tools.
 set -euo pipefail
 
+# An error annotation, escaped so it stays one workflow command, then exit.
 fail() {
-  printf '::error title=rotate install::%s\n' "$1" >&2
+  local message=$1
+  message=${message//%/%25}
+  message=${message//$'\r'/%0D}
+  message=${message//$'\n'/%0A}
+  printf '::error title=rotate install::%s\n' "$message" >&2
   exit "${2:-1}"
 }
 
@@ -31,13 +36,18 @@ output() {
 [ -n "${RUNNER_TEMP:-}" ] || fail "RUNNER_TEMP is not set"
 
 if [ -n "${ROTATE_BINARY:-}" ]; then
+  # The path goes into GITHUB_OUTPUT, so no newline or other control
+  # character; and it is never echoed into a workflow command.
+  if [[ $ROTATE_BINARY =~ [[:cntrl:]] ]]; then
+    fail "input rotate-binary: must not contain control characters" 2
+  fi
   bin=$ROTATE_BINARY
   case $bin in
     /*) ;;
     *) bin="$PWD/$bin" ;;
   esac
-  [ -f "$bin" ] && [ -x "$bin" ] || fail "input rotate-binary: $ROTATE_BINARY is not an executable file" 2
-  "$bin" --version || fail "input rotate-binary: $ROTATE_BINARY --version failed"
+  [ -f "$bin" ] && [ -x "$bin" ] || fail "input rotate-binary: not an executable file" 2
+  "$bin" --version || fail "input rotate-binary: --version failed"
   output path "$bin"
   exit 0
 fi
@@ -71,17 +81,31 @@ download=$(mktemp -d "$RUNNER_TEMP/rotate/download.XXXXXX")
 # Whatever happens, nothing downloaded is left behind.
 trap 'rm -rf "$download"' EXIT
 
+# Redirects stay on https (GitHub sends release downloads to its CDN);
+# plain http only for a test server given in ROTATE_RELEASE_BASE.
+case $BASE in
+  https://*) protocols=(--proto '=https' --proto-redir '=https') ;;
+  *) protocols=(--proto '=https,http' --proto-redir '=https,http') ;;
+esac
+
 fetch() {
   curl --disable --silent --show-error --fail --location --retry 2 \
-    --proto '=https,http' --output "$download/$1" "$BASE/$1" ||
+    "${protocols[@]}" --output "$download/$1" "$BASE/$1" ||
     fail "could not download $BASE/$1"
 }
 fetch "$NAME.tar.gz"
 fetch SHA256SUMS
 
-line=$(grep " \*\{0,1\}$NAME.tar.gz\$" "$download/SHA256SUMS" || true)
-[ -n "$line" ] || fail "SHA256SUMS has no line for $NAME.tar.gz"
-if ! (cd "$download" && printf '%s\n' "$line" | sha256_check >/dev/null); then
+# Exactly one well-formed line for the tarball: `<64 hex>  <name>` (or
+# ` *<name>`, binary mode).
+escaped=$(printf '%s' "$NAME.tar.gz" | sed 's/[.]/\\./g')
+line=$(grep -E "[[:space:]][*]?$escaped\$" "$download/SHA256SUMS" || true)
+count=$(printf '%s' "$line" | grep -c . || true)
+[ "$count" -ne 0 ] || fail "SHA256SUMS has no line for $NAME.tar.gz"
+[ "$count" -eq 1 ] || fail "SHA256SUMS has $count lines for $NAME.tar.gz; expected one"
+well_formed="^[0-9a-fA-F]{64} [ *]$escaped\$"
+[[ $line =~ $well_formed ]] || fail "SHA256SUMS has a malformed line for $NAME.tar.gz"
+if ! (cd "$download" && printf '%s\n' "$line" | sha256_check >/dev/null 2>&1); then
   fail "checksum mismatch for $NAME.tar.gz: SHA256SUMS does not match the download; nothing was installed"
 fi
 echo "checksum ok: $NAME.tar.gz"

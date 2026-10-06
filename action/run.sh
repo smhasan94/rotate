@@ -37,9 +37,19 @@ SUPPORTED_TYPES=aws_secret_access_key,aws_access_key_id,github_personal_access_t
 
 PERMISSION_HINT="the token needs Secret scanning alerts: read; GITHUB_TOKEN cannot read alerts"
 
-# One line naming the input, exit 2 (AC6).
+# A workflow command's message, escaped so it stays one command:
+# `%`, CR and LF are encoded as GitHub documents.
+annotate() {
+  local message=$1
+  message=${message//%/%25}
+  message=${message//$'\r'/%0D}
+  message=${message//$'\n'/%0A}
+  printf '::error title=rotate::%s\n' "$message" >&2
+}
+
+# One line naming the input, exit 2 (AC6). Never echoes the raw input.
 bad_input() {
-  printf '::error title=rotate::input %s\n' "$1" >&2
+  annotate "input $1"
   exit 2
 }
 
@@ -68,7 +78,7 @@ check_inputs() {
     bad_input "alerts-token: is not a GitHub token"
   fi
   # The token must not travel in clear text, except to this machine.
-  if ! [[ ${API_URL:-} =~ ^https://[^/?#@[:space:]]+(/[^?#[:space:]]*)?$ ]] &&
+  if ! [[ ${API_URL:-} =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^?#[:space:]]*)?$ ]] &&
     ! [[ ${API_URL:-} =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?(/[^?#[:space:]]*)?$ ]]; then
     bad_input "api-url: must be an https URL, or http to a loopback address"
   fi
@@ -76,9 +86,12 @@ check_inputs() {
     0 | 1 | 2 | 3) ;;
     *) bad_input "verbose: must be 0, 1, 2 or 3" ;;
   esac
+  if [[ ${ROTATE_CONFIG_PATH:-} =~ [[:cntrl:]] ]]; then
+    bad_input "config: must not contain control characters"
+  fi
   if [ -n "${ROTATE_CONFIG_PATH:-}" ] && [ "$ROTATE_CONFIG_PATH" != rotate.yaml ] &&
     [ ! -f "$ROTATE_CONFIG_PATH" ]; then
-    bad_input "config: $ROTATE_CONFIG_PATH does not exist"
+    bad_input "config: the file does not exist"
   fi
 }
 
@@ -120,6 +133,12 @@ publish_summary() {
   output summary-path "$summary_path"
 }
 
+# Redirects stay on https; plain http only for the loopback test server.
+case $API_URL in
+  https://*) protocols=(--proto '=https' --proto-redir '=https') ;;
+  *) protocols=(--proto '=https,http' --proto-redir '=https,http') ;;
+esac
+
 alerts_url="$API_URL/repos/$REPOSITORY/secret-scanning/alerts"
 urls=()
 if [ -n "${ALERT_NUMBER:-}" ]; then
@@ -137,21 +156,30 @@ fi
 
 # GETs every URL in turn, bodies to stdout. The token reaches curl as a
 # config line on its stdin (printf is a shell builtin), so it never appears
-# in a process's arguments. Each request's status goes to $status_file. On
-# the first failure nothing more is fetched and a byte that is not JSON
-# is written, so rotate refuses the whole input instead of planning part
-# of it.
+# in a process's arguments. Each request's HTTP status goes to
+# $status_file, and curl's exit code as `curl-exit=N` when it fails.
+#
+# A failed request is an API failure, except curl exit 23 (it could not
+# write its output): that means rotate stopped reading, for example on a
+# bad rotate.yaml, and rotate's exit code tells what happened. On an API
+# failure nothing more is fetched and a byte that is not JSON is written,
+# so rotate refuses the whole input instead of planning part of it.
 fetch_alerts() {
-  local url
+  local url rc
   for url in "${urls[@]}"; do
-    if ! printf 'header = "Authorization: Bearer %s"\n' "$ALERTS_TOKEN" |
+    rc=0
+    printf 'header = "Authorization: Bearer %s"\n' "$ALERTS_TOKEN" |
       curl --disable --config - --silent --show-error --fail --location --max-redirs 3 \
-        --proto '=https,http' --connect-timeout 20 --max-time 120 \
+        "${protocols[@]}" --connect-timeout 20 --max-time 120 \
         --user-agent rotate-action \
         --header 'Accept: application/vnd.github+json' \
         --header 'X-GitHub-Api-Version: 2022-11-28' \
         --write-out '%{stderr}%{http_code}\n' \
-        "$url" 2>> "$status_file"; then
+        "$url" 2>> "$status_file" || rc=$?
+    if [ "$rc" -eq 23 ]; then
+      return 0
+    elif [ "$rc" -ne 0 ]; then
+      printf 'curl-exit=%s\n' "$rc" >> "$status_file"
       printf '\n!\n'
       return 1
     fi
@@ -181,12 +209,18 @@ plan_alerts() {
   if [ -n "${ROTATE_CONFIG_PATH:-}" ] && [ -f "$ROTATE_CONFIG_PATH" ]; then
     config=(--config "$ROTATE_CONFIG_PATH")
   fi
+  local rc=0
   { printf '%s' "$first"; cat; } |
     "$ROTATE_BIN" ${verbosity[@]+"${verbosity[@]}"} --json \
       --state-file "$state_dir/.rotate/state.json" \
       --audit-log "$state_dir/.rotate/audit.jsonl" \
       ${config[@]+"${config[@]}"} \
-      plan --stdin --format github-alert > "$plan_path" 2> "$log_file"
+      plan --stdin --format github-alert > "$plan_path" 2> "$log_file" || rc=$?
+  # rotate may stop reading early (a config error is reported before the
+  # input is read). Drain the rest of the stream, unread, so curl never
+  # fails on a closed pipe.
+  cat > /dev/null
+  return "$rc"
 }
 
 set +e
@@ -218,7 +252,7 @@ if [ "$fetch_status" -ne 0 ] || [ "$rotate_status" -eq 99 ]; then
         ;;
     esac
   fi
-  printf '::error title=rotate::%s\n' "$message" >&2
+  annotate "$message"
   printf '%s\n' "$message" > "$summary_path"
   rm -f "$plan_path" "$log_file" "$status_file"
   publish_summary

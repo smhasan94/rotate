@@ -619,10 +619,34 @@ async fn sha198_t4_install_verifies_the_checksum_before_running() {
     let name = format!("rotate-{version}-{}.tar.gz", target());
     let scratch = tempfile::tempdir().unwrap();
     let tarball = release_tarball(scratch.path(), version);
-    let good_sums = format!("{}  {name}\n", hex(&Sha256::digest(&tarball)));
-    let bad_sums = format!("{}  {name}\n", hex(&Sha256::digest(b"tampered")));
+    let good = hex(&Sha256::digest(&tarball));
+    let wrong = hex(&Sha256::digest(b"tampered"));
+    let other = format!(
+        "{}  rotate-{version}-other-target.tar.gz\n",
+        hex(&[7u8; 32])
+    );
+    // (SHA256SUMS, None for a good install or the expected error)
+    let cases: Vec<(String, Option<&str>)> = vec![
+        (format!("{other}{good}  {name}\n"), None),
+        (format!("{good} *{name}\n"), None),
+        (format!("{wrong}  {name}\n"), Some("checksum mismatch")),
+        (other.clone(), Some("SHA256SUMS has no line for")),
+        (format!("{}  {name}\n", &good[..40]), Some("malformed line")),
+        (
+            format!("zz{}  {name}\n", &good[2..]),
+            Some("malformed line"),
+        ),
+        (
+            format!("{good}  {name}\n{wrong}  {name}\n"),
+            Some("2 lines for"),
+        ),
+        (
+            format!("{wrong}  {name}\n{good}  {name}\n"),
+            Some("2 lines for"),
+        ),
+    ];
 
-    for (sums, good) in [(good_sums, true), (bad_sums, false)] {
+    for (sums, error) in cases {
         let token = token_canary();
         let rec = CallRecorder::start().await;
         let base = format!("/download/v{version}");
@@ -634,7 +658,7 @@ async fn sha198_t4_install_verifies_the_checksum_before_running() {
             .await;
         Mock::given(method("GET"))
             .and(path(format!("{base}/SHA256SUMS")))
-            .respond_with(ResponseTemplate::new(200).set_body_string(sums))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sums.clone()))
             .with_priority(1)
             .mount(rec.server())
             .await;
@@ -655,21 +679,11 @@ async fn sha198_t4_install_verifies_the_checksum_before_running() {
             let _ = run.run("run.sh", &[]);
         }
 
-        if good {
-            assert_eq!(install.status.code(), Some(0), "{stderr}");
-            assert!(stdout.contains("checksum ok"), "{stdout}");
-            assert!(
-                stdout.lines().any(|l| l == format!("rotate {version}")),
-                "{stdout}"
-            );
-            let bin = run.path("runner_temp/rotate/bin/rotate");
-            assert_eq!(run.outputs()["path"], bin.display().to_string());
-            assert!(marker.exists(), "the installed binary was not run");
-            assert_eq!(binaries_under(&run.path("runner_temp")), vec![bin]);
-        } else {
-            assert_eq!(install.status.code(), Some(1), "{stderr}");
-            assert!(stderr.contains("checksum mismatch"), "{stderr}");
-            assert!(!marker.exists(), "the binary ran despite a bad checksum");
+        if let Some(error) = error {
+            assert_eq!(install.status.code(), Some(1), "{sums}: {stderr}");
+            assert!(stderr.contains(error), "{sums}: {stderr}");
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(!marker.exists(), "the binary ran despite a bad SHA256SUMS");
             assert!(!run.outputs().contains_key("path"));
             assert_eq!(
                 binaries_under(&run.path("runner_temp")),
@@ -681,6 +695,18 @@ async fn sha198_t4_install_verifies_the_checksum_before_running() {
                 "alerts fetched after a failed install: {reqs:?}"
             );
             assert_eq!(reqs.len(), 2, "{reqs:?}");
+        } else {
+            assert_eq!(install.status.code(), Some(0), "{sums}: {stderr}");
+            assert!(stdout.contains("checksum ok"), "{stdout}");
+            assert!(
+                stdout.lines().any(|l| l == format!("rotate {version}")),
+                "{stdout}"
+            );
+            let bin = run.path("runner_temp/rotate/bin/rotate");
+            assert_eq!(run.outputs()["path"], bin.display().to_string());
+            assert!(marker.exists(), "the installed binary was not run");
+            let binaries = binaries_under(&run.path("runner_temp"));
+            assert_eq!(binaries, vec![bin]);
         }
     }
 }
@@ -712,11 +738,28 @@ async fn sha198_t5_bad_inputs_exit_2_before_any_request() {
         ("API_URL", "http://example.com", "api-url"),
         ("VERBOSE", "9", "verbose"),
         ("ROTATE_CONFIG_PATH", "missing.yaml", "config"),
+        (
+            "ROTATE_CONFIG_PATH",
+            "rotate.yaml\n::warning::injected",
+            "config",
+        ),
+        ("ROTATE_CONFIG_PATH", "a\rb.yaml", "config"),
+        ("API_URL", "http://127.0.0.1.evil.com", "api-url"),
+        ("API_URL", "http://127.0.0.1@evil.com", "api-url"),
+        ("API_URL", "https://x@evil", "api-url"),
+        ("API_URL", "http://localhost.evil.com", "api-url"),
+        ("API_URL", "http://localhost@evil", "api-url"),
+        ("API_URL", "http://[::1].evil.com", "api-url"),
+        ("API_URL", "https://evil.com\\@api.github.com", "api-url"),
     ];
     for (key, value, input) in cases {
         for args in [&[][..], &["--check-inputs"][..]] {
             let mut run = ActionRun::new(&rec.uri(), &token);
             run.set(key, value);
+            if *key == "ROTATE_CONFIG_PATH" && value.chars().any(char::is_control) {
+                // The file exists: only the control character is wrong.
+                std::fs::write(run.path("work").join(value), "").unwrap();
+            }
             let output = run.run("run.sh", args);
             let stderr = text(&output.stderr);
             assert_eq!(output.status.code(), Some(2), "{key}={value:?}: {stderr}");
@@ -726,11 +769,24 @@ async fn sha198_t5_bad_inputs_exit_2_before_any_request() {
                 lines[0].contains(&format!("input {input}:")),
                 "{key}={value:?}: {stderr}"
             );
+            assert!(!stderr.contains("injected"), "input echoed: {stderr}");
             assert!(output.stdout.is_empty());
             assert!(run.calls().is_none(), "rotate ran for {key}={value:?}");
         }
     }
     assert_eq!(requests(&rec).await, Vec::<String>::new());
+
+    // rotate-binary is never echoed and cannot reach GITHUB_OUTPUT with a
+    // newline in it.
+    let mut run = ActionRun::new(&rec.uri(), &token);
+    run.set("ROTATE_BINARY", "bin/rotate\n::warning::injected");
+    let output = run.run("install.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("input rotate-binary:"), "{stderr}");
+    assert!(!stderr.contains("injected"), "{stderr}");
+    assert!(!run.outputs().contains_key("path"));
 
     // mode: apply names the follow-up.
     let mut run = ActionRun::new(&rec.uri(), &token);
@@ -822,6 +878,47 @@ async fn sha198_t6_api_refusal_names_the_permission_and_skips_rotate() {
             Canary::new("alerts token", &token),
         ],
     );
+}
+
+// rotate exits on a bad rotate.yaml before reading its input. With a body
+// bigger than a pipe buffer, curl then cannot write; that is not an API
+// failure, and rotate's own error must reach the summary.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha198_t6_rotate_config_error_is_not_an_api_failure() {
+    if !tools_present() {
+        return;
+    }
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let template = fixture_alerts(&[2]).remove(0);
+    let alerts: Vec<Value> = (1..=200)
+        .map(|n| {
+            let mut alert = template.clone();
+            alert["number"] = json!(n);
+            alert["html_url"] = json!(format!("{ALERT_URL}/{n}"));
+            alert
+        })
+        .collect();
+    let body = serde_json::to_vec(&alerts).unwrap();
+    assert!(body.len() > 128 * 1024, "{} bytes", body.len());
+    serve_open_alerts(&rec, &token, json!(alerts)).await;
+    let mut run = ActionRun::new(&rec.uri(), &token);
+    run.set("ALERT_NUMBER", "");
+    std::fs::write(run.path("work/rotate.yaml"), "overlap_window: soon\n").unwrap();
+    let output = run.run("run.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    let summary = run.summary();
+    assert!(summary.contains("rotate exited with code 2"), "{summary}");
+    assert!(summary.contains("invalid duration"), "{summary}");
+    assert!(!summary.contains("HTTP"), "{summary}");
+    assert!(!stderr.contains("alerts API"), "{stderr}");
+    let outputs = run.outputs();
+    assert_eq!(outputs["exit-code"], "2");
+    assert_eq!(outputs["rotation-ids"], "");
+    assert!(!outputs.contains_key("plan-path"));
+    assert_eq!(requests(&rec).await.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
