@@ -678,6 +678,12 @@ fn read_input(console: &mut Console, input: &InputArgs) -> Result<Vec<Finding>, 
         }
     }
 
+    if input.stdin && input.format.is_some() {
+        // A report document on stdin (SHA-337), read like a report file.
+        let report = rotate::report::read_report_from(std::io::stdin().lock(), input.format);
+        return report_findings(console, report);
+    }
+
     if input.stdin {
         let stdin = std::io::stdin();
         // The hint is best effort; a closed stderr must not stop the read.
@@ -698,7 +704,17 @@ fn read_input(console: &mut Console, input: &InputArgs) -> Result<Vec<Finding>, 
         );
         return Err(Exit::Usage);
     };
-    match read_report(path, input.format) {
+    report_findings(console, read_report(path, input.format))
+}
+
+/// The findings of a parsed report, with its warnings printed; or the
+/// error printed, which names the format, line and column but never the
+/// report's text or path.
+fn report_findings(
+    console: &mut Console,
+    report: Result<rotate::report::ParsedReport, ReportError>,
+) -> Result<Vec<Finding>, Exit> {
+    match report {
         Ok(report) => {
             for warning in &report.warnings {
                 let _ = writeln!(console.err(), "warning: {warning}");

@@ -12,6 +12,12 @@ output from a scan of a real repository here.
   The end-to-end test needs a key id that is not a documentation example
   (those are reported invalid without any call), and committing one would
   trip secret scanners.
+- `github_alerts.json` (SHA-337) is an array of GitHub REST
+  secret-scanning alerts: GitHub, npm and OpenAI tokens, an AWS secret key
+  alert with its key id alert at the same path and commit, a second key id
+  alert elsewhere, a resolved alert, a base64-encoded alert, a
+  webhook-shaped alert without `secret`, and an unsupported
+  `github_ssh_private_key` alert whose value is not a key.
 - `trufflehog_malformed.ndjson` line 2 is deliberately truncated JSON. Its
   text is a canary that tests assert never appears in warnings or logs.
 

@@ -1,0 +1,48 @@
+# Homebrew formula checks (SHA-339 T2).
+#
+# Renders the formula from the fixture SHA256SUMS and runs
+# `brew audit --strict` and `brew style` on it. `brew audit` only accepts a
+# formula in a tap, so the formula goes into a throwaway local tap. The
+# release workflow runs the same checks on the real formula before it
+# pushes it to smhasan94/homebrew-rotate.
+name: homebrew
+
+on:
+  pull_request:
+    paths:
+      - packaging/**
+      - scripts/render-formula.sh
+      - .github/workflows/homebrew.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  audit:
+    name: brew audit and style
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: render the fixture formula
+        shell: bash
+        run: |
+          scripts/render-formula.sh 1.2.3 packaging/homebrew/fixtures/SHA256SUMS > rotate.rb
+          diff packaging/homebrew/fixtures/rotate.rb rotate.rb
+      - name: brew audit --strict and brew style (AC2)
+        shell: bash
+        run: |
+          brew --version
+          brew tap-new --no-git local/rotate-check
+          cp rotate.rb "$(brew --repository local/rotate-check)/Formula/rotate.rb"
+          brew audit --strict --formula local/rotate-check/rotate
+          brew style local/rotate-check/rotate
