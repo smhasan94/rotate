@@ -13,6 +13,9 @@ All notable changes to rotate are recorded here. The format follows
   every rotation has passed create, update, verify and the revoke gate.
   A rate-limited request fails the rotations still to revoke, with the old
   secret still valid and the time to re-run apply. (SHA-286)
+- Homebrew: `brew install smhasan94/rotate/rotate` on macOS and Linux.
+  Each release updates the formula in the smhasan94/homebrew-rotate tap.
+  (SHA-339)
 
 ### Changed
 
