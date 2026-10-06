@@ -2,7 +2,9 @@
 //!
 //! The binary in `main.rs` keeps the CLI and exit-code modules private for
 //! now; this crate root grows one module per core ticket. `unsafe` is denied
-//! crate-wide and allowed only in tests that need to inspect raw memory.
+//! crate-wide and allowed only in tests that need to inspect raw memory and
+//! in `harden`, for the `mlock` and `munlock` calls on secret buffers
+//! (SHA-204).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -19,6 +21,7 @@ pub mod error;
 pub mod finding;
 pub mod fsutil;
 pub mod github;
+pub mod harden;
 pub mod input;
 pub mod permissions;
 pub mod plan;

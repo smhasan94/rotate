@@ -90,6 +90,17 @@ rotate --json plan trufflehog-report.json > plan.json
 jq -e '.rotations | length == 0' plan.json
 ```
 
+A report can also come on stdin with `--format`, so a GitHub
+secret-scanning alert goes from the REST API to rotate without the value
+touching a variable or a file. The token must be able to read
+secret-scanning alerts; a workflow's `GITHUB_TOKEN` cannot (see
+[report-formats.md](report-formats.md#github-secret-scanning-alerts)):
+
+```sh
+gh api "repos/$REPO/secret-scanning/alerts/$ALERT" \
+  | rotate --json plan --stdin --format github-alert > plan.json
+```
+
 ## Other flags a script uses
 
 - `--force` (apply): revoke even if some consumers could not be updated.

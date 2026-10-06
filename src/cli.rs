@@ -63,16 +63,21 @@ impl GlobalArgs {
     }
 }
 
-/// Where the leaked secrets come from: a scanner report, or a single
-/// secret on stdin. Secrets are never accepted as arguments.
+/// Where the leaked secrets come from: a scanner report (a file, or stdin
+/// with `--format`), or a single secret on stdin. Secrets are never
+/// accepted as arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+#[command(group(clap::ArgGroup::new("input_source").args(["report", "stdin"])))]
 pub struct InputArgs {
-    /// TruffleHog (JSON lines) or gitleaks (JSON) report to read.
+    /// TruffleHog (JSON lines), gitleaks (JSON) or GitHub alert report to
+    /// read.
     #[arg(value_name = "REPORT", conflicts_with = "stdin")]
     pub report: Option<PathBuf>,
 
-    /// Report format. Detected from the file when omitted.
-    #[arg(long, value_enum, value_name = "FORMAT", requires = "report")]
+    /// Report format. Detected from the file when omitted, except
+    /// github-alert, which must be named. With --stdin, read a report of
+    /// this format from stdin instead of one secret.
+    #[arg(long, value_enum, value_name = "FORMAT", requires = "input_source")]
     pub format: Option<ReportFormat>,
 
     /// Read one secret from stdin instead of a report. An AWS key pair may
@@ -80,8 +85,14 @@ pub struct InputArgs {
     #[arg(long)]
     pub stdin: bool,
 
-    /// Provider of the stdin secret, skipping identification.
-    #[arg(long, value_name = "NAME", requires = "stdin")]
+    /// Provider of the stdin secret, skipping identification. Not with
+    /// --format: a report names its own types.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "stdin",
+        conflicts_with = "format"
+    )]
     pub provider: Option<String>,
 
     /// Most provider checks in flight at once.
@@ -350,6 +361,17 @@ mod tests {
         assert_eq!(input.format, Some(ReportFormat::Gitleaks));
         assert!(!input.stdin);
 
+        // SHA-337: a report of a named format on stdin.
+        for (name, format) in [
+            ("github-alert", ReportFormat::GithubAlert),
+            ("trufflehog", ReportFormat::Trufflehog),
+        ] {
+            let cli = Cli::parse_from(["rotate", "plan", "--stdin", "--format", name]);
+            let input = cli.subcommand().input().cloned().unwrap();
+            assert!(input.stdin && input.report.is_none());
+            assert_eq!(input.format, Some(format));
+        }
+
         let cli = Cli::parse_from(["rotate", "apply", "--stdin", "--provider", "aws"]);
         let Command::Apply(apply) = cli.subcommand() else {
             panic!("not apply");
@@ -371,6 +393,15 @@ mod tests {
             vec!["rotate", "plan", "--provider", "aws"],
             vec!["rotate", "plan", "--format", "gitleaks"],
             vec!["rotate", "plan", "r.json", "--format", "csv"],
+            vec![
+                "rotate",
+                "plan",
+                "--stdin",
+                "--provider",
+                "aws",
+                "--format",
+                "github-alert",
+            ],
             vec!["rotate", "plan", "r.json", "--concurrency", "0"],
             vec!["rotate", "plan", "r.json", "--concurrency", "65"],
         ] {

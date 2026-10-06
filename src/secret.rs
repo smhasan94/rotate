@@ -10,13 +10,19 @@
 //! registry while alive, so any copy that reaches a log is replaced by its
 //! fingerprint marker (SHA-218, [`crate::redact`]).
 //!
-//! What this module does not do: lock pages in memory, block core dumps, or
-//! scrub copies that other code makes. The first two are Later tickets; the
-//! third is what the redaction layer is for.
+//! The buffer is locked in RAM while it lives where the OS allows it, so it
+//! is never written to swap (SHA-204, [`crate::harden`]). Drop wipes the
+//! whole allocation, then unlocks it, then frees it. Core dumps are switched
+//! off for the process by [`crate::harden::harden_process`].
+//!
+//! What this module does not do: scrub or lock copies that other code makes.
+//! That is what the redaction layer is for.
 
 use std::fmt::{self, Write as _};
 use std::io::{self, Read};
+use std::ops::Deref;
 use std::str::Utf8Error;
+use std::sync::Mutex;
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
@@ -24,6 +30,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::harden::{self, Locker, Span};
 use crate::redact::registry::Registration;
 
 /// Bytes reserved before reading a secret from a reader, so that a typical
@@ -64,7 +71,7 @@ const FINGERPRINT_HEX_LEN: usize = 16;
 /// registration is shared by clones and released when the last one drops.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretValue {
-    bytes: Zeroizing<Vec<u8>>,
+    bytes: LockedBytes,
     #[zeroize(skip)]
     registration: Option<Registration>,
 }
@@ -77,6 +84,14 @@ impl SecretValue {
     }
 
     fn wrap(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self::wrap_in(bytes, harden::locker())
+    }
+
+    /// [`wrap`](Self::wrap) with a given locker; tests pass one that
+    /// refuses or records.
+    fn wrap_in(mut bytes: Zeroizing<Vec<u8>>, locker: &'static Mutex<Locker>) -> Self {
+        // Moves the allocation out; the emptied `Zeroizing` frees nothing.
+        let bytes = LockedBytes::new(std::mem::take(&mut *bytes), locker);
         let registration = Registration::new(&bytes);
         Self {
             bytes,
@@ -163,12 +178,75 @@ impl fmt::Display for SecretValue {
     }
 }
 
+/// The heap buffer of a [`SecretValue`], locked in RAM while it lives where
+/// the OS allows it (SHA-204).
+///
+/// The vector is never grown or shrunk after construction, so its
+/// allocation stays where it was locked. `Zeroize` wipes the whole capacity
+/// and keeps the allocation and the lock. Drop wipes, then unlocks, then
+/// frees, so the secret is never in an unlocked page.
+struct LockedBytes {
+    bytes: Vec<u8>,
+    locker: &'static Mutex<Locker>,
+    span: Option<Span>,
+}
+
+impl LockedBytes {
+    /// Takes ownership of `bytes` (no copy) and locks its allocation. A
+    /// refused lock leaves it unlocked and usable; see [`harden::lock`].
+    fn new(mut bytes: Vec<u8>, locker: &'static Mutex<Locker>) -> Self {
+        let span = harden::lock(locker, &mut bytes);
+        Self {
+            bytes,
+            locker,
+            span,
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+}
+
+impl Deref for LockedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// A clone is a new allocation, locked on its own.
+impl Clone for LockedBytes {
+    fn clone(&self) -> Self {
+        Self::new(self.bytes.clone(), self.locker)
+    }
+}
+
+impl Zeroize for LockedBytes {
+    fn zeroize(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl Drop for LockedBytes {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        if let Some(span) = self.span.take() {
+            harden::unlock(self.locker, &mut self.bytes, span);
+        }
+    }
+}
+
+impl ZeroizeOnDrop for LockedBytes {}
+
 /// Constant-time comparison through `subtle`. A length mismatch is reported
 /// as unequal without comparing bytes; the length of a token is not what an
 /// attacker is after.
 impl PartialEq for SecretValue {
     fn eq(&self, other: &Self) -> bool {
-        self.bytes.as_slice().ct_eq(other.bytes.as_slice()).into()
+        self.bytes[..].ct_eq(&other.bytes[..]).into()
     }
 }
 
@@ -487,6 +565,95 @@ mod tests {
         copy.zeroize();
         assert!(copy.is_empty());
         assert_eq!(original.len(), PLAINTEXT.len());
+    }
+
+    // SHA-204 T3 (AC2): with every mlock refused, secrets are still built,
+    // cloned and compared as usual, and exactly one warning is logged,
+    // holding none of the values.
+    #[test]
+    fn refused_mlock_still_builds_secrets_and_warns_once() {
+        use crate::harden::testing::{capture_raw, leaked, warnings, Refusing};
+
+        let locker = leaked(Refusing, 4096);
+        let values = [
+            "sha204-canary-alpha-0001",
+            "sha204-canary-bravo-0002",
+            "sha204-canary-charlie-0003",
+        ];
+        let mut built = Vec::new();
+        let log = capture_raw(|| {
+            for value in values {
+                built.push(SecretValue::wrap_in(
+                    Zeroizing::new(value.as_bytes().to_vec()),
+                    locker,
+                ));
+            }
+            built.push(built[0].clone());
+        });
+
+        assert_eq!(warnings(&log), 1, "{log}");
+        assert!(log.contains("could not lock secret values in memory"));
+        for (secret, value) in built.iter().zip(values) {
+            assert_eq!(*secret, SecretValue::from(value));
+            assert!(secret.expose_secret_str(|s| s == value).unwrap());
+            assert!(!log.contains(value), "warning leaked a value");
+        }
+        assert_eq!(built[3], built[0]);
+    }
+
+    // SHA-204 T5 (AC4): two secrets on one page. Dropping the first unlocks
+    // nothing on that page; dropping the second unlocks its whole
+    // allocation, after it was wiped.
+    #[test]
+    fn shared_page_stays_locked_until_the_last_secret_drops() {
+        use crate::harden::testing::{leaked, shared_page_size, Call, Recording};
+
+        let mut a = Vec::with_capacity(40);
+        a.extend_from_slice(b"sha204-shared-page-a");
+        let mut b = Vec::with_capacity(40);
+        b.extend_from_slice(b"sha204-shared-page-b");
+        let page = shared_page_size(&[&a, &b]);
+        let (b_addr, b_len) = (b.as_ptr() as usize, b.capacity());
+        let rec = Recording::default();
+        let locker = leaked(rec.clone(), page);
+        let unlocks = || -> Vec<Call> {
+            rec.calls()
+                .into_iter()
+                .filter(|c| matches!(c, Call::Unlock { .. }))
+                .collect()
+        };
+
+        let first = SecretValue::wrap_in(Zeroizing::new(a), locker);
+        let second = SecretValue::wrap_in(Zeroizing::new(b), locker);
+        let copy = second.clone();
+        let locks = rec
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Lock { .. }))
+            .count();
+        assert_eq!(locks, 3, "every buffer, the clone included, is locked");
+
+        drop(first);
+        drop(copy);
+        // The clone's allocation may or may not share the page; what
+        // matters is that nothing on `second`'s allocation was unlocked.
+        let early = unlocks();
+        assert!(
+            early.iter().all(|c| !matches!(
+                c,
+                Call::Unlock { addr, len, .. }
+                    if *addr < b_addr + b_len && b_addr < *addr + *len
+            )),
+            "the page of a live secret was unlocked: {early:?}"
+        );
+
+        drop(second);
+        assert!(unlocks().contains(&Call::Unlock {
+            addr: b_addr,
+            len: b_len,
+            wiped: true,
+        }));
+        assert_eq!(locker.lock().unwrap().held_pages(), 0);
     }
 
     #[test]

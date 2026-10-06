@@ -13,6 +13,15 @@ All notable changes to rotate are recorded here. The format follows
   every rotation has passed create, update, verify and the revoke gate.
   A rate-limited request fails the rotations still to revoke, with the old
   secret still valid and the time to re-run apply. (SHA-286)
+- `--format github-alert`: plan and rotate from GitHub secret-scanning
+  alerts as the REST API returns them, from a file or piped to `--stdin`.
+  AWS key-id and secret-key alerts are paired by location; resolved and
+  secretless alerts are skipped by alert number. (SHA-337)
+- `--stdin --format <FORMAT>` reads a report of that format from stdin.
+  `--provider` cannot be combined with `--format`. (SHA-337)
+- Homebrew: `brew install smhasan94/rotate/rotate` on macOS and Linux.
+  Each release updates the formula in the smhasan94/homebrew-rotate tap.
+  (SHA-339)
 
 ### Changed
 
@@ -25,6 +34,13 @@ All notable changes to rotate are recorded here. The format follows
 - The "revoking N github tokens in one request" notice counts only the
   tokens the request carries, leaving out installation and legacy-format
   tokens. (SHA-330)
+
+### Security
+
+- Core dumps are off at startup: the core file limit is 0, soft and hard,
+  and on Linux the process is also marked not dumpable. Secret buffers are
+  locked in RAM with `mlock`, so they are not written to swap. If the OS
+  refuses, rotate keeps working and prints one warning. (SHA-204)
 
 ## [0.2.0] - 2026-10-05
 

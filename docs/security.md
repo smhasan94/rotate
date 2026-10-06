@@ -19,7 +19,9 @@ How each one holds:
 
 1. **No plain text.** A secret lives only in one type (`SecretValue`) whose
    memory is wiped when it is dropped, which cannot be serialized, and
-   whose debug output is its fingerprint. Every byte rotate writes to
+   whose debug output is its fingerprint. Where the OS allows, that memory
+   is locked so it is never written to swap, and rotate switches off core
+   dumps when it starts (see Limits). Every byte rotate writes to
    stdout, stderr, the tracing log, the audit log, the state file, an
    error or a panic message passes through a redaction layer that replaces
    every live secret value, and anything shaped like a provider token, with
@@ -147,11 +149,19 @@ How the design limits that:
 What rotate does not protect against:
 
 - **Memory dumps.** Secrets are wiped when rotate is done with them, but
-  while it runs they are in process memory. rotate does not lock pages in
-  memory or disable core dumps, so swap, a core dump, a debugger or anyone
-  who can read the process's memory as your user or as root can see them.
-  Copies made by libraries (the HTTP client, the TLS stack, the AWS SDK)
-  are not wiped.
+  while it runs they are in process memory. At startup rotate sets its core
+  file size limit to 0 (soft and hard), so a crash writes no core file; on
+  Linux it also marks itself not dumpable, so other processes of your user
+  cannot attach a debugger to it or read its memory through `/proc`. macOS
+  has no such flag: a debugger your user is allowed to run can still
+  attach. Each secret buffer is locked in RAM (`mlock`) so it is never
+  written to swap. When the OS refuses, usually because the locked-memory
+  limit (`ulimit -l`) is 0 or used up, rotate keeps working with unlocked
+  buffers and prints one warning: `could not lock secret values in
+  memory`. Not locked, and so able to reach swap: the redaction layer's own
+  copy of each value, and copies made by libraries (the HTTP client, the
+  TLS stack, the AWS SDK), which are not wiped either. Root can read the
+  process's memory regardless.
 - **Your operator credentials and environment.** rotate reads AWS, GitHub,
   npm and OpenAI operator credentials from the environment and the AWS
   config files. Anyone who can read your environment, shell history or

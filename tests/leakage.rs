@@ -1709,3 +1709,126 @@ async fn sha288_t8_npm_otp_runs_are_clean() {
         assert_private_state(&work);
     }
 }
+
+// ---------------------------------------------------------------------------
+// SHA-337 T3 (AC4): GitHub secret-scanning alerts on stdin
+// ---------------------------------------------------------------------------
+
+const GITHUB_ALERTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/github_alerts.json"
+);
+
+/// Every secret in the alert fixture: the resolved alert's, the base64
+/// alert's as written and decoded, and the unsupported type's. The AWS key
+/// ids are not secret and are left out.
+const GITHUB_ALERT_VALUES: [(&str, &str); 8] = [
+    (
+        "github token alert",
+        "ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake0001",
+    ),
+    (
+        "npm token alert",
+        "npm_FAKEfakeFAKEfakeFAKEfakeFAKEfake0002",
+    ),
+    (
+        "openai key alert",
+        "sk-proj-FAKEfakeFAKEfakeFAKEfakeFAKEfake0003",
+    ),
+    (
+        "aws secret key alert",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    ),
+    ("resolved alert", "npm_FAKEfakeFAKEfakeFAKEfakeFAKEfake0004"),
+    (
+        "base64 alert, decoded",
+        "ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake0006",
+    ),
+    (
+        "base64 alert, as written",
+        "Z2hwX0ZBS0VmYWtlRkFLRWZha2VGQUtFZmFrZUZBS0VmYWtlMDAwNg==",
+    ),
+    (
+        "unsupported alert",
+        "FAKE-ssh-private-key-body-not-a-key-0009",
+    ),
+];
+
+/// The fixture through `plan` (table and JSON, stdin and file) and an
+/// `apply --all` at `-vvv` with `RUST_LOG=trace`: no alert value reaches
+/// stdout, stderr (the trace log), the state file, the audit log or the
+/// call log. A truncated document is refused the same way.
+#[test]
+fn sha337_t3_github_alert_fixture_is_swept_clean() {
+    let fixture = std::fs::read_to_string(GITHUB_ALERTS).unwrap();
+    let canaries: Vec<Canary> = GITHUB_ALERT_VALUES
+        .iter()
+        .map(|(label, value)| Canary::new(label, value))
+        .collect();
+    let mut run = MockRun::new();
+    run.sweep = Sweep::new(&canaries);
+    run.set(|s| {
+        s["consumers"] = json!([]);
+        s["prompt"] = json!({ "answers": ["all"] });
+    });
+    let file = run.path("inputs/alerts.json");
+    std::fs::write(&file, &fixture).unwrap();
+    let stdin_args = ["plan", "--stdin", "--format", "github-alert"];
+
+    let table = run.run_full(&stdin_args, Some(&fixture), &[], true);
+    assert_eq!(table.status.code(), Some(0), "{}", shown(&table));
+    assert!(
+        text(&table.stdout).contains("Plan: 5 to rotate, 2 skipped."),
+        "{}",
+        shown(&table)
+    );
+    let mut json_args = vec!["--json"];
+    json_args.extend(stdin_args);
+    let json_plan = run.run_full(&json_args, Some(&fixture), &[], true);
+    assert_eq!(json_plan.status.code(), Some(0), "{}", shown(&json_plan));
+    run.expect(
+        0,
+        &["plan", file.to_str().unwrap(), "--format", "github-alert"],
+    );
+
+    let applied = run.run_full(
+        &[
+            "--overlap",
+            "0s",
+            "apply",
+            "--stdin",
+            "--format",
+            "github-alert",
+            "--all",
+        ],
+        Some(&fixture),
+        &[],
+        true,
+    );
+    assert_eq!(applied.status.code(), Some(0), "{}", shown(&applied));
+    let files = assert_private_state(&run.work());
+    assert!(files.contains(&"state.json".to_owned()), "{files:?}");
+    assert!(files.contains(&"audit.jsonl".to_owned()), "{files:?}");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(run.work().join(".rotate/state.json")).unwrap())
+            .unwrap();
+    let steps: Vec<&str> = state["rotations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["step"].as_str().unwrap())
+        .collect();
+    assert_eq!(steps, ["revoked"; 5], "{}", shown(&applied));
+    run.expect(0, &["--json", "status", "--all"]);
+
+    // Truncated right after the OpenAI value: refused by line and column.
+    let openai = GITHUB_ALERT_VALUES[2].1;
+    let cut = fixture.find(openai).unwrap() + openai.len() + 1;
+    let refused = run.run_full(&stdin_args, Some(&fixture[..cut]), &[], true);
+    assert_eq!(refused.status.code(), Some(2), "{}", shown(&refused));
+    assert!(
+        text(&refused.stderr).contains("github-alert report is not valid JSON at line"),
+        "{}",
+        shown(&refused)
+    );
+}
