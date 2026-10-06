@@ -31,6 +31,11 @@ All notable changes to rotate are recorded here. The format follows
   plan` on them and writes a job summary. Plan mode only: it makes no
   state-changing call, and the alert body goes only to rotate's stdin.
   See docs/github-action.md. (SHA-198)
+- `--format betterleaks`: plan and rotate from a Betterleaks report, as a
+  1.x JSON array or a 2.x JSON or JSON lines report, from a file or piped
+  to `--stdin`. Betterleaks pairs each AWS key id with its secret key
+  itself; rotate uses that pair and skips a finding with several candidate
+  secret keys or a redacted value. (SHA-202)
 
 ### Changed
 

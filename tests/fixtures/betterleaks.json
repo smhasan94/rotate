@@ -1,0 +1,93 @@
+[
+ {
+  "RuleID": "aws-access-token",
+  "Description": "Identified an AWS access key ID paired with a secret access key, which together can provide full access to AWS services.",
+  "StartLine": 3,
+  "EndLine": 3,
+  "StartColumn": 19,
+  "EndColumn": 38,
+  "Match": "AKIAIOSFODNN7EXAMPLE",
+  "Secret": "AKIAIOSFODNN7EXAMPLE",
+  "Attributes": {
+   "confidence": "high",
+   "path": "deploy/aws.env",
+   "resource": "fs.content"
+  },
+  "Tags": [],
+  "ComponentSets": [
+   {
+    "components": [
+     {
+      "RuleID": "aws-secret-access-key",
+      "Optional": false,
+      "StartLine": 4,
+      "EndLine": 4,
+      "StartColumn": 5,
+      "EndColumn": 62,
+      "Match": "SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "Secret": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+     }
+    ]
+   }
+  ],
+  "Fingerprint": "deploy/aws.env:aws-access-token:3",
+  "File": "deploy/aws.env",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.684184,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": ""
+ },
+ {
+  "RuleID": "github-pat",
+  "Description": "Uncovered a GitHub Personal Access Token, potentially leading to unauthorized repository access and sensitive content exposure.",
+  "StartLine": 12,
+  "EndLine": 12,
+  "StartColumn": 16,
+  "EndColumn": 55,
+  "Match": "ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake0001",
+  "Secret": "ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake0001",
+  "Attributes": {
+   "confidence": "high",
+   "path": "src/app.js",
+   "resource": "fs.content"
+  },
+  "Tags": [],
+  "Fingerprint": "src/app.js:github-pat:12",
+  "File": "src/app.js",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.603056,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": ""
+ },
+ {
+  "RuleID": "npm-access-token",
+  "Description": "Uncovered an npm access token, potentially compromising package management and code repository access.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 34,
+  "EndColumn": 73,
+  "Match": "npm_FAKEfakeFAKEfakeFAKEfakeFAKEfake0002",
+  "Secret": "npm_FAKEfakeFAKEfakeFAKEfakeFAKEfake0002",
+  "Attributes": {
+   "confidence": "high",
+   "path": ".npmrc",
+   "resource": "fs.content"
+  },
+  "Tags": [],
+  "Fingerprint": ".npmrc:npm-access-token:1",
+  "File": ".npmrc",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.603056,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": ""
+ }
+]
