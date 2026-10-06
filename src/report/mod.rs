@@ -1,8 +1,10 @@
 //! Scanner report parsers (SHA-223): TruffleHog JSON lines and gitleaks JSON
-//! arrays into [`Finding`]s.
+//! arrays into [`Finding`]s, plus GitHub secret-scanning alerts from the
+//! REST API (SHA-337).
 //!
-//! Secret fields deserialize straight into [`SecretValue`],
-//! and [`read_report`] holds the file in a zeroized buffer, so the plain
+//! Secret fields deserialize straight into [`SecretValue`], and
+//! [`read_report`] and [`read_report_from`] hold the input in a zeroized
+//! buffer, so the plain
 //! text exists only in memory that is wiped on drop. Entries that cannot be
 //! used are skipped with a [`ParseWarning`] built from the line, column and
 //! a fixed reason. serde_json's own error text is never used because its
@@ -10,12 +12,15 @@
 //!
 //! Field mapping and tested scanner versions: `docs/report-formats.md`.
 
+mod github_alert;
 mod gitleaks;
 mod trufflehog;
 
+pub use github_alert::{AWS_KEY_ID_TYPE, AWS_SECRET_TYPE};
+
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
@@ -36,6 +41,9 @@ pub enum ReportFormat {
     Trufflehog,
     /// gitleaks `-f json`: one JSON array.
     Gitleaks,
+    /// GitHub secret-scanning alerts from the REST API: one alert object or
+    /// an array of them. Never detected; it must be named.
+    GithubAlert,
 }
 
 impl fmt::Display for ReportFormat {
@@ -43,6 +51,7 @@ impl fmt::Display for ReportFormat {
         f.write_str(match self {
             ReportFormat::Trufflehog => "trufflehog",
             ReportFormat::Gitleaks => "gitleaks",
+            ReportFormat::GithubAlert => "github-alert",
         })
     }
 }
@@ -136,6 +145,23 @@ pub enum SkipReason {
     EmptySecret,
     /// An AWS record without both the access key id and the secret half.
     AwsIncomplete,
+    /// A GitHub alert whose `state` is `resolved`.
+    AlertResolved {
+        /// The alert number.
+        number: u64,
+    },
+    /// A GitHub alert without a `secret` (the webhook payload, or the REST
+    /// API with `hide_secret=true`).
+    AlertWithoutSecret {
+        /// The alert number.
+        number: u64,
+    },
+    /// A GitHub alert marked `is_base64_encoded` whose secret does not
+    /// decode.
+    AlertBadBase64 {
+        /// The alert number.
+        number: u64,
+    },
 }
 
 impl fmt::Display for SkipReason {
@@ -149,6 +175,16 @@ impl fmt::Display for SkipReason {
             SkipReason::AwsIncomplete => {
                 f.write_str("AWS finding without both the access key id and the secret key")
             }
+            SkipReason::AlertResolved { number } => write!(f, "alert #{number} is resolved"),
+            SkipReason::AlertWithoutSecret { number } => write!(
+                f,
+                "alert #{number} has no `secret` field (the webhook payload and \
+                 `hide_secret=true` leave it out); fetch the alert with the REST API"
+            ),
+            SkipReason::AlertBadBase64 { number } => write!(
+                f,
+                "alert #{number} is marked base64 encoded but its secret does not decode"
+            ),
         }
     }
 }
@@ -186,7 +222,11 @@ pub enum ReportError {
     /// The first byte is neither `[` nor `{`.
     #[error("unrecognized report format: expected a gitleaks JSON array or TruffleHog JSON lines")]
     Unrecognized,
-    /// A gitleaks report that is not a valid JSON array.
+    /// Standard input could not be read.
+    #[error("could not read the report from stdin: {0}")]
+    Stdin(#[source] io::Error),
+    /// A gitleaks report that is not a valid JSON array, or a GitHub alert
+    /// document that is not valid JSON.
     #[error("{format} report is not valid JSON at line {line}, column {column}")]
     Malformed {
         /// Format of the report.
@@ -196,15 +236,31 @@ pub enum ReportError {
         /// 1-based column of the error.
         column: usize,
     },
+    /// A GitHub alert document holding a JSON value that is neither an
+    /// alert object nor an array of alerts.
+    #[error("github-alert input at line {line} is not an alert object or an array of alerts")]
+    NotAlerts {
+        /// 1-based line where the value starts.
+        line: usize,
+    },
 }
 
 /// Parses a report held in memory. `format` forces a format; it must match
-/// the detected one. Empty or whitespace-only input is an empty report
-/// whatever the format. Each warning is also logged at `warn` level.
+/// the detected one, except [`ReportFormat::GithubAlert`], which is never
+/// detected and is parsed as named. Empty or whitespace-only input is an
+/// empty report whatever the format. Each warning is also logged at `warn`
+/// level.
 pub fn parse_report(
     input: &[u8],
     format: Option<ReportFormat>,
 ) -> Result<ParsedReport, ReportError> {
+    let body = input.strip_prefix(BOM).unwrap_or(input);
+    if format == Some(ReportFormat::GithubAlert) {
+        if detect_format(input) == Detected::Empty {
+            return Ok(ParsedReport::default());
+        }
+        return Ok(log_warnings(github_alert::parse(body)?));
+    }
     let detected = match detect_format(input) {
         Detected::Empty => return Ok(ParsedReport::default()),
         Detected::Unrecognized => return Err(ReportError::Unrecognized),
@@ -217,15 +273,20 @@ pub fn parse_report(
         });
     }
 
-    let body = input.strip_prefix(BOM).unwrap_or(input);
     let report = match detected {
         ReportFormat::Trufflehog => trufflehog::parse(body),
         ReportFormat::Gitleaks => gitleaks::parse(body)?,
+        // detect_format never yields it; handled above.
+        ReportFormat::GithubAlert => github_alert::parse(body)?,
     };
+    Ok(log_warnings(report))
+}
+
+fn log_warnings(report: ParsedReport) -> ParsedReport {
     for warning in &report.warnings {
         tracing::warn!(%warning, "report entry skipped");
     }
-    Ok(report)
+    report
 }
 
 /// Reads a report file into a zeroized buffer and parses it.
@@ -241,6 +302,54 @@ pub fn read_report(path: &Path, format: Option<ReportFormat>) -> Result<ParsedRe
     let mut buf = Zeroizing::new(Vec::with_capacity(capacity));
     file.read_to_end(&mut buf).map_err(io_error)?;
     parse_report(&buf, format)
+}
+
+/// Reads a whole report from `reader` (stdin with `--stdin --format`) into
+/// a zeroized buffer and parses it. The buffer grows by copying into a new
+/// zeroized buffer, so a reallocation never frees an unwiped copy.
+pub fn read_report_from(
+    reader: impl Read,
+    format: Option<ReportFormat>,
+) -> Result<ParsedReport, ReportError> {
+    let buf = read_zeroized(reader).map_err(ReportError::Stdin)?;
+    parse_report(&buf, format)
+}
+
+/// First buffer size for [`read_report_from`]: a few alerts fit.
+const READ_CHUNK: usize = 64 * 1024;
+
+fn read_zeroized(mut reader: impl Read) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(READ_CHUNK));
+    loop {
+        if buf.len() == buf.capacity() {
+            let mut bigger = Zeroizing::new(Vec::with_capacity(buf.capacity() * 2));
+            bigger.extend_from_slice(&buf);
+            buf = bigger;
+        }
+        let filled = buf.len();
+        let capacity = buf.capacity();
+        // Within capacity, so this never reallocates.
+        buf.resize(capacity, 0);
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                buf.truncate(filled);
+                return Ok(buf);
+            }
+            Ok(n) => buf.truncate(filled + n),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => buf.truncate(filled),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// 1-based line in `body` where `element`, a slice borrowed from it, starts.
+fn line_of(body: &[u8], element: &str) -> usize {
+    let offset = (element.as_ptr() as usize).saturating_sub(body.as_ptr() as usize);
+    let newlines = body[..offset.min(body.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    newlines + 1
 }
 
 /// `None` when the value is absent or empty.
