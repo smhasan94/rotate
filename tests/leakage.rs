@@ -625,6 +625,106 @@ fn sha293_t1_revoke_manual_then_rollback() {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-286 T10 (AC1, AC4): several GitHub rotations in one apply
+// ---------------------------------------------------------------------------
+
+/// What the scenario's github mock mints for its `n`th replacement.
+fn github_mock_replacement(n: usize) -> String {
+    format!("ghp_github-replacement-{n}")
+}
+
+/// Three leaked `ghp_` canaries in one gitleaks report under `inputs/`,
+/// each held by a GitHub Actions secret, confirmed with `--all`: one apply
+/// takes all three to `revoked`, every revoke last, and no canary or mock
+/// replacement reaches stdout, stderr, the state file, the audit log or
+/// the call log.
+#[test]
+fn sha286_t10_mock_batch_apply_sweep() {
+    let tokens: Vec<String> = (0..3).map(|_| format!("ghp_{}", canary_of(36))).collect();
+    let mut canaries: Vec<Canary> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Canary::new(&format!("leaked github token {i}"), t))
+        .collect();
+    for n in 1..=tokens.len() {
+        canaries.push(Canary::new(
+            &format!("mock replacement {n}"),
+            &github_mock_replacement(n),
+        ));
+    }
+    let mut run = MockRun::new();
+    run.sweep = Sweep::new(&canaries);
+    let matches: Vec<Value> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| json!({ "fingerprint": fp(t), "ref": format!("gha:org/repo{i}:GH_TOKEN") }))
+        .collect();
+    run.set(|s| {
+        s["consumers"] = json!([{ "name": "github-actions", "matches": matches }]);
+        s["prompt"] = json!({ "answers": ["all"] });
+    });
+    let findings: Vec<Value> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            json!({
+                "RuleID": "github-pat", "Description": "fixture",
+                "StartLine": 1, "EndLine": 1, "StartColumn": 1, "EndColumn": 10,
+                "Match": t, "Secret": t, "File": format!("ci/env{i}"),
+                "SymlinkFile": "", "Commit": "", "Entropy": 4.0, "Author": "",
+                "Email": "", "Date": "", "Message": "", "Tags": [],
+                "Fingerprint": format!("ci/env{i}:github-pat:1"),
+            })
+        })
+        .collect();
+    let report = run.path("inputs/report.json");
+    std::fs::write(&report, serde_json::to_string(&findings).unwrap()).unwrap();
+
+    let output = run.expect(
+        0,
+        &[
+            "--overlap",
+            "0s",
+            "apply",
+            report.to_str().unwrap(),
+            "--all",
+        ],
+    );
+    assert!(
+        text(&output.stdout).contains("Apply: 3 revoked"),
+        "{}",
+        shown(&output)
+    );
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(run.work().join(".rotate/state.json")).unwrap())
+            .unwrap();
+    let steps: Vec<&str> = state["rotations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["step"].as_str().unwrap())
+        .collect();
+    assert_eq!(steps, ["revoked"; 3]);
+    // Every revoke comes after every create and update.
+    let calls = std::fs::read_to_string(run.path("out/calls.jsonl")).unwrap();
+    let methods: Vec<String> = calls
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .filter(|m| matches!(m.as_str(), "create_replacement" | "update" | "revoke"))
+        .collect();
+    assert_eq!(methods.iter().filter(|m| *m == "revoke").count(), 3);
+    assert!(
+        methods[methods.len() - 3..].iter().all(|m| m == "revoke"),
+        "{methods:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SHA-294 T3, T5, T7 (AC3, AC5): a revoke resumed in a new process
 // ---------------------------------------------------------------------------
 

@@ -30,11 +30,24 @@
 //! that has exited cannot go on, since its replacement's value is gone: it
 //! is marked `needs_rollback`.
 //!
+//! [`Executor::run_all`] runs every confirmed rotation in two phases
+//! (SHA-286). Phase 1 takes each in turn through create, update, verify and
+//! the revoke gate (with the force record); a rotation that ends there is
+//! finished. Phase 2 revokes the rest, last, grouped by provider: one
+//! [`Provider::revoke_batch`] per group, so GitHub tokens go to the
+//! credential revocation API up to 1000 per request instead of one each
+//! against its hourly limit. Every rotation still gets its own revoke audit
+//! entry and state checkpoint. With `--wait`, each group sleeps once, until
+//! the latest `revoke_not_before` in it.
+//!
 //! The replacement credential is held by the [`Executor`] from create until
 //! it is verified, so a second run of the same rotation in the same process
-//! can still update the consumers that missed it. It is zeroized,
-//! registered with the redactor while alive, and dropped with the executor.
-//! Nothing returned from here holds a value.
+//! can still update the consumers that missed it. Once verified it moves
+//! into that rotation's place in phase 2 and lives until its revoke result
+//! is recorded, so revoke text that echoes it is redacted; with many
+//! rotations that is until the last one reaches its gate. It is zeroized,
+//! registered with the redactor while alive, and dropped with the executor
+//! or after its revoke. Nothing returned from here holds a value.
 //!
 //! Nothing here prints. The binary prints the plan, asks the questions
 //! through a [`Prompt`], and renders the [`Outcome`]s with
@@ -62,7 +75,8 @@ use crate::input::{self, ReplacementInputError, REPLACEMENT_MAX};
 use crate::plan::{Plan, PlannedRotation, Skipped};
 use crate::provider::otp::{self, OtpError, OtpSource};
 use crate::provider::{
-    Credential, Provider, ProviderError, ProviderRegistry, Replacement, ReplacementMode, Validity,
+    Credential, Provider, ProviderError, ProviderRegistry, Replacement, ReplacementMode, Revoked,
+    Validity,
 };
 use crate::secret::{Fingerprint, SecretValue};
 use crate::state::{ConsumerState, ConsumerStatus, Rotation, StateError, StateStore, Step};
@@ -913,7 +927,7 @@ impl fmt::Debug for Executor<'_> {
     }
 }
 
-/// Progress of one rotation inside [`Executor::run`].
+/// Progress of one rotation inside [`Executor::run_all`].
 struct Progress {
     record: Rotation,
     provider: &'static str,
@@ -921,6 +935,85 @@ struct Progress {
     /// The replacement is broader than the leaked credential (SHA-291).
     scope_widened: bool,
     forced: Vec<String>,
+}
+
+/// A rotation that passed its revoke gate in phase 1 of
+/// [`Executor::run_all`] and waits for its revoke in phase 2 (SHA-286). No
+/// `Debug`: it holds the verified replacement. Nothing in it reaches the
+/// state file or the audit log but `progress.record`.
+struct Ready<'r> {
+    /// Position in the `run_all` input.
+    index: usize,
+    rotation: &'r PlannedRotation,
+    progress: Progress,
+    /// The replacement this run verified, alive (zeroized, registered with
+    /// the redactor) until this rotation's revoke result is recorded, so
+    /// revoke text that echoes it is redacted (SHA-293). `None` when an
+    /// earlier run verified it.
+    verified: Option<Credential>,
+    /// With `--wait`: revoke no earlier than this.
+    not_before: Option<OffsetDateTime>,
+}
+
+/// How phase 1 left one rotation.
+enum Prepared<'r> {
+    /// Finished without a revoke from rotate.
+    Done(Progress, RunResult),
+    /// Through the gate; revoked in phase 2.
+    Ready(Ready<'r>),
+}
+
+/// The [`Outcome`] of `rotation` from its progress and result.
+fn outcome(rotation: &PlannedRotation, progress: Progress, result: RunResult) -> Outcome {
+    let unchanged = rotation
+        .consumers
+        .iter()
+        .map(|c| &c.found.consumer_ref)
+        .filter(|r| {
+            !progress
+                .record
+                .consumers
+                .iter()
+                .any(|c| &c.consumer_ref == *r)
+        })
+        .cloned()
+        .collect();
+    Outcome {
+        rotation_id: rotation.rotation_id.clone(),
+        provider: rotation.provider,
+        fingerprint: rotation.fingerprint.clone(),
+        replacement_fingerprint: progress.record.replacement_fingerprint.clone(),
+        consumers: progress.record.consumers.clone(),
+        unchanged,
+        forced: progress.forced,
+        result,
+    }
+}
+
+/// The outcome of a rotation [`Executor::run_all`] recorded none for. It
+/// records one for every rotation; this keeps the call total without a
+/// panic, and fails rather than claims success.
+fn no_outcome(rotation: &PlannedRotation) -> Outcome {
+    Outcome {
+        result: RunResult::Failed {
+            step: AuditStep::Plan,
+            error: RedactedText::new("apply recorded no outcome for this rotation"),
+        },
+        ..Outcome::skipped(rotation, Ineligible::NoScope)
+    }
+}
+
+/// What to do after a rate-limited revoke (SHA-286): re-run once the
+/// provider's hint has passed. Nothing is retried in the same run.
+fn retry_hint(now: OffsetDateTime, retry_after: Option<std::time::Duration>) -> String {
+    match retry_after.and_then(|d| time::Duration::try_from(d).ok()) {
+        Some(wait) => format!(
+            "re-run rotate apply after {} (in {}) to revoke it",
+            rfc3339(now + wait),
+            remaining_text(wait)
+        ),
+        None => "re-run rotate apply once the provider's rate limit resets to revoke it".to_owned(),
+    }
 }
 
 impl<'a> Executor<'a> {
@@ -973,16 +1066,53 @@ impl<'a> Executor<'a> {
         self
     }
 
-    /// Runs one confirmed rotation from where the state file says it is
-    /// (SHA-258): create, update every consumer not yet updated, verify,
-    /// revoke gate, revoke. A step finished by an earlier run is not
-    /// repeated; it gets a `skipped` audit entry. Never calls `revoke`
-    /// after an earlier failure. An ineligible rotation is returned as
-    /// skipped without a call.
+    /// Runs one confirmed rotation: [`run_all`](Self::run_all) with one
+    /// rotation.
     pub async fn run(&mut self, rotation: &PlannedRotation) -> Outcome {
-        if let Err(why) = eligibility_in(rotation, self.store) {
-            return Outcome::skipped(rotation, why);
+        self.run_all(&[rotation])
+            .await
+            .pop()
+            .unwrap_or_else(|| no_outcome(rotation))
+    }
+
+    /// Runs confirmed rotations from where the state file says each is
+    /// (SHA-258), in two phases (SHA-286). Phase 1 takes each in turn
+    /// through create, update every consumer not yet updated, verify and
+    /// the revoke gate; one that ends there (failed, held, pending,
+    /// revoke by hand) is finished. Phase 2 revokes the rest, last, one
+    /// [`Provider::revoke_batch`] per provider. A step finished by an
+    /// earlier run is not repeated; it gets a `skipped` audit entry. Never
+    /// revokes after an earlier failure. An ineligible rotation is returned
+    /// as skipped without a call. Outcomes are in input order.
+    pub async fn run_all(&mut self, rotations: &[&PlannedRotation]) -> Vec<Outcome> {
+        let mut outcomes: Vec<Option<Outcome>> = vec![None; rotations.len()];
+        let mut ready = Vec::new();
+        for (index, rotation) in rotations.iter().copied().enumerate() {
+            if let Err(why) = eligibility_in(rotation, self.store) {
+                outcomes[index] = Some(Outcome::skipped(rotation, why));
+                continue;
+            }
+            match self.prepare(index, rotation).await {
+                Prepared::Done(progress, result) => {
+                    outcomes[index] = Some(outcome(rotation, progress, result));
+                }
+                Prepared::Ready(r) => ready.push(r),
+            }
         }
+        for (index, progress, result) in self.revoke_ready(ready).await {
+            outcomes[index] = Some(outcome(rotations[index], progress, result));
+        }
+        outcomes
+            .into_iter()
+            .zip(rotations)
+            .map(|(o, rotation)| o.unwrap_or_else(|| no_outcome(rotation)))
+            .collect()
+    }
+
+    /// Phase 1 for one rotation: everything up to and including the revoke
+    /// gate. A rotation the gate lets through comes back [`Ready`], holding
+    /// the verified replacement when this run verified it.
+    async fn prepare<'r>(&mut self, index: usize, rotation: &'r PlannedRotation) -> Prepared<'r> {
         let mut progress = Progress {
             record: self
                 .store
@@ -1000,56 +1130,32 @@ impl<'a> Executor<'a> {
             scope_widened: rotation.widens_scope().is_some(),
             forced: Vec::new(),
         };
-        let result = self.steps(rotation, &mut progress).await;
-        let unchanged = rotation
-            .consumers
-            .iter()
-            .map(|c| &c.found.consumer_ref)
-            .filter(|r| {
-                !progress
-                    .record
-                    .consumers
-                    .iter()
-                    .any(|c| &c.consumer_ref == *r)
-            })
-            .cloned()
-            .collect();
-        Outcome {
-            rotation_id: rotation.rotation_id.clone(),
-            provider: rotation.provider,
-            fingerprint: rotation.fingerprint.clone(),
-            replacement_fingerprint: progress.record.replacement_fingerprint.clone(),
-            consumers: progress.record.consumers.clone(),
-            unchanged,
-            forced: progress.forced,
-            result,
-        }
-    }
-
-    async fn steps(&mut self, rotation: &PlannedRotation, progress: &mut Progress) -> RunResult {
-        if let Err(err) = self.event(progress, AuditStep::Plan, AuditOutcome::Ok, None, None) {
+        if let Err(err) = self.event(&progress, AuditStep::Plan, AuditOutcome::Ok, None, None) {
             // Nothing was done; the stored step stays as it is.
-            return RunResult::Failed {
+            let result = RunResult::Failed {
                 step: AuditStep::Plan,
                 error: RedactedText::new(&err.to_string()),
             };
+            return Prepared::Done(progress, result);
         }
         let Some(provider) = self.providers.get(rotation.provider) else {
-            return self.fail(
-                progress,
+            let result = self.fail(
+                &mut progress,
                 AuditStep::Create,
                 "the provider is not registered",
                 None,
             );
+            return Prepared::Done(progress, result);
         };
         let from = resume_point(&progress.record);
         let id = rotation.rotation_id.clone();
-        if let Err(err) = self.audit_done(progress, from) {
+        if let Err(err) = self.audit_done(&progress, from) {
             // Nothing was done; the stored step stays as it is.
-            return RunResult::Failed {
+            let result = RunResult::Failed {
                 step: AuditStep::Plan,
                 error: RedactedText::new(&err.to_string()),
             };
+            return Prepared::Done(progress, result);
         }
 
         if from == Resume::Create {
@@ -1057,46 +1163,55 @@ impl<'a> Executor<'a> {
             // failed): start over.
             progress.record.failed_step = None;
             progress.record.consumers.clear();
-            if let Err(result) = self.create(rotation, provider.as_ref(), progress).await {
-                return result;
+            if let Err(result) = self
+                .create(rotation, provider.as_ref(), &mut progress)
+                .await
+            {
+                return Prepared::Done(progress, result);
             }
         }
         if from <= Resume::Update {
             // The replacement lives in `held` until it is verified; a copy
             // lives in this frame. Without it nothing can be updated.
             let Some(credential) = self.held.get(&id).cloned() else {
-                return self.needs_rollback(progress, AuditStep::Update, LOST_REPLACEMENT);
+                let result =
+                    self.needs_rollback(&mut progress, AuditStep::Update, LOST_REPLACEMENT);
+                return Prepared::Done(progress, result);
             };
             progress.record.failed_step = None;
-            if let Err(result) = self.update_all(rotation, progress, &credential).await {
-                return result;
+            if let Err(result) = self.update_all(rotation, &mut progress, &credential).await {
+                return Prepared::Done(progress, result);
             }
         }
         // The verified replacement leaves `held` but stays alive, and so
-        // registered with the redactor, until revoke is over: a revoke error
-        // or revoke-by-hand text that echoes it is printed and stored after
-        // this point (SHA-293).
+        // registered with the redactor, until this rotation's revoke is
+        // recorded in phase 2: a revoke error or revoke-by-hand text that
+        // echoes it is printed and stored after this point (SHA-293).
         let verified = if from <= Resume::Verify {
             progress.record.failed_step = None;
-            if let Err(result) = self.verify(rotation, provider.as_ref(), progress).await {
-                return result;
+            if let Err(result) = self
+                .verify(rotation, provider.as_ref(), &mut progress)
+                .await
+            {
+                return Prepared::Done(progress, result);
             }
             self.held.remove(&id)
         } else {
             None
         };
-        // SHA-294: a revoke resumed in a process that never held the
-        // replacement (after the overlap window, or `--wait` in a new
-        // process) cannot redact it, so it keeps only a safe summary.
-        let upstream = match verified {
-            Some(_) => UpstreamText::Redacted,
-            None => UpstreamText::Summary,
-        };
-        let result = self
-            .finish(rotation, provider.as_ref(), progress, upstream)
-            .await;
-        drop(verified);
-        result
+        match self.gate(rotation, provider.as_ref(), &mut progress).await {
+            Ok(not_before) => Prepared::Ready(Ready {
+                index,
+                rotation,
+                progress,
+                verified,
+                not_before,
+            }),
+            Err(result) => {
+                drop(verified);
+                Prepared::Done(progress, result)
+            }
+        }
     }
 
     /// One `skipped` audit entry for every step an earlier run finished
@@ -1349,18 +1464,19 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    /// The revoke gate, the force record, the overlap window (waited out
-    /// with `--wait`), then revoke: always the last step. Runs only once
-    /// the replacement is verified.
-    async fn finish(
+    /// The revoke gate and the force record (SHA-256): `Ok(None)` is revoke
+    /// now, `Ok(Some(t))` is revoke once `t` has passed (`--wait`), `Err` is
+    /// how the rotation ends without a revoke from rotate. Runs only once
+    /// the replacement is verified. A rotation an earlier run left at
+    /// `revoke_manual` is only checked (SHA-289).
+    async fn gate(
         &mut self,
         rotation: &PlannedRotation,
         provider: &dyn Provider,
         progress: &mut Progress,
-        upstream: UpstreamText,
-    ) -> RunResult {
+    ) -> Result<Option<OffsetDateTime>, RunResult> {
         if progress.record.step == Step::RevokeManual {
-            return self.recheck_by_hand(rotation, provider, progress).await;
+            return Err(self.recheck_by_hand(rotation, provider, progress).await);
         }
         let now = (self.clock)();
         // A force recorded by an earlier run still stands.
@@ -1373,13 +1489,14 @@ impl<'a> Executor<'a> {
             force,
         );
         if !matches!(gate, Gate::Hold(_)) && force {
-            // NFR5: the force is on record before anything is revoked.
+            // NFR5: the force is on record before anything is revoked, so
+            // before the batch request of phase 2 too.
             if let Err(err) = self.record_force(rotation, progress) {
-                return self.fail(progress, AuditStep::Force, &err.to_string(), None);
+                return Err(self.fail(progress, AuditStep::Force, &err.to_string(), None));
             }
         }
         match gate {
-            Gate::Revoke => {}
+            Gate::Revoke => Ok(None),
             Gate::Hold(reason) => {
                 if let Err(err) = self.event(
                     progress,
@@ -1390,7 +1507,7 @@ impl<'a> Executor<'a> {
                 ) {
                     tracing::warn!(rotation_id = %progress.record.rotation_id, "{err}");
                 }
-                return RunResult::Held { reason };
+                Err(RunResult::Held { reason })
             }
             Gate::Wait(not_before) => {
                 let remaining = not_before - now;
@@ -1407,29 +1524,155 @@ impl<'a> Executor<'a> {
                     )
                 });
                 if let Err(err) = recorded {
-                    return self.fail(progress, AuditStep::Revoke, &err.to_string(), None);
+                    return Err(self.fail(progress, AuditStep::Revoke, &err.to_string(), None));
                 }
                 if !self.wait {
-                    return RunResult::PendingRevoke {
+                    return Err(RunResult::PendingRevoke {
                         not_before,
                         remaining,
-                    };
+                    });
                 }
-                self.notice(&format!(
-                    "Rotation {}: waiting until {when} ({}) to revoke the old secret; interrupt to stop, then re-run rotate apply after that time.\n",
-                    progress.record.rotation_id,
-                    remaining_text(remaining)
-                ));
-                let pause = std::time::Duration::try_from(remaining).unwrap_or_default();
-                tokio::time::sleep(pause).await;
+                Ok(Some(not_before))
             }
         }
-        // SHA-289: a credential rotate cannot revoke ends at revoke_manual,
-        // not failed: everything up to the revoke worked.
-        if let Some(instructions) = provider.manual_revoke(rotation.scope.as_ref()) {
-            return self.revoke_by_hand(progress, instructions);
+    }
+
+    /// Phase 2 (SHA-286): revokes every rotation that passed its gate, one
+    /// [`Provider::revoke_batch`] per provider. Groups with nothing to wait
+    /// for go first, then by the latest `not_before` in the group; with
+    /// `--wait` each group sleeps once, until its latest time, so nothing
+    /// is revoked before its own time. A rotation the provider can only
+    /// have revoked by hand never enters the batch. Each rotation's result
+    /// is recorded on its own, in group order, after the batch returns.
+    async fn revoke_ready(&mut self, ready: Vec<Ready<'_>>) -> Vec<(usize, Progress, RunResult)> {
+        let mut groups: Vec<(&'static str, Vec<Ready<'_>>)> = Vec::new();
+        for r in ready {
+            match groups
+                .iter_mut()
+                .find(|(name, _)| *name == r.rotation.provider)
+            {
+                Some((_, group)) => group.push(r),
+                None => groups.push((r.rotation.provider, vec![r])),
+            }
         }
-        let revoked = match provider.revoke(&rotation.credential).await {
+        // Stable: ties keep their first appearance.
+        groups.sort_by_key(|(_, group)| group.iter().filter_map(|r| r.not_before).max());
+
+        let mut done = Vec::new();
+        for (name, group) in groups {
+            if let Some(latest) = group.iter().filter_map(|r| r.not_before).max() {
+                self.wait_for(&group, latest).await;
+            }
+            let Some(provider) = self.providers.get(name).cloned() else {
+                // Cannot happen after phase 1, which needed the provider.
+                for mut r in group {
+                    let result = self.fail(
+                        &mut r.progress,
+                        AuditStep::Revoke,
+                        "the provider is not registered; the old secret may still be valid",
+                        None,
+                    );
+                    done.push((r.index, r.progress, result));
+                }
+                continue;
+            };
+            let mut batch = Vec::new();
+            for mut r in group {
+                // SHA-289: a credential rotate cannot revoke ends at
+                // revoke_manual, not failed: everything up to the revoke
+                // worked.
+                match provider.manual_revoke(r.rotation.scope.as_ref()) {
+                    Some(instructions) => {
+                        let result = self.revoke_by_hand(&mut r.progress, instructions);
+                        done.push((r.index, r.progress, result));
+                    }
+                    None => batch.push(r),
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            if let Some(size) = provider.revoke_batch_size().filter(|s| *s > 0) {
+                for chunk in batch.chunks(size).filter(|c| c.len() > 1) {
+                    self.notice(&format!(
+                        "revoking {} {name} tokens in one request\n",
+                        chunk.len()
+                    ));
+                }
+            }
+            let credentials: Vec<&Credential> =
+                batch.iter().map(|r| &r.rotation.credential).collect();
+            let results = provider.revoke_batch(&credentials).await;
+            drop(credentials);
+            if results.len() != batch.len() {
+                let error = format!(
+                    "the provider returned {} results for {} credentials; the old secret may still be valid",
+                    results.len(),
+                    batch.len()
+                );
+                for mut r in batch {
+                    let result = self.fail(&mut r.progress, AuditStep::Revoke, &error, None);
+                    done.push((r.index, r.progress, result));
+                }
+                continue;
+            }
+            for (mut r, revoked) in batch.into_iter().zip(results) {
+                let result = self.record_revoke(&mut r, revoked);
+                done.push((r.index, r.progress, result));
+            }
+        }
+        done
+    }
+
+    /// `--wait` for one provider group: one notice naming every rotation in
+    /// it, then a sleep until `latest`.
+    async fn wait_for(&mut self, group: &[Ready<'_>], latest: OffsetDateTime) {
+        let remaining = latest - (self.clock)();
+        let ids: Vec<&str> = group
+            .iter()
+            .map(|r| r.progress.record.rotation_id.as_str())
+            .collect();
+        let (noun, secret) = if ids.len() == 1 {
+            ("Rotation", "secret")
+        } else {
+            ("Rotations", "secrets")
+        };
+        self.notice(&format!(
+            "{noun} {}: waiting until {} ({}) to revoke the old {secret}; interrupt to stop, then re-run rotate apply after that time.\n",
+            ids.join(", "),
+            rfc3339(latest),
+            remaining_text(remaining)
+        ));
+        let pause = std::time::Duration::try_from(remaining).unwrap_or_default();
+        tokio::time::sleep(pause).await;
+    }
+
+    /// Records one rotation's revoke result from phase 2: `revoked` with
+    /// its restore handle, a revoke by hand, or a failure. The error text
+    /// is kept, redacted, when this run held the verified replacement, and
+    /// summarized when it did not (SHA-294). Drops the replacement.
+    fn record_revoke(
+        &mut self,
+        ready: &mut Ready<'_>,
+        result: Result<Revoked, ProviderError>,
+    ) -> RunResult {
+        let upstream = match ready.verified {
+            Some(_) => UpstreamText::Redacted,
+            None => UpstreamText::Summary,
+        };
+        let result = self.revoke_result(&mut ready.progress, upstream, result);
+        // Zeroized, and unregistered from the redactor with the last copy.
+        ready.verified = None;
+        result
+    }
+
+    fn revoke_result(
+        &mut self,
+        progress: &mut Progress,
+        upstream: UpstreamText,
+        result: Result<Revoked, ProviderError>,
+    ) -> RunResult {
+        let revoked = match result {
             Ok(revoked) => revoked,
             Err(err) if err.unsupported().is_some() => {
                 let instructions = match upstream {
@@ -1455,14 +1698,14 @@ impl<'a> Executor<'a> {
                         None => revoke_error_summary(progress.provider, &err),
                     },
                 };
-                return self.fail(
-                    progress,
-                    AuditStep::Revoke,
-                    &format!(
-                        "{text}; the replacement is live and the old secret may still be valid"
-                    ),
-                    None,
+                let mut error = format!(
+                    "{text}; the replacement is live and the old secret may still be valid"
                 );
+                // SHA-286: nothing is retried; say when a re-run can revoke.
+                if let ProviderError::RateLimited { retry_after } = err.base() {
+                    let _ = write!(error, "; {}", retry_hint((self.clock)(), *retry_after));
+                }
+                return self.fail(progress, AuditStep::Revoke, &error, None);
             }
         };
         progress.record.step = Step::Revoked;
@@ -3666,5 +3909,296 @@ mod tests {
         r.replacement_ref = Some("npm-ref-1".into());
         assert_eq!(resume_point(&r), Resume::Revoke);
         assert_eq!(step_eligibility(Step::RevokeManual), Ok(()));
+    }
+
+    // SHA-286: batched revokes.
+
+    /// Delegates every method to a [`MockProvider`] and records the size of
+    /// each `revoke_batch` call, in a list shared between recorders.
+    struct BatchRecorder {
+        inner: MockProvider,
+        sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BatchRecorder {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn replacement_mode(&self) -> ReplacementMode {
+            self.inner.replacement_mode()
+        }
+        fn manual_revoke(&self, scope: Option<&crate::provider::Scope>) -> Option<&'static str> {
+            Provider::manual_revoke(&self.inner, scope)
+        }
+        fn identify(&self, finding: &Finding) -> Option<crate::provider::Confidence> {
+            self.inner.identify(finding)
+        }
+        async fn check_valid(&self, credential: &Credential) -> Result<Validity, ProviderError> {
+            self.inner.check_valid(credential).await
+        }
+        async fn describe_scope(
+            &self,
+            credential: &Credential,
+        ) -> Result<crate::provider::Scope, ProviderError> {
+            self.inner.describe_scope(credential).await
+        }
+        async fn create_replacement(
+            &self,
+            credential: &Credential,
+        ) -> Result<Replacement, ProviderError> {
+            self.inner.create_replacement(credential).await
+        }
+        async fn verify(
+            &self,
+            credential: &Credential,
+            identity: &crate::provider::Identity,
+        ) -> Result<(), ProviderError> {
+            self.inner.verify(credential, identity).await
+        }
+        async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError> {
+            self.inner.revoke(credential).await
+        }
+        async fn revoke_batch(
+            &self,
+            credentials: &[&Credential],
+        ) -> Vec<Result<Revoked, ProviderError>> {
+            self.sizes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(credentials.len());
+            self.inner.revoke_batch(credentials).await
+        }
+        async fn restore(
+            &self,
+            restore_ref: &str,
+        ) -> Result<crate::provider::RestoreOutcome, ProviderError> {
+            self.inner.restore(restore_ref).await
+        }
+    }
+
+    /// Two batch-recording mock providers, `npm` (`npm_`) and `pypi`
+    /// (`pypi_`), sharing one call log and one size list; no consumers.
+    struct Batch {
+        _dir: tempfile::TempDir,
+        store: StateStore,
+        audit: AuditLog,
+        audit_path: std::path::PathBuf,
+        log: CallLog,
+        providers: ProviderRegistry,
+        consumers: ConsumerRegistry,
+        sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    fn batch_fixture() -> Batch {
+        let dir = tempfile::tempdir().unwrap();
+        let log = CallLog::new();
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::new();
+        for (name, prefix) in [("npm", "npm_"), ("pypi", "pypi_")] {
+            providers.register(Arc::new(BatchRecorder {
+                inner: MockProvider::new(name)
+                    .identify_prefix(prefix)
+                    .log(log.clone()),
+                sizes: sizes.clone(),
+            }));
+        }
+        let audit_path = dir.path().join("audit.jsonl");
+        Batch {
+            store: StateStore::open(dir.path().join("state.json")).unwrap(),
+            audit: AuditLog::open_as(&audit_path, "tester@host").unwrap(),
+            audit_path,
+            _dir: dir,
+            log,
+            providers,
+            consumers: ConsumerRegistry::new(),
+            sizes,
+        }
+    }
+
+    async fn plan_many(b: &mut Batch, values: &[&str]) -> Plan {
+        let findings = values
+            .iter()
+            .map(|v| Finding::new(SecretValue::from(*v), "Mock", SourceLocation::file("a")))
+            .collect();
+        let assessed = assess(findings, &b.providers, &AssessOptions::default()).await;
+        let mut plan = crate::plan::build(
+            assessed,
+            &b.providers,
+            &b.consumers,
+            "0s".parse().unwrap(),
+            &ConsumersConfig::default(),
+        )
+        .await;
+        crate::plan::assign_ids(&mut plan, &mut b.store).unwrap();
+        assert_eq!(plan.rotations.len(), values.len());
+        b.log.clear();
+        plan
+    }
+
+    /// The rotation of `value` in `plan`, by fingerprint.
+    fn rotation_of<'p>(plan: &'p Plan, value: &str) -> &'p PlannedRotation {
+        plan.rotations
+            .iter()
+            .find(|r| r.fingerprint == fp(value))
+            .unwrap()
+    }
+
+    /// Moves `value`'s rotation to `pending_revoke` until `at`, as an
+    /// earlier run with an overlap window would have left it.
+    fn seed_pending(b: &mut Batch, plan: &Plan, value: &str, at: OffsetDateTime) {
+        let id = &rotation_of(plan, value).rotation_id;
+        let mut record = b.store.get(id).unwrap().clone();
+        record.step = Step::PendingRevoke;
+        record.revoke_not_before = Some(at);
+        record.replacement_ref = Some(format!("{id}-ref"));
+        record.replacement_fingerprint = Some(fp(&format!("{value}-replacement")));
+        b.store.upsert(record).unwrap();
+    }
+
+    fn sizes(b: &Batch) -> Vec<usize> {
+        b.sizes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// SHA-286 T2 (AC2), executor side: the rotations that pass their gate
+    /// are revoked with one `revoke_batch` per provider, in order of first
+    /// appearance, each recorded on its own.
+    #[tokio::test]
+    async fn ready_rotations_are_revoked_in_one_batch_per_provider() {
+        let mut b = batch_fixture();
+        let values = [
+            "npm_sha286_batch_a",
+            "pypi_sha286_batch_a",
+            "npm_sha286_batch_b",
+            "pypi_sha286_batch_b",
+            "npm_sha286_batch_c",
+        ];
+        let plan = plan_many(&mut b, &values).await;
+        let requested: Vec<&PlannedRotation> =
+            values.iter().map(|v| rotation_of(&plan, v)).collect();
+        let outcomes = Executor::new(&b.providers, &b.consumers, &mut b.store, &mut b.audit)
+            .run_all(&requested)
+            .await;
+
+        assert_eq!(sizes(&b), [3, 2]);
+        assert_eq!(outcomes.len(), values.len());
+        for (outcome, value) in outcomes.iter().zip(values) {
+            assert_eq!(outcome.fingerprint, fp(value), "input order");
+            assert_eq!(outcome.result, RunResult::Revoked, "{value}");
+            let stored = b.store.get(&outcome.rotation_id).unwrap();
+            assert_eq!(stored.step, Step::Revoked);
+            assert!(stored.restore_ref.is_some(), "{value}");
+        }
+        // Every create and verify comes before the first revoke.
+        let methods: Vec<String> = b.log.calls().into_iter().map(|c| c.method).collect();
+        let first_revoke = methods.iter().position(|m| m == "revoke").unwrap();
+        assert!(methods[first_revoke..].iter().all(|m| m == "revoke"));
+        assert_eq!(methods[first_revoke..].len(), values.len());
+        let revokes = crate::audit::read_all(&b.audit_path)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.step == AuditStep::Revoke && e.outcome == AuditOutcome::Ok)
+            .count();
+        assert_eq!(revokes, values.len());
+        assert_eq!(run_status(&outcomes), RunStatus::Done);
+    }
+
+    /// SHA-286 T8 (AC8), unit half: with `--wait`, a provider group waits
+    /// once, for its latest `not_before`, and a group with nothing to wait
+    /// for is revoked first. A clock past every time means no wait at all.
+    #[tokio::test]
+    async fn wait_groups_by_latest_not_before() {
+        let now = OffsetDateTime::now_utc();
+        let values = ["npm_sha286_wait_a", "npm_sha286_wait_b"];
+
+        let mut b = batch_fixture();
+        let plan = plan_many(&mut b, &values).await;
+        seed_pending(&mut b, &plan, values[0], now + time::Duration::seconds(1));
+        seed_pending(&mut b, &plan, values[1], now + time::Duration::seconds(2));
+        let mut term = Recorder::default();
+        let started = std::time::Instant::now();
+        let outcomes = {
+            let requested: Vec<&PlannedRotation> = plan.rotations.iter().collect();
+            Executor::new(&b.providers, &b.consumers, &mut b.store, &mut b.audit)
+                .with_wait(true)
+                .with_clock(two_hours_later)
+                .with_manual(ReplacementSource::Supplied(None), &mut term)
+                .run_all(&requested)
+                .await
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(outcomes.iter().all(|o| o.result == RunResult::Revoked));
+        assert_eq!(sizes(&b), [2]);
+        assert!(!term.err.contains("waiting until"), "{}", term.err);
+
+        let mut b = batch_fixture();
+        let other = "pypi_sha286_wait_c";
+        let plan = plan_many(&mut b, &[values[0], values[1], other]).await;
+        let started = std::time::Instant::now();
+        let now = OffsetDateTime::now_utc();
+        seed_pending(&mut b, &plan, values[0], now + time::Duration::seconds(1));
+        seed_pending(
+            &mut b,
+            &plan,
+            values[1],
+            now + time::Duration::milliseconds(1500),
+        );
+        let ids: Vec<String> = values
+            .iter()
+            .map(|v| rotation_of(&plan, v).rotation_id.clone())
+            .collect();
+        let mut term = Recorder::default();
+        let outcomes = {
+            let requested: Vec<&PlannedRotation> = [values[0], values[1], other]
+                .iter()
+                .map(|v| rotation_of(&plan, v))
+                .collect();
+            Executor::new(&b.providers, &b.consumers, &mut b.store, &mut b.audit)
+                .with_wait(true)
+                .with_manual(ReplacementSource::Supplied(None), &mut term)
+                .run_all(&requested)
+                .await
+        };
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
+        assert!(outcomes.iter().all(|o| o.result == RunResult::Revoked));
+        // The other provider's batch precedes the npm group's wait.
+        assert_eq!(sizes(&b), [1, 2]);
+        assert_eq!(term.err.matches("waiting until").count(), 1, "{}", term.err);
+        let notice = term
+            .err
+            .lines()
+            .find(|l| l.contains("waiting until"))
+            .unwrap();
+        assert!(
+            notice.contains(&ids[0]) && notice.contains(&ids[1]),
+            "{notice}"
+        );
+        assert!(notice.contains(&rfc3339(now + time::Duration::milliseconds(1500))));
+        let revoked: Vec<String> = crate::audit::read_all(&b.audit_path)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.step == AuditStep::Revoke && e.outcome == AuditOutcome::Ok)
+            .map(|e| e.rotation_id)
+            .collect();
+        assert_eq!(revoked[0], rotation_of(&plan, other).rotation_id);
+        assert_eq!(revoked[1..], ids);
+    }
+
+    /// SHA-286: a rate-limited revoke says when to re-run; nothing else
+    /// does.
+    #[test]
+    fn retry_hint_text() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(
+            retry_hint(now, Some(std::time::Duration::from_secs(1800))),
+            "re-run rotate apply after 1970-01-01T00:30:00Z (in 30m 0s) to revoke it"
+        );
+        assert_eq!(
+            retry_hint(now, None),
+            "re-run rotate apply once the provider's rate limit resets to revoke it"
+        );
     }
 }

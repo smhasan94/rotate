@@ -27,6 +27,7 @@ use crate::secret::{Fingerprint, SecretPair, SecretValue};
 pub const MUTATING: &[&str] = &[
     "create_replacement",
     "revoke",
+    "revoke_batch",
     "restore",
     "revoke_replacement",
 ];
@@ -338,7 +339,35 @@ pub trait Provider: Send + Sync {
     }
 
     /// Revokes the credential. Mutating, and always the last step.
+    ///
+    /// Apply calls [`revoke_batch`](Self::revoke_batch), never this
+    /// directly (SHA-286). Implement `revoke`, and override `revoke_batch`
+    /// only when the provider has a bulk endpoint.
     async fn revoke(&self, credential: &Credential) -> Result<Revoked, ProviderError>;
+
+    /// Revokes every credential, one result per input in input order
+    /// (SHA-286). Mutating. The default calls [`revoke`](Self::revoke) on
+    /// each in turn and never stops early, so a failure applies to that
+    /// credential only. A provider with a bulk endpoint (GitHub's
+    /// credential revocation API) overrides it to send many in one request.
+    async fn revoke_batch(
+        &self,
+        credentials: &[&Credential],
+    ) -> Vec<Result<Revoked, ProviderError>> {
+        let mut results = Vec::with_capacity(credentials.len());
+        for credential in credentials {
+            results.push(self.revoke(credential).await);
+        }
+        results
+    }
+
+    /// How many credentials one [`revoke_batch`](Self::revoke_batch)
+    /// request takes when the provider sends them together, so apply can
+    /// say how many go in each request (SHA-286). `None` (the default)
+    /// means one call per credential. Pure: no network.
+    fn revoke_batch_size(&self) -> Option<usize> {
+        None
+    }
 
     /// Reactivates a revoked credential by the handle `revoke` returned.
     /// Mutating. Returns `Unsupported` rather than an error when the
@@ -585,10 +614,42 @@ mod tests {
         );
     }
 
+    /// SHA-286 T9 (AC9): the default `revoke_batch` calls `revoke` once
+    /// per credential, in input order, and a failure stops nothing.
+    #[tokio::test]
+    async fn default_revoke_batch_calls_revoke_in_order() {
+        let mock = MockProvider::new("mock");
+        mock.fail_next("revoke", ProviderError::Permanent("denied".into()));
+        let creds: Vec<Credential> = ["mock_batch_a", "mock_batch_b", "mock_batch_c"]
+            .iter()
+            .map(|v| Credential::Token(SecretValue::from(*v)))
+            .collect();
+        let refs: Vec<&Credential> = creds.iter().collect();
+        let results = mock.revoke_batch(&refs).await;
+
+        let calls = mock.call_log().calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        for (call, cred) in calls.iter().zip(&creds) {
+            assert_eq!(call.method, "revoke");
+            assert_eq!(call.fingerprint, Some(cred.fingerprint()));
+        }
+        assert_eq!(results[0], Err(ProviderError::Permanent("denied".into())));
+        for i in [1, 2] {
+            assert_eq!(
+                results[i],
+                Ok(Revoked {
+                    restore_ref: Some(format!("mock-{}", creds[i].fingerprint()))
+                })
+            );
+        }
+        assert_eq!(mock.revoke_batch_size(), None);
+    }
+
     #[test]
     fn mutating_list_matches_contract() {
         assert!(is_mutating("create_replacement"));
         assert!(is_mutating("revoke"));
+        assert!(is_mutating("revoke_batch"));
         assert!(is_mutating("restore"));
         assert!(is_mutating("revoke_replacement"));
         for read_only in ["identify", "check_valid", "describe_scope", "verify"] {

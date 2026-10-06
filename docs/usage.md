@@ -200,7 +200,7 @@ rotate apply trufflehog-report.json --confirm rot-5f36d3cd
 # expect: Apply: 1 revoked, 0 pending revoke, 0 held, 0 failed, 0 need rollback, 0 revoke by hand, 0 skipped.
 ```
 
-For each confirmed rotation, in this order:
+Every confirmed rotation is taken through these steps, in this order:
 
 1. **create** the replacement (or, in manual mode, ask you to paste it);
 2. **update** every consumer the plan listed;
@@ -208,6 +208,14 @@ For each confirmed rotation, in this order:
 4. **revoke** the old secret, last. An npm account that asks for a
    one-time password to delete tokens gets a hidden prompt here (or
    `ROTATE_NPM_OTP`); see [permissions.md](permissions.md).
+
+`rotate apply` takes every rotation through create, update, verify and the revoke
+gate first, then revokes the old secrets, last of all. GitHub tokens go to
+GitHub's credential revocation API together, in one request per 1000
+tokens (GitHub allows 60 such requests an hour), and apply says so on
+stderr. If GitHub rate-limits a request, the rotations still to revoke fail
+at revoke with the old secret still valid and the time to re-run apply;
+nothing is retried. Every rotation keeps its own audit entry and state.
 
 State is saved after every step and every step is appended to the audit
 log. If any step before revoke fails, that rotation stops, the old secret is
@@ -315,6 +323,8 @@ rotate apply trufflehog-report.json --confirm rot-5f36d3cd
 
 For a short window, `--wait` waits in the same run and then revokes. If it
 is interrupted, the revoke stays pending and a later apply finishes it.
+With several rotations, apply waits once per provider, until the latest
+time among that provider's rotations, then revokes them together.
 
 <!-- test: wait -->
 ```sh

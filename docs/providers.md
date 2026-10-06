@@ -32,7 +32,7 @@ or Manual.
 | `create_replacement` | apply | Mints the new secret. In manual mode, `manual_instructions` says what to create and apply asks you to paste it instead. When `scope_widening` returns a note, an automatic replacement would be broader than the leaked secret: the plan shows the note and the `create` audit entry records `scope_widened`. |
 | `verify` | apply | Checks the new secret works and belongs to the same identity, before anything is revoked. |
 | `verify_replacement` | apply (resume) | Checks the replacement by its reference when apply resumes at verify in a new process, since rotate never stores the value. |
-| `revoke` | apply | Revokes the leaked secret. Always the last step. When `manual_revoke` returns a row, the plan shows it instead and apply stops at revoke. When `revoke_blocker` returns a reason (npm without a usable operator token), the plan shows it as a blocker. |
+| `revoke` | apply | Revokes the leaked secret. Always the last step. When `manual_revoke` returns a row, the plan shows it instead and apply stops at revoke. When `revoke_blocker` returns a reason (npm without a usable operator token), the plan shows it as a blocker. Apply revokes every rotation of a run together at the end through `revoke_batch`, one call per provider; its default calls `revoke` for each secret, and a provider with a bulk endpoint overrides it and names its request size in `revoke_batch_size`. |
 | `revoke_replacement` | rollback | Revokes the replacement by its reference. |
 | `restore` | rollback | Brings the revoked secret back. |
 
@@ -62,7 +62,7 @@ or Manual.
 | `create_replacement` | Manual | none | GitHub has no API to create tokens. Apply names the page and, for a classic token, the scopes, then asks you to paste the new token. |
 | `verify` | Automated | none | `GET /user` with the pasted token; the login must match. |
 | `verify_replacement` | Unsupported | none | A pasted token is never stored. A rotation that stopped before verify is marked `needs_rollback`. |
-| `revoke` | Automated | none | `POST /credentials/revoke`, unauthenticated. `ghs_` installation tokens and legacy 40-hex tokens are not accepted by that API and are never revoked; `ghs_` tokens expire within an hour. |
+| `revoke` | Automated | none | `POST /credentials/revoke`, unauthenticated. Apply sends every GitHub token of a run in one request per 1000, since GitHub allows 60 such requests an hour; a rate-limited request stops the rest, which fail with the time to re-run. `ghs_` installation tokens and legacy 40-hex tokens are not accepted by that API and are never revoked; `ghs_` tokens expire within an hour. |
 | `revoke_replacement` | Manual | none | Rollback cannot revoke a pasted token and tells you to revoke it on GitHub by hand. |
 | `restore` | Unsupported | none | GitHub cannot reactivate a revoked token. Rollback restores consumers only and exits 1. |
 
