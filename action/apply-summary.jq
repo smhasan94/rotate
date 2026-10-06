@@ -13,6 +13,8 @@
 #   $server      GITHUB_SERVER_URL, for alert links
 #   $run_url     this workflow run, or ""
 #   $notes       rotate's `warning:`, `error:` and `note:` lines
+#   $not_applied confirmed ids rotate did not apply although it exited 0
+#                ("" otherwise); $exit_code is then 2
 #
 # Every value comes from rotate's output and the state file, which hold
 # fingerprints and references only, never a secret value.
@@ -37,7 +39,11 @@ def code: "`" + (tostring | gsub("`"; "'")) + "`";
     "",
     "Confirmed: " + ([$ids[] | code] | join(", ")) + ".",
     "",
-    (if $exit_code == "0" then
+    (if $not_applied != "" then
+       "**Not applied.** rotate apply exited 0 but did not apply "
+       + ([$not_applied | split(",")[] | code] | join(", "))
+       + ": the alerts fetched again planned nothing for them, for example because an alert was resolved or the secret was revoked while the job waited for approval. Nothing was revoked for them; check the alerts and run the plan again."
+     elif $exit_code == "0" then
        "**Done.** Every confirmed rotation finished: the replacement is in every consumer, verified, and the old secret is revoked."
      elif $exit_code == "1" then
        "**Failed: the old secret is still valid.** rotate stopped before revoking it. The step and error of each rotation are below; the audit log has every step. Re-run `rotate apply` with the state file once the cause is fixed, or `rotate rollback`."

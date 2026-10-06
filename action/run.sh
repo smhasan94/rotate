@@ -38,7 +38,9 @@
 # could not be fetched (rotate is not run), otherwise rotate's own code.
 # For apply that is 0 done, 1 failed (the old secret is still valid), 2
 # nothing changed, 3 the overlap window ends after MAX_WAIT (the old
-# secret is not revoked), 4 revoke by hand.
+# secret is not revoked), 4 revoke by hand. When rotate exits 0 but a
+# confirmed rotation is not at `revoked` (it found nothing to apply), the
+# step exits 2.
 #
 # Never `set -x`: it would print the token. Works with bash 3.2.
 set -euo pipefail
@@ -190,6 +192,11 @@ output() {
     printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
   fi
 }
+
+# Set before any fetch, probe or apply: the audit upload in action.yml
+# runs on always() and needs it even when this step is killed or times
+# out in the middle of a --wait.
+output state-dir "$state_dir"
 
 # The summary goes to the job summary and to the log.
 publish_summary() {
@@ -346,7 +353,7 @@ fi
 # Renders the apply summary from status.json (if any) and $notes, then
 # publishes it.
 apply_summary() {
-  local code=$1 overlap=$2 rows_arg=()
+  local code=$1 overlap=$2 not_applied=$3 rows_arg=()
   if [ -s "$status_path" ]; then
     rows_arg=(--slurpfile rows "$status_path")
   else
@@ -364,6 +371,7 @@ apply_summary() {
     --arg confirm "$CONFIRM" \
     --arg overlap "$overlap" \
     --arg max_wait "$MAX_WAIT" \
+    --arg not_applied "$not_applied" \
     -f "$ACTION_DIR/apply-summary.jq" > "$summary_path"
   publish_summary
 }
@@ -435,9 +443,8 @@ if [ "$MODE" = apply ]; then
     cat "$log_file" >&2
     notes=$(grep -E '^(warning|error|note): ' "$log_file" 2>/dev/null || true)
     rm -f "$log_file"
-    output state-dir "$state_dir"
     annotate "rotate apply did not start (exit $probe_status); nothing was changed. See the job summary."
-    apply_summary "$probe_status" ""
+    apply_summary "$probe_status" "" ""
     output exit-code "$probe_status"
     exit "$probe_status"
   fi
@@ -454,6 +461,30 @@ if [ "$MODE" = apply ]; then
     printf 'The overlap window (%s) is longer than max-wait (%s): rotate will not wait, and the old secret will not be revoked in this run.\n' \
       "${overlap:-unknown}" "$MAX_WAIT" >&2
   fi
+
+  # A revoke time an earlier apply recorded for a confirmed rotation wins
+  # over this run's window (rotate keeps it), so wait only if that time too
+  # is within max-wait. `rotate status` reads the state file only; it exits
+  # 3 while a rotation is pending. When the time cannot be read, no wait.
+  if [ ${#wait_flag[@]} -gt 0 ]; then
+    pending_secs=unknown
+    status_rc=0
+    (
+      unset ALERTS_TOKEN
+      "$ROTATE_BIN" "${rotate_flags[@]}" --json status --all > "$status_path"
+    ) || status_rc=$?
+    if [ "$status_rc" -eq 0 ] || [ "$status_rc" -eq 3 ]; then
+      pending_secs=$(jq -r --arg ids "$CONFIRM" \
+        '[.[] | select(.rotation_id as $id | $ids | split(",") | index($id)) | .revoke_remaining_seconds // empty] | max // 0' \
+        "$status_path" 2>/dev/null || echo unknown)
+    fi
+    rm -f "$status_path"
+    if ! [[ $pending_secs =~ ^[0-9]+$ ]] || [ "$pending_secs" -gt "$max_secs" ]; then
+      wait_flag=()
+      printf 'A confirmed rotation has a revoke time recorded more than max-wait (%s) from now, or it could not be read: rotate will not wait, and the old secret will not be revoked in this run.\n' \
+        "$MAX_WAIT" >&2
+    fi
+  fi
 fi
 
 set +e
@@ -466,8 +497,6 @@ statuses=("${PIPESTATUS[@]}")
 set -e
 fetch_status=${statuses[0]}
 rotate_status=${statuses[1]}
-
-output state-dir "$state_dir"
 
 # AC7: the alerts could not be fetched. The summary holds this message only.
 if [ "$fetch_status" -ne 0 ] || [ "$rotate_status" -eq 99 ]; then
@@ -512,8 +541,33 @@ if [ "$MODE" = apply ]; then
   if [ "$status_rc" -ne 0 ] && [ "$status_rc" -ne 3 ]; then
     rm -f "$status_path"
   fi
+  # rotate exits 0 with "Nothing to apply." when the alerts fetched again
+  # plan nothing, for example when an alert was resolved or a secret
+  # revoked while the job waited for approval. Done means every confirmed
+  # rotation is revoked; anything else is reported as not applied, exit 2.
+  not_applied=
+  if [ "$rotate_status" -eq 0 ]; then
+    if [ -s "$status_path" ]; then
+      not_applied=$(jq -r --arg ids "$CONFIRM" \
+        '[.[] | select(.step == "revoked") | .rotation_id] as $done
+         | [$ids | split(",")[] | select(. as $id | $done | index($id) | not)]
+         | join(",")' "$status_path" 2>/dev/null) || not_applied=$CONFIRM
+    else
+      not_applied=$CONFIRM
+    fi
+    if [ -n "$not_applied" ]; then
+      rotate_status=2
+    fi
+  fi
   case $rotate_status in
     0) ;;
+    2)
+      if [ -n "$not_applied" ]; then
+        annotate "The confirmed rotations $not_applied were not applied: rotate apply found nothing to do for them. See the job summary."
+      else
+        annotate "rotate apply exited with code 2; nothing was changed. See the job summary."
+      fi
+      ;;
     1) annotate "rotate apply failed; the old secret is still valid. See the job summary." ;;
     3)
       at=$(jq -r --arg ids "$CONFIRM" \
@@ -524,7 +578,7 @@ if [ "$MODE" = apply ]; then
     4) annotate "rotate cannot revoke the old secret: revoke it by hand as the job summary says." ;;
     *) annotate "rotate apply exited with code $rotate_status. See the job summary." ;;
   esac
-  apply_summary "$rotate_status" "$overlap"
+  apply_summary "$rotate_status" "$overlap" "$not_applied"
   output exit-code "$rotate_status"
   exit "$rotate_status"
 fi

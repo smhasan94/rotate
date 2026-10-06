@@ -351,7 +351,7 @@ jobs:
       - if: steps.rotate.outputs.rotation-ids != ''
         uses: actions/upload-artifact@v4
         with:
-          name: rotate-state-${{ github.run_id }}
+          name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.rotate.outputs.state-dir }}
           include-hidden-files: true # the files are under .rotate/
           retention-days: 1
@@ -379,7 +379,7 @@ jobs:
           aws-region: us-east-1
       - uses: actions/download-artifact@v4
         with:
-          name: rotate-state-${{ github.run_id }}
+          name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rotate-plan-state
       - uses: smhasan94/rotate@vX.Y.Z
         with:
@@ -411,13 +411,18 @@ consumers could not all be updated is not revoked unless `force: true`.
 
 The job summary is built from `rotate --json status --all` and the exit
 code: one row per confirmed rotation with its step, consumers updated,
-revoke time, next step and error. The step's exit code is rotate's:
+revoke time, next step and error. The step's exit code is rotate's, with
+one exception: rotate exits 0 with "Nothing to apply." when the alerts it
+fetches again plan nothing, for example when an alert was resolved or the
+secret revoked while the job waited for approval. The step passes only
+when every confirmed rotation is at `revoked` in the state file;
+otherwise it exits 2 and names the rotations that were not applied.
 
 | Exit | Meaning | The step | The summary says |
 | --- | --- | --- | --- |
-| 0 | Every confirmed rotation finished; the old secrets are revoked. | passes | Done. |
+| 0 | Every confirmed rotation finished: `rotate status` shows each at `revoked`. | passes | Done. |
 | 1 | A step failed; rotate stopped before the revoke. | fails | The old secret is still valid, with each rotation's step and error. |
-| 2 | Nothing was changed: a configuration error, an id not in the state file, a manual replacement missing. | fails | rotate's error. |
+| 2 | Nothing was changed: a configuration error, an id not in the state file, a manual replacement missing; or rotate exited 0 without applying a confirmed rotation. | fails | rotate's error, or "Not applied" with the rotation ids. |
 | 3 | The overlap window is longer than `max-wait`. Created, updated and verified, not revoked. | fails | The time after which the old secret may be revoked. |
 | 4 | rotate cannot revoke the old secret. | fails | The provider's instructions for revoking it by hand. |
 
@@ -434,13 +439,22 @@ not wait: it creates, updates and verifies, then fails with exit 3 and
 the revoke time. After that time, revoke the old secret yourself: with
 the state file from the audit artifact (`rotate apply --state-file ...`
 with the same input), or by hand at the provider. Resuming a pending
-revoke from a later workflow run is not supported.
+revoke from a later workflow run is not supported. The step also
+declines to wait when the state it was given already records a revoke
+time for a confirmed rotation that is more than `max-wait` away.
 
 Do not re-run a failed apply job: it would start again from the plan
 job's state, not from where the failed run stopped, and could create a
-second replacement. Download its audit artifact and continue with rotate
-by hand (`rotate status`, `rotate apply` or `rotate rollback` with
-`--state-file` and `--audit-log` pointing into it).
+second replacement. The state artifact's name carries
+`github.run_attempt` for this reason: "Re-run failed jobs" runs the apply
+job as a new attempt whose download finds no artifact of that name, so it
+fails before rotate runs; "Re-run all jobs" plans again and hands over a
+fresh state. To continue a failed or pending rotation, download the failed
+run's audit artifact and use rotate by hand (`rotate status`, `rotate
+apply` or `rotate rollback` with `--state-file` and `--audit-log`
+pointing into it). With `upload-audit: false` there is no such artifact:
+after an exit 3 or 4 no state is left to resume from, and the old secret
+must be revoked by hand at the provider.
 
 ### The audit artifact
 

@@ -1099,7 +1099,7 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
     // The caller workflow in the doc: the state hand-off and the approval.
     for needle in [
         "environment: rotate-apply",
-        "name: rotate-state-${{ github.run_id }}",
+        "name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}",
         "retention-days: 1",
         "include-hidden-files: true",
         "actions/download-artifact",
@@ -1120,8 +1120,9 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
 
 /// Stands in for rotate in an apply step: each subcommand but `apply`
 /// runs with its scenario variant (`ActionRun::scenario`), so the call log
-/// of `apply` survives the overlap probe before it and the status run
-/// after it.
+/// of `apply` survives the overlap probe before it and the status runs
+/// around it. It also keeps a copy of `GITHUB_OUTPUT` as each subcommand
+/// starts (`inputs/output-before-<cmd>`).
 const ROTATE_SHIM: &str = r#"#!/bin/sh
 cmd=
 for arg in "$@"; do
@@ -1129,6 +1130,9 @@ for arg in "$@"; do
     plan | apply | status) cmd=$arg; break ;;
   esac
 done
+if [ -n "$cmd" ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
+  cp "$GITHUB_OUTPUT" "${ROTATE_TEST_SCENARIO%/*}/output-before-$cmd"
+fi
 variant="${ROTATE_TEST_SCENARIO%.json}.$cmd.json"
 if [ "$cmd" != apply ] && [ -f "$variant" ]; then
   ROTATE_TEST_SCENARIO=$variant
@@ -1171,6 +1175,12 @@ impl ActionRun {
         self.set("MODE", "apply");
         self.set("CONFIRM", ids);
         self.set("PLAN_STATE_DIR", &download.display().to_string());
+    }
+
+    /// `GITHUB_OUTPUT` as it was when the step first ran rotate (the
+    /// overlap probe, `plan`); `None` if rotate never ran.
+    fn output_before_rotate(&self) -> Option<String> {
+        std::fs::read_to_string(self.path("inputs/output-before-plan")).ok()
     }
 
     /// The calls of one of the apply step's other rotate runs: `plan` (the
@@ -1243,6 +1253,29 @@ fn rotation_steps(calls: &[Value]) -> Vec<String> {
                 .any(|m| c.ends_with(&format!(".{m}")))
         })
         .collect()
+}
+
+/// The plan job for `secret` on `rec`, then an apply job for its rotation
+/// in a fresh runner temp, with an overlap of `0s` and `extra` in the
+/// scenario. Returns the apply run (not yet run) and the rotation id.
+async fn apply_after_plan(
+    rec: &CallRecorder,
+    token: &str,
+    secret: &str,
+    extra: Value,
+) -> (ActionRun, String) {
+    let (plan, id, _) = plan_job(rec, token, secret).await;
+    let mut run = ActionRun::new(&rec.uri(), token);
+    run.apply_job(&plan, &id);
+    run.set("OVERLAP", "0s");
+    run.scenario(apply_scenario(secret, extra));
+    (run, id)
+}
+
+fn assert_no_mutating(run: &ActionRun) {
+    let calls = run.calls().unwrap_or_default();
+    let mutating: Vec<&Value> = calls.iter().filter(|c| c["mutating"] == true).collect();
+    assert!(mutating.is_empty(), "state-changing calls: {mutating:?}");
 }
 
 fn assert_no_revoke(calls: &[Value]) {
@@ -1331,6 +1364,13 @@ async fn sha338_t1_apply_runs_every_step_in_order_without_a_prompt() {
     assert_eq!(outputs["exit-code"], "0");
     assert_eq!(outputs["state-dir"], run.state_dir().display().to_string());
     assert!(!outputs.contains_key("rotation-ids"));
+    // state-dir was set before rotate first ran, so the audit upload has
+    // it even if the step is killed during --wait.
+    let before = run.output_before_rotate().expect("rotate ran");
+    assert!(
+        before.contains(&format!("state-dir={}\n", run.state_dir().display())),
+        "{before}"
+    );
 
     // The state the plan job handed over was used: same id, a private
     // copy, and its audit trail continues in the apply job's audit log.
@@ -1571,6 +1611,40 @@ async fn sha338_t4_bad_confirm_exits_2_before_any_request() {
     }
     assert_eq!(requests(&rec).await, Vec::<String>::new());
 
+    // A state-dir whose .rotate, or whose state.json, is a symbolic link
+    // is refused the same way.
+    let linked_dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(
+        scratch.path().join(".rotate"),
+        linked_dir.path().join(".rotate"),
+    )
+    .unwrap();
+    let linked_file = tempfile::tempdir().unwrap();
+    std::fs::create_dir(linked_file.path().join(".rotate")).unwrap();
+    std::os::unix::fs::symlink(
+        scratch.path().join(".rotate/state.json"),
+        linked_file.path().join(".rotate/state.json"),
+    )
+    .unwrap();
+    for dir in [linked_dir.path(), linked_file.path()] {
+        for args in [&[][..], &["--check-inputs"][..]] {
+            let mut run = ActionRun::new(&rec.uri(), &token);
+            run.set("MODE", "apply");
+            run.set("CONFIRM", "rot-1a2b3c4d");
+            run.set("PLAN_STATE_DIR", &dir.display().to_string());
+            let output = run.run("run.sh", args);
+            let stderr = text(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{stderr}");
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(
+                stderr.starts_with("::error title=rotate::input state-dir:"),
+                "{stderr}"
+            );
+            assert!(run.calls().is_none());
+        }
+    }
+    assert_eq!(requests(&rec).await, Vec::<String>::new());
+
     // The same state directory with good ids passes the checks.
     let mut run = ActionRun::new(&rec.uri(), &token);
     run.set("MODE", "apply");
@@ -1657,4 +1731,293 @@ async fn sha338_t5_apply_leaks_no_secret_anywhere() {
         names.contains(&"audit.jsonl".to_owned()) && names.contains(&"state.json".to_owned()),
         "{names:?}"
     );
+
+    // Automatic mode: the replacement rotate creates (the mock's value)
+    // appears nowhere either.
+    let secret = ghp_canary();
+    let rec = CallRecorder::start().await;
+    let (plan, id, plan_output) = plan_job(&rec, &token, &secret).await;
+    let mut run = ActionRun::new(&rec.uri(), &token);
+    run.apply_job(&plan, &id);
+    run.set("OVERLAP", "0s");
+    run.set("VERBOSE", "3");
+    run.scenario(apply_scenario(&secret, json!({})));
+    let output = run.run("run.sh", &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        rotation_steps(&run.calls().unwrap())[0],
+        "github.create_replacement"
+    );
+    let canaries = [
+        Canary::new("leaked secret", &secret),
+        Canary::new("created replacement", MOCK_GITHUB_REPLACEMENT),
+        Canary::new("alerts token", &token),
+    ];
+    run.sweep(&output, &canaries);
+    plan.sweep(&plan_output, &canaries);
+    let sweep = Sweep::new(&canaries);
+    for dir in [
+        run.path("runner_temp/rotate-plan-state"),
+        run.state_dir().join(".rotate"),
+    ] {
+        assert_no_hits(
+            &format!("artifact {}", dir.display()),
+            &sweep.scan_dir(&dir, &[]),
+        );
+    }
+}
+
+/// The first replacement the mock `github` provider creates in a run
+/// (`src/provider/mock.rs`: identify prefix, name, `-replacement-1`).
+const MOCK_GITHUB_REPLACEMENT: &str = "ghp_github-replacement-1";
+
+// ---------------------------------------------------------------------------
+// SHA-338 review: rotate exits 0 without applying, fetch failures, an
+// unknown id, the max-wait boundary, a probe config error, a recorded
+// revoke time
+// ---------------------------------------------------------------------------
+
+/// The alert was resolved while the job waited for approval: rotate finds
+/// nothing to apply and exits 0. The step must not report Done.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha338_exit_0_without_applying_is_not_done() {
+    if !tools_present() {
+        return;
+    }
+    let secret = ghp_canary();
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let (plan, id, _) = plan_job(&rec, &token, &secret).await;
+
+    // The apply job's alerts API: alert 42 is now resolved.
+    let later = CallRecorder::start().await;
+    let mut resolved = alert(42, "github_personal_access_token", Some(&secret));
+    resolved["state"] = json!("resolved");
+    resolved["resolution"] = json!("revoked");
+    serve_alert(&later, &token, &resolved).await;
+    serve_key_ids(&later, &token, json!([])).await;
+    let mut run = ActionRun::new(&later.uri(), &token);
+    run.apply_job(&plan, &id);
+    run.set("OVERLAP", "0s");
+    run.scenario(apply_scenario(&secret, json!({})));
+    let output = run.run("run.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "::error title=rotate::The confirmed rotations {id} were not applied"
+        )),
+        "{stderr}"
+    );
+    assert_no_mutating(&run);
+    let summary = run.summary();
+    assert!(!summary.contains("**Done.**"), "{summary}");
+    assert!(
+        summary.contains(&format!(
+            "**Not applied.** rotate apply exited 0 but did not apply `{id}`"
+        )),
+        "{summary}"
+    );
+    assert_eq!(run.outputs()["exit-code"], "2");
+}
+
+/// Apply-mode fetch failures: the second alert fails (the poison byte:
+/// rotate refuses the whole input), or the first does (rotate apply never
+/// starts). Exit 1, no provider or consumer call, and state-dir is set
+/// for the audit upload all the same.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha338_fetch_failure_in_apply_calls_nothing() {
+    if !tools_present() {
+        return;
+    }
+    let secret = ghp_canary();
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let (mut run, _) = apply_after_plan(&rec, &token, &secret, json!({})).await;
+    Mock::given(method("GET"))
+        .and(path(format!("{ALERTS_PATH}/43")))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(rec.server())
+        .await;
+
+    run.set("ALERT_NUMBER", "42,43");
+    let output = run.run("run.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("HTTP 404"), "{stderr}");
+    // rotate apply read the input and refused it: no call at all.
+    assert_eq!(run.calls().unwrap_or_default(), Vec::<Value>::new());
+    assert_eq!(status_rows_or_none(&run), None);
+    let outputs = run.outputs();
+    assert_eq!(outputs["exit-code"], "1");
+    assert_eq!(outputs["state-dir"], run.state_dir().display().to_string());
+    assert!(run
+        .output_before_rotate()
+        .unwrap()
+        .contains(&format!("state-dir={}\n", run.state_dir().display())));
+    run.sweep(
+        &output,
+        &[
+            Canary::new("alert secret", &secret),
+            Canary::new("alerts token", &token),
+        ],
+    );
+
+    // The first request fails: rotate apply is never started.
+    let _ = std::fs::remove_file(run.call_log());
+    run.set("ALERT_NUMBER", "43");
+    let output = run.run("run.sh", &[]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert!(run.calls().is_none(), "rotate apply ran");
+    assert_eq!(
+        run.outputs()["state-dir"],
+        run.state_dir().display().to_string()
+    );
+}
+
+fn status_rows_or_none(run: &ActionRun) -> Option<Vec<Value>> {
+    let text = std::fs::read(run.path("runner_temp/rotate/status.json")).ok()?;
+    Some(serde_json::from_slice(&text).unwrap())
+}
+
+/// A well-formed id that is not in the plan: rotate exits 2, nothing is
+/// changed.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha338_unknown_confirmed_id_exits_2() {
+    if !tools_present() {
+        return;
+    }
+    let secret = ghp_canary();
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let (mut run, id) = apply_after_plan(&rec, &token, &secret, json!({})).await;
+    let unknown = if id == "rot-00000000" {
+        "rot-11111111"
+    } else {
+        "rot-00000000"
+    };
+    run.set("CONFIRM", unknown);
+    let output = run.run("run.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert_no_mutating(&run);
+    let summary = run.summary();
+    assert!(summary.contains("**Nothing was changed.**"), "{summary}");
+    assert!(summary.contains("- error: "), "{summary}");
+    assert!(!summary.contains("**Done.**"), "{summary}");
+    assert_eq!(run.outputs()["exit-code"], "2");
+}
+
+/// A window equal to max-wait is waited out; one second more is not.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha338_max_wait_boundary() {
+    if !tools_present() {
+        return;
+    }
+    let token = token_canary();
+    for (overlap, code, waits) in [("2s", 0, true), ("3s", 3, false)] {
+        let secret = ghp_canary();
+        let rec = CallRecorder::start().await;
+        let (mut run, _) = apply_after_plan(&rec, &token, &secret, json!({})).await;
+        run.set("OVERLAP", overlap);
+        run.set("MAX_WAIT", "2s");
+        let output = run.run("run.sh", &[]);
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{overlap}: {stderr}");
+        assert_eq!(stderr.contains("waiting until"), waits, "{stderr}");
+        assert_eq!(
+            stderr.contains(&format!(
+                "The overlap window ({overlap}) is longer than max-wait (2s)"
+            )),
+            !waits,
+            "{stderr}"
+        );
+        if !waits {
+            assert_no_revoke(&run.calls().unwrap());
+        }
+    }
+}
+
+/// A bad rotate.yaml stops apply mode at the overlap probe: exit 2,
+/// before any request, nothing changed.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha338_probe_config_error_stops_before_any_request() {
+    if !tools_present() {
+        return;
+    }
+    let secret = ghp_canary();
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let (mut run, _) = apply_after_plan(&rec, &token, &secret, json!({})).await;
+    let planned = requests(&rec).await.len();
+    run.set("OVERLAP", "");
+    std::fs::write(run.path("work/rotate.yaml"), "overlap_window: soon\n").unwrap();
+    let output = run.run("run.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("::error title=rotate::rotate apply did not start (exit 2)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        requests(&rec).await.len(),
+        planned,
+        "the alerts were fetched"
+    );
+    assert!(run.calls().is_none(), "rotate apply ran");
+    let summary = run.summary();
+    assert!(summary.contains("**Nothing was changed.**"), "{summary}");
+    assert!(summary.contains("invalid duration"), "{summary}");
+    let outputs = run.outputs();
+    assert_eq!(outputs["exit-code"], "2");
+    assert_eq!(outputs["state-dir"], run.state_dir().display().to_string());
+}
+
+/// The state handed over already records a revoke time for the confirmed
+/// rotation (an earlier apply exited 3). This run's window is 0s, but
+/// rotate keeps the recorded time, so the step must not wait for it when
+/// it is more than max-wait away.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha338_recorded_revoke_time_beyond_max_wait_is_not_waited_for() {
+    use time::OffsetDateTime;
+
+    if !tools_present() {
+        return;
+    }
+    let secret = ghp_canary();
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let (mut first, id) = apply_after_plan(&rec, &token, &secret, json!({})).await;
+    first.set("OVERLAP", "2h");
+    first.set("MAX_WAIT", "1h");
+    let output = first.run("run.sh", &[]);
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output.stderr));
+
+    let mut run = ActionRun::new(&rec.uri(), &token);
+    run.apply_job(&first, &id);
+    run.set("OVERLAP", "0s");
+    run.set("MAX_WAIT", "1h");
+    run.scenario(apply_scenario(&secret, json!({})));
+    let started = OffsetDateTime::now_utc();
+    let output = run.run("run.sh", &[]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(
+        OffsetDateTime::now_utc() - started < time::Duration::minutes(1),
+        "the step waited"
+    );
+    assert!(
+        stderr.contains("revoke time recorded more than max-wait (1h) from now"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("waiting until"), "{stderr}");
+    assert_no_revoke(&run.calls().unwrap());
+    assert_eq!(status_rows(&run)[0]["step"], "pending_revoke");
 }
