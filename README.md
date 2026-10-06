@@ -10,6 +10,11 @@ still valid, creates a replacement, updates every place that uses the secret
 works, and only then revokes the old one. Every step goes to a local audit
 log that holds fingerprints, never values.
 
+![Demo: rotate plan shows the rotation of a leaked AWS key used by a GitHub
+Actions secret and a Secrets Manager entry, rotate apply rotates it after the
+typed confirmation, rotate status shows it done, and the audit log holds
+fingerprints only](docs/demo/demo.gif)
+
 MVP providers: AWS IAM access keys, GitHub tokens, npm access tokens and
 OpenAI API keys.
 

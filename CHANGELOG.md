@@ -22,6 +22,10 @@ All notable changes to rotate are recorded here. The format follows
 - Homebrew: `brew install smhasan94/rotate/rotate` on macOS and Linux.
   Each release updates the formula in the smhasan94/homebrew-rotate tap.
   (SHA-339)
+- A recorded demo at the top of the README: plan, apply, status and the
+  audit log for a leaked AWS key, simulated with the `test-providers`
+  build. `scripts/demo.sh` runs it, and `docs/demo/demo.tape` re-renders
+  it with vhs. (SHA-340)
 
 ### Changed
 
