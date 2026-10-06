@@ -1472,6 +1472,55 @@ fn sha287_t8_userinfo_canary_stays_out_of_every_output() {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-332 T2 (AC2): a credential in an endpoint URL's query or fragment
+// ---------------------------------------------------------------------------
+
+/// A canary in the query string or fragment of each endpoint field's URL:
+/// `rotate plan` refuses the config (exit 2) before any call, and the
+/// canary appears nowhere, in stdout, stderr or any file rotate wrote.
+#[test]
+fn sha332_t2_query_canary_stays_out_of_every_output() {
+    let url_safe =
+        |c: String| -> String { c.chars().filter(char::is_ascii_alphanumeric).collect() };
+    let query = url_safe(canary());
+    let fragment = url_safe(canary());
+    assert!(query.len() >= 16 && fragment.len() >= 16);
+    let sweep = Sweep::new(&[
+        Canary::new("URL query", &query),
+        Canary::new("URL fragment", &fragment),
+    ]);
+    let urls = [
+        format!("https://proxy.example.com/?access_token={query}"),
+        format!("https://ghe.example.com/api/v3?token={query}#{fragment}"),
+        format!("http://localhost:4873/#{fragment}"),
+    ];
+    let templates = [
+        "providers:\n  aws:\n    endpoint_url: \"{}\"\n",
+        "providers:\n  github:\n    api_url: \"{}\"\n",
+        "providers:\n  npm:\n    registry: \"{}\"\n",
+        "providers:\n  openai:\n    api_url: \"{}\"\n",
+    ];
+    for template in templates {
+        for url in &urls {
+            let run = MockRun::new();
+            let config = run.path("inputs/rotate.yaml");
+            std::fs::write(&config, template.replace("{}", url)).unwrap();
+            let config = config.to_str().unwrap();
+            let output = run.expect(2, &["--config", config, "plan", "--stdin"]);
+            assert!(
+                text(&output.stderr).contains("must not have a query string or fragment"),
+                "{}",
+                shown(&output)
+            );
+            let mut hits = sweep.scan("stdout", &output.stdout);
+            hits.extend(sweep.scan("stderr", &output.stderr));
+            hits.extend(sweep.scan_dir(run.root.path(), &[run.path("inputs")]));
+            assert_no_hits("a config with a token in a URL query", &hits);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SHA-288 T8 (AC8): the npm one-time password through the binary
 // ---------------------------------------------------------------------------
 

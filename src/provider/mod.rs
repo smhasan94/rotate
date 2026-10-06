@@ -369,6 +369,15 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Whether [`revoke_batch`](Self::revoke_batch) would put `credential`
+    /// in a request, so apply's "in one request" notice counts only those
+    /// (SHA-330). The default, `true`, suits a provider without a bulk
+    /// endpoint. Pure: no network.
+    fn batchable(&self, credential: &Credential) -> bool {
+        let _ = credential;
+        true
+    }
+
     /// Reactivates a revoked credential by the handle `revoke` returned.
     /// Mutating. Returns `Unsupported` rather than an error when the
     /// provider cannot.
@@ -643,6 +652,8 @@ mod tests {
             );
         }
         assert_eq!(mock.revoke_batch_size(), None);
+        // SHA-330 T3 (AC3): the default puts every credential in a batch.
+        assert!(mock.batchable(&Credential::Token(SecretValue::from("mock_t3"))));
     }
 
     #[test]

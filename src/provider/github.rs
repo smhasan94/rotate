@@ -649,6 +649,14 @@ impl Provider for GithubProvider {
         Some(REVOKE_BATCH)
     }
 
+    /// A token GitHub's revocation API accepts, as [`revoke_batch`] decides
+    /// (SHA-330).
+    ///
+    /// [`revoke_batch`]: Provider::revoke_batch
+    fn batchable(&self, credential: &Credential) -> bool {
+        token(credential).is_ok_and(|t| revocable(t, &self.web_url()).is_ok())
+    }
+
     /// GitHub cannot reactivate a revoked token.
     async fn restore(&self, _restore_ref: &str) -> Result<RestoreOutcome, ProviderError> {
         Ok(RestoreOutcome::Unsupported)
@@ -879,6 +887,27 @@ mod tests {
         assert_eq!(p.manual_revoke(Some(&scope_of(&["type: classic"]))), None);
         assert_eq!(p.manual_revoke(Some(&scope_of(&[]))), None);
         assert_eq!(p.manual_revoke(None), None);
+    }
+
+    /// SHA-330 T3 (AC3): batchable is exactly what the revocation API
+    /// accepts.
+    #[test]
+    fn batchable_matches_revocable() {
+        let p = provider();
+        let cred = |v: String| Credential::Token(SecretValue::from(v.as_str()));
+        for accepted in [
+            tok(["gh", "p_"], 36),
+            tok(["github", "_pat_"], 82),
+            tok(["gh", "o_"], 36),
+            tok(["gh", "u_"], 36),
+            tok(["gh", "r_"], 76),
+        ] {
+            assert!(p.batchable(&cred(accepted)));
+        }
+        let legacy = "0123456789abcdef".repeat(3)[..40].to_owned();
+        for refused in [tok(["gh", "s_"], 36), legacy, "not a token".to_owned()] {
+            assert!(!p.batchable(&cred(refused)));
+        }
     }
 
     #[test]

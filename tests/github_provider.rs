@@ -1401,24 +1401,22 @@ async fn sha286_t6_revoke_batch_leaves_out_installation_tokens() {
     assert!(results[1].is_ok() && results[2].is_ok());
 }
 
-// SHA-286 T6 (AC6), through the executor: an installation token whose
-// scope does not name its type reaches the batch, is refused there and
-// ends as a revoke by hand; the others are revoked in one request.
-#[tokio::test]
-async fn sha286_t6_installation_token_in_a_batch_is_by_hand() {
+/// One installation token, whose scope does not name its type, plus the
+/// classic tokens `others`, all verified and run through the executor
+/// with GitHub answering every revoke with 202.
+async fn installation_batch(
+    tag: &str,
+    others: &[String],
+) -> (CallRecorder, Term, Vec<rotate::apply::Outcome>) {
     let rec = CallRecorder::start().await;
     mount_revoke(&rec, 202).await;
-    let installation = token(["gh", "s_"], "t6InEx");
+    let installation = token(["gh", "s_"], &format!("{tag}InEx"));
     mount_installation(&rec, &installation).await;
-    let others = [classic("t6ExCl1"), classic("t6ExCl2")];
-    mount_leaked(&rec, &others).await;
-    let values = [
-        installation.as_str(),
-        others[0].as_str(),
-        others[1].as_str(),
-    ];
+    mount_leaked(&rec, others).await;
+    let mut values = vec![installation.as_str()];
+    values.extend(others.iter().map(String::as_str));
     let mut p = pipeline_many(&rec, &values, Vec::new()).await;
-    for value in values {
+    for value in &values {
         seed_verified(&mut p, value);
     }
     let fp = SecretValue::from(installation.as_str()).fingerprint();
@@ -1453,6 +1451,17 @@ async fn sha286_t6_installation_token_in_a_batch_is_by_hand() {
         }
         other => panic!("expected a revoke by hand, got {other:?}"),
     }
+    (rec, term, outcomes)
+}
+
+// SHA-286 T6 (AC6), through the executor: an installation token whose
+// scope does not name its type reaches the batch, is refused there and
+// ends as a revoke by hand; the others are revoked in one request.
+// SHA-330 T1 (AC1): the notice counts the two tokens the request carries.
+#[tokio::test]
+async fn sha286_t6_installation_token_in_a_batch_is_by_hand() {
+    let others = [classic("t6ExCl1"), classic("t6ExCl2")];
+    let (rec, term, outcomes) = installation_batch("t6", &others).await;
     assert_eq!(outcomes[1].result, RunResult::Revoked);
     assert_eq!(outcomes[2].result, RunResult::Revoked);
     let sent = revokes(&rec).await;
@@ -1461,6 +1470,25 @@ async fn sha286_t6_installation_token_in_a_batch_is_by_hand() {
         sent[0].0,
         serde_json::json!({ "credentials": [others[0], others[1]] })
     );
+    assert!(
+        term.err.contains("revoking 2 github tokens in one request"),
+        "{}",
+        term.err
+    );
+    assert!(!term.err.contains("revoking 3"), "{}", term.err);
+}
+
+// SHA-330 T2 (AC2): with the installation token left out, one token goes
+// in the request, so there is no "in one request" notice.
+#[tokio::test]
+async fn sha330_t2_one_batchable_token_has_no_batch_notice() {
+    let others = [classic("t2ExCl1")];
+    let (rec, term, outcomes) = installation_batch("t2", &others).await;
+    assert_eq!(outcomes[1].result, RunResult::Revoked);
+    let sent = revokes(&rec).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, serde_json::json!({ "credentials": [others[0]] }));
+    assert!(!term.err.contains("in one request"), "{}", term.err);
 }
 
 /// Answers `POST /credentials/revoke` with 202 after noting what the audit
