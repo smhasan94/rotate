@@ -150,14 +150,18 @@ pub enum SkipReason {
     EmptySecret,
     /// An AWS record without both the access key id and the secret half.
     AwsIncomplete,
-    /// A Betterleaks AWS finding with more than one candidate secret
-    /// access key and none of them marked valid by Betterleaks.
+    /// A Betterleaks AWS finding with more than one distinct candidate
+    /// secret access key, counted after keeping only the component sets
+    /// Betterleaks marked valid, if it marked any.
     AwsAmbiguous {
         /// How many distinct candidates there are.
         candidates: usize,
     },
     /// A Betterleaks value masked by `--redact`.
     Redacted,
+    /// A well-formed Betterleaks record that is not a finding, a report or
+    /// a scan record, after at least one record that was.
+    UnknownRecord,
     /// A GitHub alert whose `state` is `resolved`.
     AlertResolved {
         /// The alert number.
@@ -190,12 +194,15 @@ impl fmt::Display for SkipReason {
             }
             SkipReason::AwsAmbiguous { candidates } => write!(
                 f,
-                "AWS finding with {candidates} candidate secret keys for one access key id and \
-                 none marked valid; rotate does not guess the pair: use `rotate plan --stdin` \
-                 with KEY_ID:SECRET"
+                "AWS finding with {candidates} candidate secret keys for one access key id \
+                 (after keeping only the sets Betterleaks marked valid, if any); rotate does \
+                 not guess the pair: use `rotate plan --stdin` with KEY_ID:SECRET"
             ),
             SkipReason::Redacted => {
                 f.write_str("secret value is redacted; scan again without --redact")
+            }
+            SkipReason::UnknownRecord => {
+                f.write_str("not a Betterleaks finding, report or scan record")
             }
             SkipReason::AlertResolved { number } => write!(f, "alert #{number} is resolved"),
             SkipReason::AlertWithoutSecret { number } => write!(

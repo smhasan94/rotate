@@ -16,7 +16,9 @@
 //! component within five lines, reported in `component_sets`. Each set is
 //! one candidate pair. The secret half comes from the only distinct
 //! candidate; when Betterleaks validated the sets, only the ones it marked
-//! `valid` count. Several candidates are skipped: as for GitHub alerts,
+//! `valid` count. Component sets are parsed only for that rule, so an
+//! odd shape cannot drop another rule's finding. Several candidates
+//! (even several marked valid) are skipped: as for GitHub alerts,
 //! rotate never tries a candidate against AWS to find the pair
 //! (`docs/plans/SHA-198.md`, maintainer decision 5).
 //!
@@ -65,7 +67,7 @@ const FORMAT: ReportFormat = ReportFormat::Betterleaks;
 /// `Match`, `MatchContext`, `CaptureGroups` and `Attributes`) is skipped
 /// by serde without a copy.
 #[derive(Deserialize)]
-struct V1Finding {
+struct V1Finding<'a> {
     #[serde(rename = "RuleID")]
     rule: String,
     #[serde(rename = "Secret", default)]
@@ -76,8 +78,9 @@ struct V1Finding {
     line: Option<u64>,
     #[serde(rename = "Commit", default)]
     commit: Option<String>,
-    #[serde(rename = "ComponentSets", default)]
-    sets: Option<Vec<V1Set>>,
+    /// Kept raw and read only for `aws-access-token` ([`Sets`]).
+    #[serde(rename = "ComponentSets", borrow, default)]
+    sets: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -112,7 +115,7 @@ struct V2Record<'a> {
 }
 
 #[derive(Deserialize)]
-struct V2Finding {
+struct V2Finding<'a> {
     rule_id: String,
     #[serde(rename = "match", default)]
     matched: Option<V2Match>,
@@ -120,8 +123,9 @@ struct V2Finding {
     location: Option<V2Location>,
     #[serde(default)]
     attributes: Option<V2Attributes>,
-    #[serde(default)]
-    component_sets: Option<Vec<V2Set>>,
+    /// Kept raw and read only for `aws-access-token` ([`Sets`]).
+    #[serde(borrow, default)]
+    component_sets: Option<&'a RawValue>,
 }
 
 /// `match`: only `value` is read.
@@ -170,11 +174,20 @@ struct V2Analysis {
 // --- common -----------------------------------------------------------------
 
 /// A finding of either version, reduced to what rotate reads.
-struct Leak {
+struct Leak<'a> {
     rule: String,
     secret: Option<SecretValue>,
     source: SourceLocation,
-    sets: Vec<Set>,
+    sets: Sets<'a>,
+}
+
+/// The raw component sets of a finding. They are only read for
+/// `aws-access-token`: no other rule rotate supports has components, and
+/// an unexpected shape must not drop another rule's finding.
+enum Sets<'a> {
+    None,
+    V1(&'a RawValue),
+    V2(&'a RawValue),
 }
 
 /// One component set: one candidate combination of component values.
@@ -183,49 +196,61 @@ struct Set {
     components: Vec<(String, Option<SecretValue>)>,
 }
 
-impl From<V1Finding> for Leak {
-    fn from(f: V1Finding) -> Self {
-        let sets = f.sets.unwrap_or_default().into_iter().map(|set| Set {
-            valid: set.status.as_deref() == Some(VALID),
-            components: set
-                .components
+impl Sets<'_> {
+    fn read(self) -> Result<Vec<Set>, serde_json::Error> {
+        Ok(match self {
+            Sets::None => Vec::new(),
+            Sets::V1(raw) => serde_json::from_str::<Option<Vec<V1Set>>>(raw.get())?
                 .unwrap_or_default()
                 .into_iter()
-                .flatten()
-                .map(|c| (c.rule, c.secret))
+                .map(|set| Set {
+                    valid: set.status.as_deref() == Some(VALID),
+                    components: set
+                        .components
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flatten()
+                        .map(|c| (c.rule, c.secret))
+                        .collect(),
+                })
                 .collect(),
-        });
+            Sets::V2(raw) => serde_json::from_str::<Option<Vec<V2Set>>>(raw.get())?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|set| Set {
+                    valid: set.analysis.and_then(|a| a.status).as_deref() == Some(VALID),
+                    components: set
+                        .components
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flatten()
+                        .map(|c| (c.rule_id, c.matched.and_then(|m| m.value)))
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+}
+
+impl<'a> From<V1Finding<'a>> for Leak<'a> {
+    fn from(f: V1Finding<'a>) -> Self {
         Leak {
             rule: f.rule,
             secret: f.secret,
             source: source(f.file, f.line, f.commit),
-            sets: sets.collect(),
+            sets: f.sets.map_or(Sets::None, Sets::V1),
         }
     }
 }
 
-impl From<V2Finding> for Leak {
-    fn from(f: V2Finding) -> Self {
-        let sets = f
-            .component_sets
-            .unwrap_or_default()
-            .into_iter()
-            .map(|set| Set {
-                valid: set.analysis.and_then(|a| a.status).as_deref() == Some(VALID),
-                components: set
-                    .components
-                    .unwrap_or_default()
-                    .into_iter()
-                    .flatten()
-                    .map(|c| (c.rule_id, c.matched.and_then(|m| m.value)))
-                    .collect(),
-            });
+impl<'a> From<V2Finding<'a>> for Leak<'a> {
+    fn from(f: V2Finding<'a>) -> Self {
         let (file, line) = f.location.map_or((None, None), |l| (l.path, l.start_line));
         Leak {
             rule: f.rule_id,
             secret: f.matched.and_then(|m| m.value),
             source: source(file, line, f.attributes.and_then(|a| a.commit)),
-            sets: sets.collect(),
+            sets: f.component_sets.map_or(Sets::None, Sets::V2),
         }
     }
 }
@@ -248,10 +273,10 @@ enum Element<'a> {
 
 pub(super) fn parse(body: &[u8]) -> Result<ParsedReport, ReportError> {
     let mut report = ParsedReport::new(FORMAT);
-    for (line, element) in elements(body)? {
+    for (line, element) in elements(body, &mut report)? {
         let leak = match element {
-            Element::V1(raw) => decode::<V1Finding>(&mut report, line, raw).map(Leak::from),
-            Element::V2(raw) => decode::<V2Finding>(&mut report, line, raw).map(Leak::from),
+            Element::V1(raw) => decode::<V1Finding<'_>>(&mut report, line, raw).map(Leak::from),
+            Element::V2(raw) => decode::<V2Finding<'_>>(&mut report, line, raw).map(Leak::from),
         };
         if let Some(leak) = leak {
             match leak.into_finding() {
@@ -281,51 +306,64 @@ fn decode<'a, T: Deserialize<'a>>(
     }
 }
 
-/// Every finding in the document with the line it starts on. A document
-/// that is not a sequence of v1 arrays and v2 records is refused by line
-/// and column; serde_json's message is never used because it can repeat
-/// the input.
-fn elements(body: &[u8]) -> Result<Vec<(usize, Element<'_>)>, ReportError> {
-    let malformed = |line: usize, column: usize| ReportError::Malformed {
-        format: FORMAT,
-        line,
-        column,
-    };
+/// Every finding in the document with the line it starts on.
+///
+/// A document that is not a sequence of JSON values is refused by line and
+/// column; serde_json's message is never used because it can repeat the
+/// input. A well-formed value that is not a v1 array or a v2 report,
+/// finding or scan record is refused when it comes first (the input is not
+/// Betterleaks at all) and skipped with a warning after that (a record
+/// kind a later Betterleaks may add to its JSON lines).
+fn elements<'a>(
+    body: &'a [u8],
+    report: &mut ParsedReport,
+) -> Result<Vec<(usize, Element<'a>)>, ReportError> {
     let at = |raw: &RawValue| line_of(body, raw.get());
     let mut out = Vec::new();
+    let mut known = false;
     for value in serde_json::Deserializer::from_slice(body).into_iter::<&RawValue>() {
-        let value = value.map_err(|err| malformed(err.line(), err.column()))?;
+        let value = value.map_err(|err| ReportError::Malformed {
+            format: FORMAT,
+            line: err.line(),
+            column: err.column(),
+        })?;
         let line = at(value);
-        let not_betterleaks = || ReportError::NotBetterleaks { line };
-        match value.get().as_bytes().first() {
-            Some(b'[') => {
-                let items: Vec<&RawValue> =
-                    serde_json::from_str(value.get()).map_err(|_| malformed(line, 1))?;
-                out.extend(items.into_iter().map(|item| (at(item), Element::V1(item))));
+        let found = match value.get().as_bytes().first() {
+            Some(b'[') => serde_json::from_str::<Vec<&RawValue>>(value.get())
+                .ok()
+                .map(|items| items.into_iter().map(|i| (at(i), Element::V1(i))).collect()),
+            Some(b'{') => match serde_json::from_str::<V2Record<'_>>(value.get()) {
+                Ok(V2Record {
+                    findings: Some(findings),
+                    ..
+                }) => Some(
+                    findings
+                        .into_iter()
+                        .map(|f| (at(f), Element::V2(f)))
+                        .collect(),
+                ),
+                Ok(V2Record {
+                    finding: Some(finding),
+                    ..
+                }) => Some(vec![(at(finding), Element::V2(finding))]),
+                Ok(V2Record { scan: Some(_), .. }) => Some(Vec::new()),
+                _ => None,
+            },
+            _ => None,
+        };
+        match found {
+            Some(elements) => {
+                known = true;
+                out.extend(elements);
             }
-            Some(b'{') => {
-                let record: V2Record<'_> =
-                    serde_json::from_str(value.get()).map_err(|_| not_betterleaks())?;
-                match record {
-                    V2Record {
-                        findings: Some(findings),
-                        ..
-                    } => out.extend(findings.into_iter().map(|f| (at(f), Element::V2(f)))),
-                    V2Record {
-                        finding: Some(finding),
-                        ..
-                    } => out.push((at(finding), Element::V2(finding))),
-                    V2Record { scan: Some(_), .. } => {}
-                    _ => return Err(not_betterleaks()),
-                }
-            }
-            _ => return Err(not_betterleaks()),
+            None if known => report.skip(FORMAT, line, SkipReason::UnknownRecord),
+            None => return Err(ReportError::NotBetterleaks { line }),
         }
     }
     Ok(out)
 }
 
-impl Leak {
+impl Leak<'_> {
     fn into_finding(self) -> Result<Finding, SkipReason> {
         let secret = usable(self.secret)?;
         if self.rule != AWS_KEY_ID_RULE {
@@ -336,7 +374,11 @@ impl Leak {
         let key_id = secret
             .expose_secret_str(str::to_owned)
             .map_err(|_| SkipReason::AwsIncomplete)?;
-        let secret_key = aws_secret(self.sets)?;
+        let sets = self
+            .sets
+            .read()
+            .map_err(|err| SkipReason::from_json(&err))?;
+        let secret_key = aws_secret(sets)?;
         Ok(Finding::new(secret_key, self.rule, self.source).with_extra(ACCESS_KEY_ID, key_id))
     }
 }
@@ -515,66 +557,117 @@ mod tests {
         }
     }
 
-    fn v2_aws(sets: &str) -> Vec<u8> {
-        format!(
-            r#"{{"schema_version":"1","finding":{{"rule_id":"aws-access-token","match":{{"full":"{AWS_KEY_ID}","value":"{AWS_KEY_ID}"}},"location":{{"path":"a.env","start_line":1}},"component_sets":{sets}}}}}"#
-        )
+    /// The report versions, for tests that build findings of both.
+    #[derive(Clone, Copy, Debug)]
+    enum Version {
+        V1,
+        V2,
+    }
+
+    const VERSIONS: [Version; 2] = [Version::V1, Version::V2];
+
+    /// An `aws-access-token` finding on line 1 with `sets` as its raw
+    /// component sets.
+    fn aws_finding(version: Version, sets: &str) -> Vec<u8> {
+        match version {
+            Version::V1 => format!(
+                r#"[{{"RuleID":"aws-access-token","Match":"{AWS_KEY_ID}","Secret":"{AWS_KEY_ID}","File":"a.env","StartLine":1,"ComponentSets":{sets}}}]"#
+            ),
+            Version::V2 => format!(
+                r#"{{"schema_version":"1","finding":{{"rule_id":"aws-access-token","match":{{"full":"{AWS_KEY_ID}","value":"{AWS_KEY_ID}"}},"location":{{"path":"a.env","start_line":1}},"component_sets":{sets}}}}}"#
+            ),
+        }
         .into_bytes()
     }
 
-    fn v2_set(secret: &str, status: Option<&str>) -> String {
-        let analysis = status.map_or(String::new(), |s| {
-            format!(r#","analysis":{{"status":"{s}"}}"#)
-        });
-        format!(
-            r#"{{"components":[{{"rule_id":"aws-secret-access-key","match":{{"full":"k={secret}","value":"{secret}"}}}}]{analysis}}}"#
-        )
+    /// One component set holding `secret`, with Betterleaks' validation
+    /// status when given.
+    fn set(version: Version, secret: &str, status: Option<&str>) -> String {
+        match version {
+            Version::V1 => {
+                let status =
+                    status.map_or(String::new(), |s| format!(r#","validationStatus":"{s}""#));
+                format!(
+                    r#"{{"components":[{{"RuleID":"aws-secret-access-key","Optional":false,"Match":"k={secret}","Secret":"{secret}"}}]{status}}}"#
+                )
+            }
+            Version::V2 => {
+                let analysis = status.map_or(String::new(), |s| {
+                    format!(r#","analysis":{{"status":"{s}"}}"#)
+                });
+                format!(
+                    r#"{{"components":[{{"rule_id":"aws-secret-access-key","match":{{"full":"k={secret}","value":"{secret}"}}}}]{analysis}}}"#
+                )
+            }
+        }
+    }
+
+    fn sets(version: Version, entries: &[(&str, Option<&str>)]) -> String {
+        let sets: Vec<String> = entries
+            .iter()
+            .map(|(secret, status)| set(version, secret, *status))
+            .collect();
+        format!("[{}]", sets.join(","))
     }
 
     #[test]
     fn aws_pair_uses_the_only_or_the_valid_candidate() {
-        let same = format!(
-            "[{},{}]",
-            v2_set(AWS_SECRET, None),
-            v2_set(AWS_SECRET, None)
-        );
-        let valid = format!(
-            "[{},{}]",
-            v2_set(OTHER_SECRET, Some("invalid")),
-            v2_set(AWS_SECRET, Some("valid"))
-        );
-        for sets in [same, valid] {
-            let report = parse(&v2_aws(&sets));
-            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-            let aws = &report.findings[0];
-            assert_eq!(aws.raw, SecretValue::from(AWS_SECRET));
-            assert_eq!(aws.credential().key_id(), Some(AWS_KEY_ID));
+        for version in VERSIONS {
+            let cases = [
+                // The same secret in two sets is one candidate.
+                vec![(AWS_SECRET, None), (AWS_SECRET, None)],
+                // Only the set Betterleaks marked valid counts.
+                vec![(OTHER_SECRET, Some("invalid")), (AWS_SECRET, Some("valid"))],
+                vec![(AWS_SECRET, Some("valid")), (OTHER_SECRET, Some("unknown"))],
+            ];
+            for entries in cases {
+                let report = parse(&aws_finding(version, &sets(version, &entries)));
+                assert!(
+                    report.warnings.is_empty(),
+                    "{version:?}: {:?}",
+                    report.warnings
+                );
+                let aws = &report.findings[0];
+                assert_eq!(aws.raw, SecretValue::from(AWS_SECRET), "{version:?}");
+                assert_eq!(aws.credential().key_id(), Some(AWS_KEY_ID), "{version:?}");
+            }
         }
     }
 
     #[test]
     fn aws_without_one_pair_is_skipped() {
-        let two = format!(
-            "[{},{}]",
-            v2_set(AWS_SECRET, None),
-            v2_set(OTHER_SECRET, None)
-        );
-        let cases = [
-            ("[]".to_owned(), SkipReason::AwsIncomplete),
-            (
-                r#"[{"components":null},{"components":[null]}]"#.to_owned(),
-                SkipReason::AwsIncomplete,
-            ),
-            (two, SkipReason::AwsAmbiguous { candidates: 2 }),
-        ];
-        for (sets, reason) in cases {
-            let report = parse(&v2_aws(&sets));
-            assert!(report.findings.is_empty());
-            assert_eq!(report.warnings[0].reason, reason);
-            assert_eq!(report.warnings[0].line, 1);
-            let rendered = report.warnings[0].to_string();
-            assert!(!rendered.contains("EXAMPLEKEY"), "{rendered}");
+        for version in VERSIONS {
+            let cases = [
+                ("[]".to_owned(), SkipReason::AwsIncomplete),
+                ("null".to_owned(), SkipReason::AwsIncomplete),
+                (
+                    r#"[{"components":null},{"components":[null]}]"#.to_owned(),
+                    SkipReason::AwsIncomplete,
+                ),
+                (
+                    sets(version, &[(AWS_SECRET, None), (OTHER_SECRET, None)]),
+                    SkipReason::AwsAmbiguous { candidates: 2 },
+                ),
+                // Two sets marked valid are still two candidates.
+                (
+                    sets(
+                        version,
+                        &[(AWS_SECRET, Some("valid")), (OTHER_SECRET, Some("valid"))],
+                    ),
+                    SkipReason::AwsAmbiguous { candidates: 2 },
+                ),
+            ];
+            for (sets, reason) in cases {
+                let report = parse(&aws_finding(version, &sets));
+                assert!(report.findings.is_empty(), "{version:?}");
+                assert_eq!(report.warnings[0].reason, reason, "{version:?}");
+                assert_eq!(report.warnings[0].line, 1);
+                let rendered = report.warnings[0].to_string();
+                assert!(!rendered.contains("EXAMPLEKEY"), "{rendered}");
+            }
         }
+        let rendered = SkipReason::AwsAmbiguous { candidates: 2 }.to_string();
+        assert!(rendered.contains("if any"), "{rendered}");
     }
 
     #[test]
@@ -585,8 +678,47 @@ mod tests {
             assert!(report.findings.is_empty());
             assert_eq!(report.warnings[0].reason, SkipReason::Redacted);
         }
-        let report = parse(&v2_aws(&format!("[{}]", v2_set("REDACTED", None))));
-        assert_eq!(report.warnings[0].reason, SkipReason::Redacted);
+        for version in VERSIONS {
+            for value in ["REDACTED", "wJalrXUtnFEMI/K7..."] {
+                let input = aws_finding(version, &sets(version, &[(value, None)]));
+                let report = parse(&input);
+                assert!(report.findings.is_empty(), "{version:?}");
+                assert_eq!(report.warnings[0].reason, SkipReason::Redacted);
+            }
+        }
+    }
+
+    // Component sets are only read for AWS: an odd shape on another rule
+    // does not drop its finding.
+    #[test]
+    fn odd_component_sets_only_matter_for_aws() {
+        for odd in [
+            r#""weird""#,
+            "7",
+            r#"{"components":1}"#,
+            r#"[{"components":"x"}]"#,
+        ] {
+            let v1 = format!(
+                r#"[{{"RuleID":"github-pat","Secret":"ghp_a","File":"a.js","ComponentSets":{odd}}}]"#
+            );
+            let v2 = format!(
+                r#"{{"schema_version":"1","finding":{{"rule_id":"github-pat","match":{{"full":"x","value":"ghp_a"}},"component_sets":{odd}}}}}"#
+            );
+            for input in [v1, v2] {
+                let report = parse(input.as_bytes());
+                assert!(report.warnings.is_empty(), "{odd}: {:?}", report.warnings);
+                assert_eq!(report.findings.len(), 1, "{odd}");
+            }
+            for version in VERSIONS {
+                let report = parse(&aws_finding(version, odd));
+                assert!(report.findings.is_empty());
+                assert!(
+                    matches!(report.warnings[0].reason, SkipReason::WrongShape { .. }),
+                    "{odd}: {:?}",
+                    report.warnings
+                );
+            }
+        }
     }
 
     #[test]
@@ -606,6 +738,87 @@ mod tests {
         assert!(!format!("{:?}", report.warnings).contains("CANARY"));
     }
 
+    fn jsonl_lines() -> Vec<&'static [u8]> {
+        V2_JSONL
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn jsonl_blank_lines_and_missing_scan_record() {
+        let lines = jsonl_lines();
+        assert_eq!(lines.len(), 4);
+        // Blank lines (and CRLF) between records.
+        let spaced = [
+            &b"\r\n"[..],
+            lines[0],
+            b"\r\n\r\n",
+            lines[1],
+            b"\n\n\n",
+            lines[2],
+            b"\n",
+            lines[3],
+            b"\n\n",
+        ]
+        .concat();
+        // No final scan record, as when the scan was cut short.
+        let unfinished = [lines[0], b"\n", lines[1], b"\n", lines[2], b"\n"].concat();
+        for input in [spaced, unfinished] {
+            let report = parse(&input);
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            assert_eq!(hinted(&report), hinted(&parse(V2_JSONL)));
+        }
+
+        // A bad record keeps its own line number past the blank lines.
+        let bad = [&b"\n\n"[..], lines[0], b"\n\n", br#"{"schema_version":"1","finding":{"rule_id":"github-pat","match":{"full":"ghp_CANARY","value":7}}}"#, b"\n"].concat();
+        let report = parse(&bad);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.warnings[0].line, 5);
+        assert!(!format!("{:?}", report.warnings).contains("CANARY"));
+    }
+
+    #[test]
+    fn jsonl_unknown_record_kind_is_skipped_after_a_known_one() {
+        let lines = jsonl_lines();
+        let unknown = br#"{"schema_version":"2","note":"ghp_CANARYunknownKind"}"#;
+        let input = [
+            lines[0],
+            b"\n",
+            unknown,
+            b"\n",
+            lines[1],
+            b"\n",
+            b"\"ghp_CANARYstring\"",
+            b"\n",
+            lines[2],
+            b"\n",
+            lines[3],
+            b"\n",
+        ]
+        .concat();
+        let report = parse(&input);
+        assert_eq!(report.findings.len(), 3);
+        let warnings: Vec<_> = report.warnings.iter().map(|w| (w.line, w.reason)).collect();
+        assert_eq!(
+            warnings,
+            [
+                (2, SkipReason::UnknownRecord),
+                (4, SkipReason::UnknownRecord)
+            ]
+        );
+        let rendered = format!("{:?} {}", report.warnings, report.warnings[0]);
+        assert!(!rendered.contains("CANARY"), "{rendered}");
+
+        // TruffleHog lines after Betterleaks ones are skipped the same way.
+        let mut mixed = V2_JSONL.to_vec();
+        mixed.extend_from_slice(TRUFFLEHOG);
+        let report = parse(&mixed);
+        assert_eq!(report.findings.len(), 3);
+        let lines: Vec<usize> = report.warnings.iter().map(|w| w.line).collect();
+        assert_eq!(lines, [5, 6, 7]);
+    }
+
     #[test]
     fn malformed_and_foreign_documents_are_refused() {
         let cut = &V2[..V2.windows(4).position(|w| w == b"ghp_").unwrap() + 8];
@@ -619,12 +832,24 @@ mod tests {
         ));
         assert!(!err.to_string().contains("ghp_"), "{err}");
 
-        let mut jsonl_then_trufflehog = V2_JSONL.to_vec();
-        jsonl_then_trufflehog.extend_from_slice(TRUFFLEHOG);
+        // Malformed JSON after known records is still refused.
+        let mut jsonl_then_cut = V2_JSONL.to_vec();
+        jsonl_then_cut.extend_from_slice(b"{\"finding\":{\"rule_id\":\"ghp_CANARY");
+        let err = parse_report(&jsonl_then_cut, Some(ReportFormat::Betterleaks)).unwrap_err();
+        assert!(
+            matches!(err, ReportError::Malformed { line: 5, .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("CANARY"));
+
+        // An unknown first record means the input is not Betterleaks.
         for (input, line) in [
             (TRUFFLEHOG, 1),
-            (&jsonl_then_trufflehog[..], 5),
             (&b"\n\"ghp_CANARY\""[..], 2),
+            (
+                &b"{\"schema_version\":\"1\",\"note\":\"ghp_CANARY\"}\n"[..],
+                1,
+            ),
         ] {
             let err = parse_report(input, Some(ReportFormat::Betterleaks)).unwrap_err();
             assert!(
