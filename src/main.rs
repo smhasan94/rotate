@@ -32,6 +32,7 @@ use crate::cli::{ApplyArgs, Cli, Command, InputArgs, RollbackArgs, StatusArgs};
 use crate::exit::Exit;
 
 fn main() -> ExitCode {
+    rotate::harden::harden_process();
     console::install_panic_hook();
     let mut console = Console::stdio();
     let cli = match Cli::try_parse() {

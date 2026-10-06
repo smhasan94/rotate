@@ -90,6 +90,13 @@ rotate keeps its own files in `./.rotate/`: the state file
 command for one incident from the same directory, or point `--state-file`
 and `--audit-log` at the same files each time.
 
+rotate locks the memory that holds secret values so it is never written to
+swap, and switches off core dumps for itself. If the OS will not lock the
+memory, usually because the locked-memory limit (`ulimit -l`) is 0 or too
+low, rotate still works and prints one warning on stderr, `could not lock
+secret values in memory`. Raise the limit to remove it; on a host without
+swap it is safe to ignore. [security.md](security.md) has the details.
+
 ## 3. First run: plan
 
 Give `rotate plan` the scanner's report. It reads TruffleHog (`trufflehog

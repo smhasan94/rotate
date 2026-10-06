@@ -35,6 +35,13 @@ All notable changes to rotate are recorded here. The format follows
   tokens the request carries, leaving out installation and legacy-format
   tokens. (SHA-330)
 
+### Security
+
+- Core dumps are off at startup: the core file limit is 0, soft and hard,
+  and on Linux the process is also marked not dumpable. Secret buffers are
+  locked in RAM with `mlock`, so they are not written to swap. If the OS
+  refuses, rotate keeps working and prints one warning. (SHA-204)
+
 ## [0.2.0] - 2026-10-05
 
 Safety fixes found after the first release, and npm one-time passwords.

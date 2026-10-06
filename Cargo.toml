@@ -40,7 +40,9 @@ regex = { version = "1", default-features = false, features = ["std", "perf", "u
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 # Hidden terminal input for a pasted replacement (SHA-257): safe termios
 # calls, no `unsafe` in rotate. Already in the tree through tempfile.
-rustix = { version = "1", default-features = false, features = ["std", "termios"] }
+# `process`, `mm` and `param`: core-dump limit, dumpable flag and mlock of
+# secret buffers (SHA-204).
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process", "mm", "param"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_norway = "0.9"

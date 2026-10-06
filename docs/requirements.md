@@ -201,7 +201,10 @@ Nice-to-haves that come up during planning go in a "Later" epic, not in MVP.
 ### Security (non-negotiable)
 
 - NFR1. Secret values are never printed, logged, or written to disk in plain
-  text. They live in zeroized memory buffers, and are wiped on drop.
+  text. They live in zeroized memory buffers, and are wiped on drop. Where
+  the OS allows, those buffers are locked in RAM so they are not swapped,
+  and core dumps are disabled for the process (SHA-204); when locking is
+  refused rotate still runs and warns once.
 - NFR2. All output paths (stdout, stderr, tracing logs, audit log, state file,
   error messages, panic messages) pass through a redaction layer that replaces
   any known secret value with its fingerprint marker.
@@ -324,7 +327,9 @@ Nice-to-haves that come up during planning go in a "Later" epic, not in MVP.
   the plan is executed.
 - Secret values exist only in zeroized buffers, never on disk, never in
   logs. The audit log holds fingerprints only, so its disclosure does not
-  reveal secrets.
+  reveal secrets. The buffers are locked out of swap where the OS allows,
+  and the process writes no core dump and, on Linux, cannot be attached to
+  by other processes of the same user.
 - rotate uses the operator's existing credentials and does not need long-lived
   credentials of its own. It never uses the leaked secret as a credential
   (decision D3).
