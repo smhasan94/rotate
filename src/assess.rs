@@ -24,11 +24,14 @@ use crate::secret::Fingerprint;
 /// gitleaks rule that matches only the access key id half of an AWS pair.
 const GITLEAKS_AWS_KEY_ID_RULE: &str = "aws-access-token";
 
-/// Scanner detector names (TruffleHog), rule ids (gitleaks) and GitHub
-/// secret-scanning `secret_type`s that name a provider. Compared ignoring
-/// ASCII case.
+/// Scanner detector names (TruffleHog), rule ids (gitleaks and
+/// Betterleaks, which share them) and GitHub secret-scanning
+/// `secret_type`s that name a provider. Compared ignoring ASCII case.
 const DETECTOR_HINTS: &[(&str, &str)] = &[
     ("AWS", "aws"),
+    // A paired Betterleaks finding (SHA-202). A gitleaks one is key id
+    // only and is refused before hints are read.
+    (GITLEAKS_AWS_KEY_ID_RULE, "aws"),
     ("Github", "github"),
     ("GitHubOauth2", "github"),
     ("github-pat", "github"),
@@ -196,7 +199,7 @@ fn group(findings: Vec<Finding>) -> Vec<Group> {
 }
 
 /// Provider named by a detector hint, if any.
-fn hint(detector: &str) -> Option<&'static str> {
+pub(crate) fn hint(detector: &str) -> Option<&'static str> {
     DETECTOR_HINTS
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(detector))
@@ -219,8 +222,9 @@ fn identify(group: &Group, registry: &ProviderRegistry, forced: Option<&str>) ->
     };
     if unpaired(GITLEAKS_AWS_KEY_ID_RULE) {
         return Disposition::NotRotatable {
-            reason: "gitleaks reports only the AWS access key id; use a TruffleHog report or \
-                     `rotate plan --stdin` with KEY_ID:SECRET"
+            reason: "gitleaks reports only the AWS access key id; use a TruffleHog report, a \
+                     Betterleaks report with `--format betterleaks`, or `rotate plan --stdin` \
+                     with KEY_ID:SECRET"
                 .into(),
         };
     }

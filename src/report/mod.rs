@@ -1,6 +1,6 @@
 //! Scanner report parsers (SHA-223): TruffleHog JSON lines and gitleaks JSON
 //! arrays into [`Finding`]s, plus GitHub secret-scanning alerts from the
-//! REST API (SHA-337).
+//! REST API (SHA-337) and Betterleaks reports (SHA-202).
 //!
 //! Secret fields deserialize straight into [`SecretValue`], and
 //! [`read_report`] and [`read_report_from`] hold the input in a zeroized
@@ -12,6 +12,7 @@
 //!
 //! Field mapping and tested scanner versions: `docs/report-formats.md`.
 
+mod betterleaks;
 mod github_alert;
 mod gitleaks;
 mod trufflehog;
@@ -44,6 +45,9 @@ pub enum ReportFormat {
     /// GitHub secret-scanning alerts from the REST API: one alert object or
     /// an array of them. Never detected; it must be named.
     GithubAlert,
+    /// Betterleaks: the v1 JSON array, or the v2 JSON report or JSON
+    /// lines. Never detected; it must be named.
+    Betterleaks,
 }
 
 impl fmt::Display for ReportFormat {
@@ -52,6 +56,7 @@ impl fmt::Display for ReportFormat {
             ReportFormat::Trufflehog => "trufflehog",
             ReportFormat::Gitleaks => "gitleaks",
             ReportFormat::GithubAlert => "github-alert",
+            ReportFormat::Betterleaks => "betterleaks",
         })
     }
 }
@@ -145,6 +150,14 @@ pub enum SkipReason {
     EmptySecret,
     /// An AWS record without both the access key id and the secret half.
     AwsIncomplete,
+    /// A Betterleaks AWS finding with more than one candidate secret
+    /// access key and none of them marked valid by Betterleaks.
+    AwsAmbiguous {
+        /// How many distinct candidates there are.
+        candidates: usize,
+    },
+    /// A Betterleaks value masked by `--redact`.
+    Redacted,
     /// A GitHub alert whose `state` is `resolved`.
     AlertResolved {
         /// The alert number.
@@ -174,6 +187,15 @@ impl fmt::Display for SkipReason {
             SkipReason::EmptySecret => f.write_str("no secret value"),
             SkipReason::AwsIncomplete => {
                 f.write_str("AWS finding without both the access key id and the secret key")
+            }
+            SkipReason::AwsAmbiguous { candidates } => write!(
+                f,
+                "AWS finding with {candidates} candidate secret keys for one access key id and \
+                 none marked valid; rotate does not guess the pair: use `rotate plan --stdin` \
+                 with KEY_ID:SECRET"
+            ),
+            SkipReason::Redacted => {
+                f.write_str("secret value is redacted; scan again without --redact")
             }
             SkipReason::AlertResolved { number } => write!(f, "alert #{number} is resolved"),
             SkipReason::AlertWithoutSecret { number } => write!(
@@ -243,23 +265,37 @@ pub enum ReportError {
         /// 1-based line where the value starts.
         line: usize,
     },
+    /// A Betterleaks document holding a JSON value that is neither a v1
+    /// finding array nor a v2 report, finding or scan record.
+    #[error(
+        "betterleaks input at line {line} is not a Betterleaks report: expected a v1 JSON \
+         array or a v2 JSON report or JSON lines"
+    )]
+    NotBetterleaks {
+        /// 1-based line where the value starts.
+        line: usize,
+    },
 }
 
 /// Parses a report held in memory. `format` forces a format; it must match
-/// the detected one, except [`ReportFormat::GithubAlert`], which is never
-/// detected and is parsed as named. Empty or whitespace-only input is an
-/// empty report whatever the format. Each warning is also logged at `warn`
-/// level.
+/// the detected one, except [`ReportFormat::GithubAlert`] and
+/// [`ReportFormat::Betterleaks`], which are never detected and are parsed
+/// as named. Empty or whitespace-only input is an empty report whatever the
+/// format. Each warning is also logged at `warn` level.
 pub fn parse_report(
     input: &[u8],
     format: Option<ReportFormat>,
 ) -> Result<ParsedReport, ReportError> {
     let body = input.strip_prefix(BOM).unwrap_or(input);
-    if format == Some(ReportFormat::GithubAlert) {
+    if let Some(named @ (ReportFormat::GithubAlert | ReportFormat::Betterleaks)) = format {
         if detect_format(input) == Detected::Empty {
             return Ok(ParsedReport::default());
         }
-        return Ok(log_warnings(github_alert::parse(body)?));
+        let report = match named {
+            ReportFormat::GithubAlert => github_alert::parse(body)?,
+            _ => betterleaks::parse(body)?,
+        };
+        return Ok(log_warnings(report));
     }
     let detected = match detect_format(input) {
         Detected::Empty => return Ok(ParsedReport::default()),
@@ -276,8 +312,9 @@ pub fn parse_report(
     let report = match detected {
         ReportFormat::Trufflehog => trufflehog::parse(body),
         ReportFormat::Gitleaks => gitleaks::parse(body)?,
-        // detect_format never yields it; handled above.
+        // detect_format never yields these; handled above.
         ReportFormat::GithubAlert => github_alert::parse(body)?,
+        ReportFormat::Betterleaks => betterleaks::parse(body)?,
     };
     Ok(log_warnings(report))
 }

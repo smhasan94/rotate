@@ -69,14 +69,14 @@ impl GlobalArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 #[command(group(clap::ArgGroup::new("input_source").args(["report", "stdin"])))]
 pub struct InputArgs {
-    /// TruffleHog (JSON lines), gitleaks (JSON) or GitHub alert report to
-    /// read.
+    /// TruffleHog (JSON lines), gitleaks (JSON), Betterleaks or GitHub
+    /// alert report to read.
     #[arg(value_name = "REPORT", conflicts_with = "stdin")]
     pub report: Option<PathBuf>,
 
     /// Report format. Detected from the file when omitted, except
-    /// github-alert, which must be named. With --stdin, read a report of
-    /// this format from stdin instead of one secret.
+    /// betterleaks and github-alert, which must be named. With --stdin,
+    /// read a report of this format from stdin instead of one secret.
     #[arg(long, value_enum, value_name = "FORMAT", requires = "input_source")]
     pub format: Option<ReportFormat>,
 
@@ -365,6 +365,7 @@ mod tests {
         for (name, format) in [
             ("github-alert", ReportFormat::GithubAlert),
             ("trufflehog", ReportFormat::Trufflehog),
+            ("betterleaks", ReportFormat::Betterleaks),
         ] {
             let cli = Cli::parse_from(["rotate", "plan", "--stdin", "--format", name]);
             let input = cli.subcommand().input().cloned().unwrap();
