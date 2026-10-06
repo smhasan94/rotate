@@ -3919,10 +3919,12 @@ mod tests {
     // SHA-286: batched revokes.
 
     /// Delegates every method to a [`MockProvider`] and records the size of
-    /// each `revoke_batch` call, in a list shared between recorders.
+    /// each `revoke_batch` call, in a list shared between recorders. With
+    /// `short`, `revoke_batch` drops its last result (SHA-331).
     struct BatchRecorder {
         inner: MockProvider,
         sizes: Arc<Mutex<Vec<usize>>>,
+        short: bool,
     }
 
     #[async_trait::async_trait]
@@ -3972,7 +3974,11 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(credentials.len());
-            self.inner.revoke_batch(credentials).await
+            let mut results = self.inner.revoke_batch(credentials).await;
+            if self.short {
+                results.pop();
+            }
+            results
         }
         async fn restore(
             &self,
@@ -3996,6 +4002,12 @@ mod tests {
     }
 
     fn batch_fixture() -> Batch {
+        batch_fixture_short(None)
+    }
+
+    /// [`batch_fixture`], with the provider `short`, if any, returning one
+    /// result too few from `revoke_batch`.
+    fn batch_fixture_short(short: Option<&str>) -> Batch {
         let dir = tempfile::tempdir().unwrap();
         let log = CallLog::new();
         let sizes = Arc::new(Mutex::new(Vec::new()));
@@ -4006,6 +4018,7 @@ mod tests {
                     .identify_prefix(prefix)
                     .log(log.clone()),
                 sizes: sizes.clone(),
+                short: short == Some(name),
             }));
         }
         let audit_path = dir.path().join("audit.jsonl");
@@ -4190,6 +4203,111 @@ mod tests {
             .collect();
         assert_eq!(revoked[0], rotation_of(&plan, other).rotation_id);
         assert_eq!(revoked[1..], ids);
+    }
+
+    /// The revoke entries in `b`'s audit log, failed or not.
+    fn revoke_entries(b: &Batch) -> Vec<crate::audit::AuditEntry> {
+        crate::audit::read_all(&b.audit_path)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.step == AuditStep::Revoke)
+            .collect()
+    }
+
+    /// Asserts `outcome` failed at revoke with `error` in its text, and that
+    /// its state and its one revoke audit entry say so.
+    fn assert_failed_at_revoke(b: &Batch, outcome: &Outcome, error: &str) {
+        match &outcome.result {
+            RunResult::Failed { step, error: text } => {
+                assert_eq!(*step, AuditStep::Revoke);
+                assert!(text.as_str().contains(error), "{text}");
+                assert!(text.as_str().contains("may still be valid"), "{text}");
+            }
+            other => panic!("expected a failed revoke, got {other:?}"),
+        }
+        let stored = b.store.get(&outcome.rotation_id).unwrap();
+        assert_eq!(stored.step, Step::Failed);
+        assert_eq!(stored.failed_step, Some(AuditStep::Revoke));
+        assert!(stored.restore_ref.is_none());
+        let entries: Vec<_> = revoke_entries(b)
+            .into_iter()
+            .filter(|e| e.rotation_id == outcome.rotation_id)
+            .collect();
+        assert_eq!(entries.len(), 1, "{}", outcome.rotation_id);
+        assert_eq!(entries[0].outcome, AuditOutcome::Failed);
+        let logged = entries[0].error.as_ref().unwrap();
+        assert!(logged.as_str().contains(error), "{logged}");
+    }
+
+    /// SHA-331 T1 (AC1): rotations that passed phase 1 whose provider is
+    /// gone in phase 2 each fail at revoke, recorded, with no revoke call.
+    #[tokio::test]
+    async fn revoke_phase_without_the_provider_fails_each_rotation() {
+        let mut b = batch_fixture();
+        let values = ["npm_sha331_gone_a", "npm_sha331_gone_b"];
+        let plan = plan_many(&mut b, &values).await;
+        let requested: Vec<&PlannedRotation> =
+            values.iter().map(|v| rotation_of(&plan, v)).collect();
+        let mut ready = Vec::new();
+        {
+            let mut phase1 = Executor::new(&b.providers, &b.consumers, &mut b.store, &mut b.audit);
+            for (index, rotation) in requested.iter().copied().enumerate() {
+                match phase1.prepare(index, rotation).await {
+                    Prepared::Ready(r) => ready.push(r),
+                    Prepared::Done(_, result) => panic!("not ready: {result:?}"),
+                }
+            }
+        }
+        assert_eq!(ready.len(), values.len());
+        let empty = ProviderRegistry::new();
+        let done = Executor::new(&empty, &b.consumers, &mut b.store, &mut b.audit)
+            .revoke_ready(ready)
+            .await;
+
+        assert_eq!(done.len(), values.len());
+        for (index, progress, result) in done {
+            let outcome = outcome(requested[index], progress, result);
+            assert_eq!(outcome.fingerprint, fp(values[index]));
+            assert_failed_at_revoke(&b, &outcome, "the provider is not registered");
+        }
+        assert!(sizes(&b).is_empty());
+        assert!(!b.log.calls().iter().any(|c| c.method == "revoke"));
+    }
+
+    /// SHA-331 T2 (AC2): a provider returning one result too few fails its
+    /// whole batch at revoke; another provider's batch still succeeds.
+    #[tokio::test]
+    async fn revoke_batch_with_a_missing_result_fails_the_batch() {
+        let mut b = batch_fixture_short(Some("npm"));
+        let values = [
+            "npm_sha331_short_a",
+            "npm_sha331_short_b",
+            "pypi_sha331_short_a",
+            "npm_sha331_short_c",
+        ];
+        let plan = plan_many(&mut b, &values).await;
+        let requested: Vec<&PlannedRotation> =
+            values.iter().map(|v| rotation_of(&plan, v)).collect();
+        let outcomes = Executor::new(&b.providers, &b.consumers, &mut b.store, &mut b.audit)
+            .run_all(&requested)
+            .await;
+
+        assert_eq!(sizes(&b), [3, 1]);
+        for (outcome, value) in outcomes.iter().zip(values) {
+            assert_eq!(outcome.fingerprint, fp(value), "input order");
+            if value.starts_with("npm_") {
+                assert_failed_at_revoke(
+                    &b,
+                    outcome,
+                    "the provider returned 2 results for 3 credentials",
+                );
+            } else {
+                assert_eq!(outcome.result, RunResult::Revoked, "{value}");
+                let stored = b.store.get(&outcome.rotation_id).unwrap();
+                assert_eq!(stored.step, Step::Revoked);
+            }
+        }
+        assert_eq!(run_status(&outcomes), RunStatus::Failed);
     }
 
     /// SHA-286: a rate-limited revoke says when to re-run; nothing else
