@@ -130,6 +130,10 @@ sends new secrets and your operator credentials, so they follow one rule:
 - A URL must not carry a user name or password
   (`https://user:token@host`); give credentials through the environment.
   The error does not repeat the URL.
+- A URL must not have a query string or fragment, not even an empty `?`
+  or `#` (`https://proxy.example.com/?token=...`): providers add paths to
+  it, and the endpoint warning below prints the URL as written. The error
+  does not repeat the URL.
 
 A refused URL stops every command with exit 2 and an error naming the
 field, before any call is made.

@@ -231,6 +231,11 @@ pub enum InvalidUrl {
     /// avoids the word, so a check for a leaked credential stays simple.
     #[error("must not embed credentials: give tokens through the environment, not in the URL")]
     Userinfo,
+    /// A query string or fragment, even an empty one (SHA-332): the
+    /// endpoint warning prints the URL as written, so a token there would
+    /// reach stderr, and providers append paths to the base URL.
+    #[error("must not have a query string or fragment: expected https://host[:port][/path]")]
+    QueryOrFragment,
     /// Plain http to a host that is not loopback.
     #[error(
         "{origin} is neither https nor loopback: only https:// is accepted, except http:// to 127.0.0.1, ::1 or localhost"
@@ -252,6 +257,9 @@ impl TryFrom<String> for ApiUrl {
         }
         if parsed.cannot_be_a_base() {
             return Err(InvalidUrl::NotAUrl);
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(InvalidUrl::QueryOrFragment);
         }
         let Some(host) = parsed.host() else {
             return Err(InvalidUrl::NotAUrl);
@@ -1122,6 +1130,37 @@ mod tests {
                 for secret in ["pass", "user@", "localhost@", "u5er-canary", "pa55-canary"] {
                     assert!(!shown.contains(secret), "{url}: {shown}");
                     assert!(!message.contains(secret), "{url}: {message}");
+                }
+            }
+        }
+    }
+
+    /// SHA-332 T1 (AC1): a query string or fragment, empty or not, is
+    /// refused for every endpoint field, and no part of it is shown.
+    #[test]
+    fn sha332_t1_query_and_fragment_are_refused() {
+        for url in [
+            "https://api.example.com/?a=qcanary",
+            "https://api.example.com?",
+            "https://api.example.com/#fcanary",
+            "https://api.example.com#",
+            "https://ghe.example.com/api/v3?x=qcanary#fcanary",
+            "http://127.0.0.1:4566/?token=qcanary",
+        ] {
+            for (name, template) in URL_FIELDS {
+                let text = yaml(template, url);
+                let (field, _, message) = invalid(&text);
+                assert_eq!(field, name, "{url}");
+                assert!(
+                    message.contains("query string or fragment"),
+                    "{url}: {message}"
+                );
+                let shown = parse(&text, Path::new("rotate.yaml"))
+                    .unwrap_err()
+                    .to_string();
+                for canary in ["qcanary", "fcanary", "a=", "x=", "token="] {
+                    assert!(!shown.contains(canary), "{url}: {shown}");
+                    assert!(!message.contains(canary), "{url}: {message}");
                 }
             }
         }
