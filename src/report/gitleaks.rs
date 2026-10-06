@@ -7,7 +7,9 @@
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use super::{non_empty, ParsedReport, ReportError, ReportFormat, SkipReason, UNKNOWN_FILE};
+use super::{
+    line_of, non_empty, ParsedReport, ReportError, ReportFormat, SkipReason, UNKNOWN_FILE,
+};
 use crate::finding::{Finding, SourceLocation};
 use crate::secret::SecretValue;
 
@@ -50,16 +52,6 @@ pub(super) fn parse(body: &[u8]) -> Result<ParsedReport, ReportError> {
         }
     }
     Ok(report)
-}
-
-/// 1-based line in `body` where `element`, a slice borrowed from it, starts.
-fn line_of(body: &[u8], element: &str) -> usize {
-    let offset = (element.as_ptr() as usize).saturating_sub(body.as_ptr() as usize);
-    let newlines = body[..offset.min(body.len())]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count();
-    newlines + 1
 }
 
 impl Leak {

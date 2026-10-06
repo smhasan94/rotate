@@ -18,13 +18,15 @@ use tokio::task::JoinSet;
 
 use crate::finding::{Finding, SourceLocation, ACCESS_KEY_ID, IS_CANARY};
 use crate::provider::{Confidence, Credential, ProviderError, ProviderRegistry, Scope, Validity};
+use crate::report::{AWS_KEY_ID_TYPE, AWS_SECRET_TYPE};
 use crate::secret::Fingerprint;
 
 /// gitleaks rule that matches only the access key id half of an AWS pair.
 const GITLEAKS_AWS_KEY_ID_RULE: &str = "aws-access-token";
 
-/// Scanner detector names (TruffleHog) and rule ids (gitleaks) that name a
-/// provider. Compared ignoring ASCII case.
+/// Scanner detector names (TruffleHog), rule ids (gitleaks) and GitHub
+/// secret-scanning `secret_type`s that name a provider. Compared ignoring
+/// ASCII case.
 const DETECTOR_HINTS: &[(&str, &str)] = &[
     ("AWS", "aws"),
     ("Github", "github"),
@@ -39,6 +41,15 @@ const DETECTOR_HINTS: &[(&str, &str)] = &[
     ("OpenAI", "openai"),
     ("OpenAIAdminKey", "openai"),
     ("openai-api-key", "openai"),
+    // GitHub secret scanning (SHA-337). `github_refresh_token` and
+    // `github_ssh_private_key` have no hint: rotate cannot rotate them.
+    (AWS_KEY_ID_TYPE, "aws"),
+    (AWS_SECRET_TYPE, "aws"),
+    ("github_personal_access_token", "github"),
+    ("github_oauth_access_token", "github"),
+    ("github_app_installation_access_token", "github"),
+    ("npm_access_token", "npm"),
+    ("openai_api_key", "openai"),
 ];
 
 /// Tuning for [`assess`].
@@ -199,15 +210,32 @@ fn identify(group: &Group, registry: &ProviderRegistry, forced: Option<&str>) ->
                 .into(),
         };
     }
-    let key_id_only = group
-        .detectors
-        .iter()
-        .any(|d| d.eq_ignore_ascii_case(GITLEAKS_AWS_KEY_ID_RULE))
-        && !group.finding.extra.contains_key(ACCESS_KEY_ID);
-    if key_id_only {
+    let unpaired = |detector: &str| {
+        !group.finding.extra.contains_key(ACCESS_KEY_ID)
+            && group
+                .detectors
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(detector))
+    };
+    if unpaired(GITLEAKS_AWS_KEY_ID_RULE) {
         return Disposition::NotRotatable {
             reason: "gitleaks reports only the AWS access key id; use a TruffleHog report or \
                      `rotate plan --stdin` with KEY_ID:SECRET"
+                .into(),
+        };
+    }
+    if unpaired(AWS_KEY_ID_TYPE) {
+        return Disposition::NotRotatable {
+            reason: "GitHub reported only the AWS access key id: no secret access key alert in \
+                     the input pairs with it; use `rotate plan --stdin` with KEY_ID:SECRET"
+                .into(),
+        };
+    }
+    if unpaired(AWS_SECRET_TYPE) {
+        return Disposition::NotRotatable {
+            reason: "GitHub reported the AWS secret access key without its access key id: no \
+                     key id alert in the input has the same path and commit, and there is not \
+                     exactly one open key id alert; use `rotate plan --stdin` with KEY_ID:SECRET"
                 .into(),
         };
     }
@@ -831,6 +859,102 @@ mod tests {
             other => panic!("expected NotRotatable, got {other:?}"),
         }
         assert_eq!(assessed[0].validity, None);
+        assert_eq!(calls_to(&log, "check_valid"), 0);
+        log.assert_no_mutations();
+    }
+
+    // SHA-337 T4 (AC1): every supported GitHub `secret_type` is a hint for
+    // its provider, and wins over a value no provider pattern claims.
+    #[tokio::test]
+    async fn sha337_github_secret_types_are_detector_hints() {
+        let cases = [
+            ("aws_secret_access_key", "aws"),
+            ("github_personal_access_token", "github"),
+            ("github_oauth_access_token", "github"),
+            ("github_app_installation_access_token", "github"),
+            ("npm_access_token", "npm"),
+            ("openai_api_key", "openai"),
+        ];
+        for (secret_type, provider) in cases {
+            assert_eq!(hint(secret_type), Some(provider), "{secret_type}");
+            assert_eq!(
+                hint(&secret_type.to_ascii_uppercase()),
+                Some(provider),
+                "{secret_type}"
+            );
+        }
+        assert_eq!(hint("aws_access_key_id"), Some("aws"));
+        for unsupported in ["github_refresh_token", "github_ssh_private_key"] {
+            assert_eq!(hint(unsupported), None, "{unsupported}");
+        }
+
+        let log = CallLog::new();
+        let mocks: Vec<Arc<MockProvider>> = ["aws", "github", "npm", "openai"]
+            .into_iter()
+            .map(|name| Arc::new(MockProvider::new(name).log(log.clone())))
+            .collect();
+        let findings = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (secret_type, _))| {
+                let f = finding(&format!("value_{i}_no_pattern"), secret_type, "u");
+                if *secret_type == "aws_secret_access_key" {
+                    f.with_extra(ACCESS_KEY_ID, "AKIAIOSFODNN7EXAMPLE")
+                } else {
+                    f
+                }
+            })
+            .collect();
+        let assessed = assess(findings, &registry(mocks), &opts()).await;
+        let providers: Vec<&Disposition> = assessed.iter().map(|a| &a.disposition).collect();
+        let expected: Vec<Disposition> = cases
+            .iter()
+            .map(|(_, provider)| Disposition::Supported {
+                provider,
+                confidence: Confidence::High,
+            })
+            .collect();
+        assert_eq!(providers, expected.iter().collect::<Vec<_>>());
+        assert_eq!(calls_to(&log, "check_valid"), cases.len());
+        log.assert_no_mutations();
+    }
+
+    // SHA-337 T4 (AC2): an unpaired GitHub AWS alert is not rotatable, with
+    // the KEY_ID:SECRET hint, and is never sent to the provider.
+    #[tokio::test]
+    async fn sha337_unpaired_github_aws_alerts_are_not_rotatable() {
+        let log = CallLog::new();
+        let aws = Arc::new(
+            MockProvider::new("aws")
+                .identify_prefix("AKIA")
+                .log(log.clone()),
+        );
+        let assessed = assess(
+            vec![
+                finding("AKIAIOSFODNN7EXAMPLE", "aws_access_key_id", "a"),
+                finding(
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                    "aws_secret_access_key",
+                    "b",
+                ),
+            ],
+            &registry(vec![aws]),
+            &opts(),
+        )
+        .await;
+        for (item, says) in assessed
+            .iter()
+            .zip(["only the AWS access key id", "without its access key id"])
+        {
+            match &item.disposition {
+                Disposition::NotRotatable { reason } => {
+                    assert!(reason.contains(says), "{reason}");
+                    assert!(reason.contains("KEY_ID:SECRET"), "{reason}");
+                }
+                other => panic!("expected NotRotatable, got {other:?}"),
+            }
+            assert_eq!(item.validity, None);
+        }
         assert_eq!(calls_to(&log, "check_valid"), 0);
         log.assert_no_mutations();
     }
