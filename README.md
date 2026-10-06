@@ -361,6 +361,16 @@ work pending, `4` revoke the old secret by hand. Details per command:
 [docs/usage.md](docs/usage.md#9-exit-codes) and, for scripts,
 [docs/non-interactive.md](docs/non-interactive.md#exit-codes).
 
+## GitHub Action
+
+`action.yml` at the root of this repository is a composite GitHub Action:
+given a secret-scanning alert number (or none, to poll the open alerts), it
+fetches the alerts with the REST API, pipes them into
+`rotate plan --stdin --format github-alert` and writes the plan to the job
+summary. It runs `rotate plan` only and changes nothing. It needs a token
+that can read secret-scanning alerts, which the workflow's `GITHUB_TOKEN`
+cannot. See [docs/github-action.md](docs/github-action.md).
+
 ## Documentation
 
 - [docs/usage.md](docs/usage.md): the usage guide.
@@ -368,6 +378,9 @@ work pending, `4` revoke the old secret by hand. Details per command:
 - [docs/security.md](docs/security.md): the security model and its limits.
 - [docs/non-interactive.md](docs/non-interactive.md): scripts, CI and exit
   codes.
+- [docs/github-action.md](docs/github-action.md): the GitHub Action that
+  plans GitHub secret-scanning alerts, its token, inputs, outputs and
+  triggers.
 - [docs/requirements.md](docs/requirements.md): requirements, threat model
   and recorded decisions.
 - [docs/report-formats.md](docs/report-formats.md): the TruffleHog and
