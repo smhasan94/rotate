@@ -132,7 +132,7 @@ jobs:
       - name: upload the plan state (the state artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: rotate-state-${{ github.run_id }}-${{ matrix.os }}
+          name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}
           path: ${{ steps.plan.outputs.state-dir }}
           include-hidden-files: true
           retention-days: 1
@@ -157,7 +157,7 @@ jobs:
       - name: download the plan state
         uses: actions/download-artifact@v4
         with:
-          name: rotate-state-${{ github.run_id }}-${{ matrix.os }}
+          name: rotate-state-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}
           path: ${{ runner.temp }}/rotate-plan-state
       - id: apply
         uses: ./
