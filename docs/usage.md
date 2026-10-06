@@ -93,8 +93,10 @@ and `--audit-log` at the same files each time.
 Give `rotate plan` the scanner's report. It reads TruffleHog (`trufflehog
 ... --json`, one JSON object per line) and gitleaks (`gitleaks ... -f json`)
 reports and detects which one it is; `--format trufflehog` or `--format
-gitleaks` forces it. [report-formats.md](report-formats.md) lists the fields
-it reads.
+gitleaks` forces it. GitHub secret-scanning alerts from the REST API are
+read with `--format github-alert`. With `--stdin`, `--format` reads the
+report from stdin instead of a file.
+[report-formats.md](report-formats.md) lists the fields it reads.
 
 <!-- test: first-run -->
 ```sh
@@ -114,6 +116,14 @@ argument: it would end up in your shell history. An AWS key pair is given as
 
 ```sh
 pbpaste | rotate plan --stdin
+```
+
+To plan a GitHub alert without copying its value at all, pipe the alert
+from the REST API; the token needs read access to secret-scanning alerts
+(see [report-formats.md](report-formats.md#github-secret-scanning-alerts)):
+
+```sh
+gh api repos/acme/api/secret-scanning/alerts/42 | rotate plan --stdin --format github-alert
 ```
 
 The plan for the report above looks like this:
@@ -405,9 +415,9 @@ Global flags work before or after the command.
 | `-h`, `--help` | all | Help. |
 | `-V`, `--version` | none | Version. |
 | `REPORT` | plan, apply, rollback | The scanner report to read. |
-| `--format <FORMAT>` | plan, apply, rollback | `trufflehog` or `gitleaks`; detected when omitted. |
-| `--stdin` | plan, apply, rollback | Read one secret from stdin instead of a report. |
-| `--provider <NAME>` | plan, apply, rollback | Provider of the `--stdin` secret: `aws`, `github`, `npm` or `openai`. |
+| `--format <FORMAT>` | plan, apply, rollback | `trufflehog`, `gitleaks` or `github-alert`; the first two are detected when omitted. With `--stdin`, read a report of that format from stdin. |
+| `--stdin` | plan, apply, rollback | Read one secret from stdin instead of a report, or with `--format` a report. |
+| `--provider <NAME>` | plan, apply, rollback | Provider of the `--stdin` secret: `aws`, `github`, `npm` or `openai`. Not with `--format` (exit 2). |
 | `--concurrency <N>` | plan, apply, rollback | Provider checks in flight at once, 1 to 64. Default 8. |
 | `--check-permissions` | plan | Probe the operator's permissions, read-only. |
 | `--allow-broader-replacement` | plan, apply | Let rotate create an OpenAI replacement with all permissions (see [config.md](config.md#providersopenaiallow_broader_replacement)). |
