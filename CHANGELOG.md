@@ -6,6 +6,16 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-11
+
+The GitHub Action, two more report formats and faster incident response.
+The Action plans secret-scanning alerts with zero state-changing calls and
+applies them behind an environment approval. rotate reads GitHub
+secret-scanning alerts and Betterleaks reports, revokes all of a run's
+GitHub tokens in one request, and keeps secrets out of swap and core
+dumps. One change can affect scripts: an endpoint URL with a query string
+or fragment is now refused with exit 2.
+
 ### Added
 
 - `rotate apply` revokes every GitHub token of a run together, in one
@@ -60,6 +70,30 @@ All notable changes to rotate are recorded here. The format follows
   and on Linux the process is also marked not dumpable. Secret buffers are
   locked in RAM with `mlock`, so they are not written to swap. If the OS
   refuses, rotate keeps working and prints one warning. (SHA-204)
+
+### Known limits
+
+- Only the GitHub Actions secret consumer has been tested against the live
+  service (`ROTATE_LIVE_TESTS=1`, see docs/live-tests.md). AWS, npm and
+  OpenAI are tested against mock servers built from the providers'
+  documentation. Run `rotate plan` first and review the plan before
+  `rotate apply`.
+- GitHub and npm tokens are rotated in manual replacement mode: you create
+  the new token and paste it. OpenAI keys are manual too, unless you opt in
+  to a broader replacement. In the GitHub Action the replacement comes from
+  the `replacement-env` input.
+- npm revoke needs an `npm login` session token as the operator token,
+  which lasts two hours. An account that asks for a one-time password
+  needs a terminal or `ROTATE_NPM_OTP` at the moment of the revoke, so an
+  unattended run with an overlap window cannot revoke it.
+- AWS keys are deactivated, not deleted. After a rollback the replacement
+  key stays inactive on the IAM user; delete it yourself.
+- OpenAI keys without an Admin API key, GitHub App installation tokens and
+  legacy-format GitHub tokens end in revoke by hand.
+- The GitHub Action's apply waits out the overlap window inside the job
+  (up to `max-wait`); a pending revoke is not resumed by a later workflow
+  run. It reads at most 100 alerts per poll and is not on the Marketplace.
+- No `--json` for `apply` or `rollback` yet. No Windows build.
 
 ## [0.2.0] - 2026-10-05
 
@@ -189,6 +223,7 @@ revoked secret, for four providers and two consumers.
   needs `rotate rollback`, then `rotate apply` again.
 - No `--json` for `apply` or `rollback` yet. No Windows build.
 
-[Unreleased]: https://github.com/smhasan94/rotate/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/smhasan94/rotate/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/smhasan94/rotate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/smhasan94/rotate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/smhasan94/rotate/releases/tag/v0.1.0
