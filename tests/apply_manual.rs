@@ -641,3 +641,92 @@ fn pasted_value_is_not_echoed_on_the_terminal() {
     assert!(!out.contains(pasted) && !err.contains(pasted));
     drop(slave);
 }
+
+// SHA-348 T3 (AC3): `--replacement-from-env` naming an operator credential,
+// a runner variable or the configured admin key variable, or something
+// that is not a variable name, exits 2 before any call. The variable holds
+// a sentinel that never reaches stdout, stderr or the audit log.
+#[test]
+fn sha348_t3_refused_replacement_env_exits_2_without_calls() {
+    let run = Run::new("npm_applymanual_sha348_leaked");
+    std::fs::write(
+        run.file("rotate.yaml"),
+        "providers:\n  openai:\n    admin_key_env: SHA348_OPENAI_ADMIN\n",
+    )
+    .unwrap();
+    let id = run.planned_id();
+    run.scenario(json!({ "prompt": "panic" }));
+    let sentinel = "npm_applymanual_sha348_sentinel";
+    let mut denied: Vec<(&str, String)> = rotate::input::DENIED_REPLACEMENT_VARS
+        .iter()
+        .map(|name| (*name, (*name).to_owned()))
+        .collect();
+    denied.extend([
+        (
+            "ACTIONS_RUNTIME_TOKEN",
+            "a variable starting with ACTIONS_".to_owned(),
+        ),
+        (
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "a variable starting with ACTIONS_".to_owned(),
+        ),
+        ("RUNNER_TEMP", "a variable starting with RUNNER_".to_owned()),
+        ("SHA348_OPENAI_ADMIN", "SHA348_OPENAI_ADMIN".to_owned()),
+    ]);
+    for (name, named) in &denied {
+        let _ = std::fs::remove_file(run.file("calls.jsonl"));
+        let audit = run.audit().len();
+        let output = run.run_env(
+            &[
+                "-vvv",
+                "apply",
+                "--stdin",
+                "--confirm",
+                &id,
+                "--replacement-from-env",
+                name,
+            ],
+            &[(name, sentinel)],
+        );
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{name}: {err}");
+        assert!(
+            err.contains(&format!(
+                "error: --replacement-from-env names {named}, which rotate reads as an operator credential or the runner sets"
+            )),
+            "{name}: {err}"
+        );
+        assert!(!err.contains(sentinel), "{name}: sentinel in stderr");
+        assert!(!stdout(&output).contains(sentinel), "{name}: in stdout");
+        assert!(run.calls().is_empty(), "{name}: {:?}", run.calls());
+        assert_eq!(run.audit().len(), audit, "{name}");
+    }
+
+    // Not a variable name: possibly the value pasted in the wrong place, so
+    // it is not repeated either.
+    for bad in [
+        sentinel.replace('_', "-"),
+        format!("1{sentinel}"),
+        String::new(),
+    ] {
+        let _ = std::fs::remove_file(run.file("calls.jsonl"));
+        let output = run.run(&[
+            "apply",
+            "--stdin",
+            "--confirm",
+            &id,
+            "--replacement-from-env",
+            &bad,
+        ]);
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{bad:?}: {err}");
+        assert!(
+            err.contains("the --replacement-from-env argument is not an environment variable name"),
+            "{bad:?}: {err}"
+        );
+        assert!(!err.contains("sha348_sentinel"), "{bad:?}: {err}");
+        assert!(!err.contains("sha348-sentinel"), "{bad:?}: {err}");
+        assert!(run.calls().is_empty(), "{bad:?}: {:?}", run.calls());
+    }
+    assert_eq!(run.rotation(&id)["step"], "planned");
+}

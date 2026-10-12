@@ -224,6 +224,14 @@ impl Rotation {
     pub fn is_rolling_back(&self) -> bool {
         self.rollback.is_some() && self.step != Step::RolledBack
     }
+
+    /// True when the rotation is done: the old secret is revoked and no
+    /// rollback has started (SHA-348). What plan reports as "already
+    /// rotated" and what `apply --confirm` accepts on a plan with nothing
+    /// to apply.
+    pub fn is_finished(&self) -> bool {
+        self.step == Step::Revoked && !self.is_rolling_back()
+    }
 }
 
 /// Why the state store could not be used. Messages name paths and versions,

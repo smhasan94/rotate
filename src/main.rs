@@ -335,7 +335,7 @@ fn plan(
 /// `--replacement-file` (SHA-257) is read first, before the state file or
 /// any provider call, so a refusal exits 2 having touched nothing.
 fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config: &Config) -> Exit {
-    let mut supplied = match supplied_replacement(args) {
+    let mut supplied = match supplied_replacement(args, config) {
         Ok(supplied) => supplied,
         Err(err) => {
             let _ = writeln!(console.err(), "error: {err}");
@@ -377,6 +377,14 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         .filter(|s| s.reason == plan::REVOKED_BY_HAND)
         .collect();
     if plan.rotations.is_empty() && by_hand.is_empty() {
+        // An empty plan takes --confirm only for rotations already revoked
+        // (an idempotent re-run, SHA-348); any other id is an error.
+        if !args.confirm.is_empty() {
+            if let Err(err) = apply::confirm_finished(&args.confirm, &store) {
+                let _ = writeln!(console.err(), "error: {err}");
+                return Exit::Usage;
+            }
+        }
         let _ = writeln!(console.err(), "Nothing to apply.");
         return Exit::Ok;
     }
@@ -623,12 +631,16 @@ fn rollback(
 
 /// The replacement named by `--replacement-from-env` or
 /// `--replacement-file`, if either was given. Errors name neither the
-/// variable nor the path.
+/// path nor a variable the operator chose; a refused variable (SHA-348) is
+/// named only when it is one rotate itself reads, such as the configured
+/// OpenAI admin key variable.
 fn supplied_replacement(
     args: &ApplyArgs,
+    config: &Config,
 ) -> Result<Option<SecretValue>, rotate::input::ReplacementInputError> {
     if let Some(name) = &args.replacement_from_env {
-        return rotate::input::replacement_from_env(name).map(Some);
+        let admin_key_env = [config.providers.openai.admin_key_env.as_str()];
+        return rotate::input::replacement_from_env(name, &admin_key_env).map(Some);
     }
     if let Some(path) = &args.replacement_file {
         return rotate::input::replacement_from_file(path).map(Some);

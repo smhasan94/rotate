@@ -128,6 +128,9 @@ impl ActionRun {
             ("ROTATE_CONFIG_PATH", "rotate.yaml".into()),
             ("MODE", "plan".into()),
             ("VERBOSE", "3".into()),
+            // SHA-348: as action.yml passes it from the event of a private
+            // repository, so upload-audit auto needs no API request.
+            ("REPOSITORY_VISIBILITY", "private".into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
@@ -756,6 +759,11 @@ async fn sha198_t5_bad_inputs_exit_2_before_any_request() {
         ("MAX_WAIT", "1 h", "max-wait"),
         ("FORCE", "yes", "force"),
         ("UPLOAD_AUDIT", "no", "upload-audit"),
+        // SHA-348
+        ("UPLOAD_AUDIT", "AUTO", "upload-audit"),
+        ("AUDIT_SUFFIX", "a b", "audit-suffix"),
+        ("AUDIT_SUFFIX", "x", "audit-suffix"),
+        ("REPLACEMENT_ENV", "ROTATE_GITHUB_TOKEN", "replacement-env"),
         ("REPLACEMENT_ENV", "NEW-TOKEN", "replacement-env"),
         ("REPLACEMENT_ENV", "$(id)", "replacement-env"),
         // Apply-only inputs are refused in plan mode.
@@ -1030,6 +1038,8 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
         "state-dir",
         "max-wait",
         "upload-audit",
+        // SHA-348
+        "audit-suffix",
     ];
     let mut want_outputs = vec![
         "rotation-ids",
@@ -1067,8 +1077,8 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
     }
 
     // SHA-338: the audit artifact. Uploaded after apply, also when apply
-    // failed, unless upload-audit is false; kept 30 days; the action is
-    // pinned to a full commit SHA.
+    // failed, when run.sh decided so (SHA-348: upload-audit auto, true or
+    // false); kept 30 days; the action is pinned to a full commit SHA.
     let audit = &steps[3];
     assert!(audit.get("run").is_none());
     let uses = audit["uses"].as_str().unwrap();
@@ -1082,10 +1092,12 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
     for needle in [
         "always()",
         "inputs.mode == 'apply'",
-        "inputs.upload-audit == 'true'",
+        "steps.rotate.outputs.upload-audit == 'true'",
+        "steps.rotate.outputs.state-dir != ''",
     ] {
         assert!(condition.contains(needle), "{condition}");
     }
+    assert!(!condition.contains("inputs.upload-audit"), "{condition}");
     let with = &audit["with"];
     assert!(with["name"]
         .as_str()
@@ -1094,7 +1106,7 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
     assert!(with["path"].as_str().unwrap().ends_with("/.rotate/"));
     assert_eq!(with["retention-days"], 30);
     assert_eq!(with["include-hidden-files"], true);
-    assert_eq!(action["inputs"]["upload-audit"]["default"], "true");
+    assert_eq!(action["inputs"]["upload-audit"]["default"], "auto");
 
     // The caller workflow in the doc: the state hand-off and the approval.
     for needle in [
@@ -1778,7 +1790,9 @@ const MOCK_GITHUB_REPLACEMENT: &str = "ghp_github-replacement-1";
 // ---------------------------------------------------------------------------
 
 /// The alert was resolved while the job waited for approval: rotate finds
-/// nothing to apply and exits 0. The step must not report Done.
+/// nothing to apply. The confirmed id is only `planned` in the state file,
+/// so rotate itself refuses it with exit 2 (SHA-348). The step must not
+/// report Done.
 #[cfg(feature = "test-providers")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sha338_exit_0_without_applying_is_not_done() {
@@ -1805,20 +1819,22 @@ async fn sha338_exit_0_without_applying_is_not_done() {
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(
+        stderr
+            .contains("error: a --confirm id is a rotation that is not finished in the state file"),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains(&format!(
-            "::error title=rotate::The confirmed rotations {id} were not applied"
+            "::error title=rotate::rotate apply exited with code 2; nothing was changed. \
+             Not applied: {id}. See the job summary."
         )),
         "{stderr}"
     );
+    assert!(!stderr.contains("Nothing to apply."), "{stderr}");
     assert_no_mutating(&run);
     let summary = run.summary();
     assert!(!summary.contains("**Done.**"), "{summary}");
-    assert!(
-        summary.contains(&format!(
-            "**Not applied.** rotate apply exited 0 but did not apply `{id}`"
-        )),
-        "{summary}"
-    );
+    assert!(summary.contains("**Nothing was changed.**"), "{summary}");
     assert_eq!(run.outputs()["exit-code"], "2");
 }
 
@@ -1904,6 +1920,11 @@ async fn sha338_unknown_confirmed_id_exits_2() {
     let output = run.run("run.sh", &[]);
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
+    // SHA-348: the annotation lists the confirmed ids not applied.
+    assert!(
+        stderr.contains(&format!("nothing was changed. Not applied: {unknown}.")),
+        "{stderr}"
+    );
     assert_no_mutating(&run);
     let summary = run.summary();
     assert!(summary.contains("**Nothing was changed.**"), "{summary}");
@@ -2020,4 +2041,481 @@ async fn sha338_recorded_revoke_time_beyond_max_wait_is_not_waited_for() {
     assert!(!stderr.contains("waiting until"), "{stderr}");
     assert_no_revoke(&run.calls().unwrap());
     assert_eq!(status_rows(&run)[0]["step"], "pending_revoke");
+}
+
+// ---------------------------------------------------------------------------
+// SHA-348: audit-suffix, upload-audit auto, replacement-env refusals
+// ---------------------------------------------------------------------------
+
+impl ActionRun {
+    /// Mode apply with good confirm and state-dir inputs (a state directory
+    /// in `scratch`), so only the input under test can be wrong.
+    fn apply_inputs(&mut self, scratch: &Path) {
+        std::fs::create_dir_all(scratch.join(".rotate")).unwrap();
+        std::fs::write(scratch.join(".rotate/state.json"), "{}").unwrap();
+        self.set("MODE", "apply");
+        self.set("CONFIRM", "rot-1a2b3c4d");
+        self.set("PLAN_STATE_DIR", &scratch.display().to_string());
+    }
+}
+
+/// The step named `id` in action.yml.
+fn action_step(action: &Value, id: &str) -> Value {
+    action["runs"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("no step {id}"))
+        .clone()
+}
+
+/// One line naming `input`, exit 2, the value never repeated, and neither
+/// rotate nor any request run.
+fn assert_bad_input(run: &ActionRun, output: &Output, input: &str, value: &str) {
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{value:?}: {stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{value:?}: {stderr}");
+    assert!(
+        stderr.starts_with(&format!("::error title=rotate::input {input}:")),
+        "{value:?}: {stderr}"
+    );
+    if !value.is_empty() {
+        assert!(!stderr.contains(value), "value echoed: {stderr}");
+    }
+    assert!(!stderr.contains("injected"), "value echoed: {stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(run.calls().is_none(), "rotate ran for {value:?}");
+    assert!(!run.outputs().contains_key("state-dir"), "{value:?}");
+}
+
+// SHA-348 T4 (AC4): audit-suffix is checked like every other input, is
+// apply only, and names the artifact.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha348_t4_audit_suffix_validated_and_names_the_artifact() {
+    if !tools_present() {
+        return;
+    }
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let longest = "a".repeat(40);
+    for good in ["prod", "eu-west-1", "job_2.retry", longest.as_str()] {
+        let mut run = ActionRun::new(&rec.uri(), &token);
+        run.apply_inputs(scratch.path());
+        run.set("AUDIT_SUFFIX", good);
+        let output = run.run("run.sh", &["--check-inputs"]);
+        assert_eq!(output.status.code(), Some(0), "{good}: {:?}", output);
+        assert!(output.stderr.is_empty(), "{good}");
+    }
+    let too_long = "a".repeat(41);
+    for bad in [
+        too_long.as_str(),
+        "a b",
+        "a/b",
+        "../x",
+        "a:b",
+        "$(id)",
+        "é",
+        "prod\n::warning::injected",
+        "prod\r",
+    ] {
+        for args in [&[][..], &["--check-inputs"][..]] {
+            let mut run = ActionRun::new(&rec.uri(), &token);
+            run.apply_inputs(scratch.path());
+            run.set("AUDIT_SUFFIX", bad);
+            let output = run.run("run.sh", args);
+            assert_bad_input(&run, &output, "audit-suffix", bad);
+        }
+    }
+    // Plan mode refuses it, even when well formed.
+    for args in [&[][..], &["--check-inputs"][..]] {
+        let mut run = ActionRun::new(&rec.uri(), &token);
+        run.set("AUDIT_SUFFIX", "prod");
+        let output = run.run("run.sh", args);
+        assert_bad_input(&run, &output, "audit-suffix", "");
+        assert!(text(&output.stderr).contains("only with mode: apply"));
+    }
+    assert_eq!(requests(&rec).await, Vec::<String>::new());
+
+    // action.yml: the input, both steps get it through env:, and the
+    // artifact is rotate-audit-<run id>-<attempt>[-<suffix>].
+    let action = action_yml();
+    assert_eq!(action["inputs"]["audit-suffix"]["default"], "");
+    for id in ["inputs", "rotate"] {
+        assert_eq!(
+            action_step(&action, id)["env"]["AUDIT_SUFFIX"],
+            "${{ inputs.audit-suffix }}",
+            "{id}"
+        );
+    }
+    assert_eq!(
+        action_step(&action, "audit")["with"]["name"],
+        "rotate-audit-${{ github.run_id }}-${{ github.run_attempt }}\
+         ${{ inputs.audit-suffix != '' && format('-{0}', inputs.audit-suffix) || '' }}"
+    );
+}
+
+/// `run.sh --upload-decision` in apply mode against `api`, with
+/// `visibility` as the event's and `upload` as the input (`None`: unset).
+/// Returns the run, its output and the upload-audit output.
+fn upload_decision(
+    api: &str,
+    token: &str,
+    scratch: &Path,
+    visibility: &str,
+    upload: Option<&str>,
+) -> (ActionRun, Output, String) {
+    let mut run = ActionRun::new(api, token);
+    run.apply_inputs(scratch);
+    run.set("REPOSITORY_VISIBILITY", visibility);
+    if let Some(upload) = upload {
+        run.set("UPLOAD_AUDIT", upload);
+    }
+    let output = run.run("run.sh", &["--upload-decision"]);
+    assert_eq!(output.status.code(), Some(0), "{:?}", output);
+    assert!(output.stdout.is_empty());
+    assert!(run.calls().is_none(), "rotate ran");
+    let decision = run
+        .outputs()
+        .get("upload-audit")
+        .cloned()
+        .expect("no upload-audit output");
+    (run, output, decision)
+}
+
+/// Serves `GET /repos/acme/api` (the run's repository) with `body`, only to
+/// the alerts token.
+async fn serve_repository(rec: &CallRecorder, token: &str, body: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api"))
+        .and(header("authorization", format!("Bearer {token}").as_str()))
+        .respond_with(body)
+        .with_priority(1)
+        .mount(rec.server())
+        .await;
+}
+
+// SHA-348 T5 (AC5): auto uploads to a private or internal repository and
+// not to a public or unknown one; true and false are taken as given.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha348_t5_upload_decision_fails_closed() {
+    if !tools_present() {
+        return;
+    }
+    // Many awaits, then a MockServer drop, also on a failed assert: run
+    // outside the coop budget so a failure fails instead of hanging.
+    crate::common::without_coop_budget(upload_decision_cases()).await;
+}
+
+async fn upload_decision_cases() {
+    let token = token_canary();
+    let scratch = tempfile::tempdir().unwrap();
+    // One server for the whole test, reset between cases.
+    let rec = CallRecorder::start().await;
+    let public_notice = "::notice title=rotate::The audit artifact will not be uploaded: \
+                         the repository is public";
+    let unknown_notice = "::notice title=rotate::The audit artifact will not be uploaded: \
+                          the repository's visibility could not be read";
+
+    // The event's visibility decides, with no request; auto is the default.
+    for upload in [None, Some("auto")] {
+        for (visibility, want) in [
+            ("private", "true"),
+            ("internal", "true"),
+            ("public", "false"),
+        ] {
+            rec.server().reset().await;
+            let (_, output, decision) =
+                upload_decision(&rec.uri(), &token, scratch.path(), visibility, upload);
+            assert_eq!(decision, want, "{visibility} {upload:?}");
+            let stderr = text(&output.stderr);
+            if want == "true" {
+                assert!(stderr.is_empty(), "{stderr}");
+            } else {
+                assert_eq!(stderr.lines().count(), 1, "{stderr}");
+                assert!(stderr.starts_with(public_notice), "{stderr}");
+            }
+            assert_eq!(requests(&rec).await, Vec::<String>::new());
+        }
+    }
+
+    // No event visibility (a schedule run), or one that is not a known
+    // value: the API decides; what it cannot answer is treated as public.
+    let cases: Vec<(ResponseTemplate, &str, Option<&str>)> = vec![
+        (
+            ResponseTemplate::new(200).set_body_json(json!({ "visibility": "private" })),
+            "true",
+            None,
+        ),
+        (
+            ResponseTemplate::new(200).set_body_json(json!({ "visibility": "internal" })),
+            "true",
+            None,
+        ),
+        (
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "visibility": "public", "private": false })),
+            "false",
+            Some(public_notice),
+        ),
+        (
+            ResponseTemplate::new(200).set_body_json(json!({ "private": true })),
+            "true",
+            None,
+        ),
+        (
+            ResponseTemplate::new(200).set_body_json(json!({ "visibility": "secret" })),
+            "false",
+            Some(unknown_notice),
+        ),
+        (
+            ResponseTemplate::new(200).set_body_json(json!({ "name": "api" })),
+            "false",
+            Some(unknown_notice),
+        ),
+        (
+            ResponseTemplate::new(200).set_body_string("not json"),
+            "false",
+            Some(unknown_notice),
+        ),
+        (ResponseTemplate::new(404), "false", Some(unknown_notice)),
+        (ResponseTemplate::new(403), "false", Some(unknown_notice)),
+        (ResponseTemplate::new(500), "false", Some(unknown_notice)),
+    ];
+    for (body, want, notice) in cases {
+        for visibility in ["", "Public", "\n::warning::injected"] {
+            rec.server().reset().await;
+            serve_repository(&rec, &token, body.clone()).await;
+            let (run, output, decision) =
+                upload_decision(&rec.uri(), &token, scratch.path(), visibility, None);
+            assert_eq!(decision, want, "{visibility:?} {body:?}");
+            let stderr = text(&output.stderr);
+            match notice {
+                None => assert!(stderr.is_empty(), "{stderr}"),
+                Some(notice) => {
+                    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+                    assert!(stderr.starts_with(notice), "{stderr}");
+                }
+            }
+            assert!(!stderr.contains("injected"), "{stderr}");
+            assert_eq!(requests(&rec).await, ["GET /repos/acme/api"]);
+            run.sweep(&output, &[Canary::new("alerts token", &token)]);
+        }
+    }
+
+    // The API is unreachable, or answers only another token.
+    rec.server().reset().await;
+    serve_repository(
+        &rec,
+        "ghs_another_token",
+        ResponseTemplate::new(200).set_body_json(json!({ "visibility": "private" })),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(2)
+        .mount(rec.server())
+        .await;
+    for api in [rec.uri(), "http://127.0.0.1:1".to_owned()] {
+        let (_, output, decision) = upload_decision(&api, &token, scratch.path(), "", None);
+        assert_eq!(decision, "false", "{api}");
+        assert!(text(&output.stderr).starts_with(unknown_notice));
+    }
+
+    // The lookup is for the run's repository (GITHUB_REPOSITORY), and a
+    // value that is not owner/repo, or has a `.` or `..` segment, is not
+    // requested at all: unknown, no upload.
+    for repo in [
+        "acme/..",
+        "../api",
+        "./api",
+        "acme/.",
+        "acme",
+        "acme/api/x",
+        "",
+    ] {
+        rec.server().reset().await;
+        serve_repository(
+            &rec,
+            &token,
+            ResponseTemplate::new(200).set_body_json(json!({ "visibility": "private" })),
+        )
+        .await;
+        let mut run = ActionRun::new(&rec.uri(), &token);
+        run.apply_inputs(scratch.path());
+        run.set("REPOSITORY_VISIBILITY", "");
+        run.set("GITHUB_REPOSITORY", repo);
+        let output = run.run("run.sh", &["--upload-decision"]);
+        assert_eq!(output.status.code(), Some(0), "{repo}: {output:?}");
+        assert_eq!(run.outputs()["upload-audit"], "false", "{repo}");
+        assert!(text(&output.stderr).starts_with(unknown_notice), "{repo}");
+        assert_eq!(requests(&rec).await, Vec::<String>::new(), "{repo}");
+    }
+
+    // Explicit true and false are taken as given, with no request.
+    for (upload, visibility) in [
+        ("true", "public"),
+        ("true", ""),
+        ("false", "private"),
+        ("false", ""),
+    ] {
+        rec.server().reset().await;
+        let (_, output, decision) =
+            upload_decision(&rec.uri(), &token, scratch.path(), visibility, Some(upload));
+        assert_eq!(decision, upload, "{visibility:?}");
+        assert!(output.stderr.is_empty(), "{:?}", text(&output.stderr));
+        assert_eq!(requests(&rec).await, Vec::<String>::new());
+    }
+
+    // Any other value is a bad input, before any request.
+    rec.server().reset().await;
+    for bad in ["yes", "AUTO", "1", "true\n::warning::injected"] {
+        for args in [&["--upload-decision"][..], &["--check-inputs"][..], &[][..]] {
+            let mut run = ActionRun::new(&rec.uri(), &token);
+            run.apply_inputs(scratch.path());
+            run.set("UPLOAD_AUDIT", bad);
+            let output = run.run("run.sh", args);
+            assert_bad_input(&run, &output, "upload-audit", bad);
+        }
+    }
+    assert_eq!(requests(&rec).await, Vec::<String>::new());
+
+    // action.yml: the default, the event's visibility through env: (never
+    // in run: text), and the upload step reads run.sh's decision.
+    let action = action_yml();
+    assert_eq!(action["inputs"]["upload-audit"]["default"], "auto");
+    let rotate = action_step(&action, "rotate");
+    assert_eq!(
+        rotate["env"]["REPOSITORY_VISIBILITY"],
+        "${{ github.event.repository.visibility }}"
+    );
+    assert_eq!(rotate["env"]["UPLOAD_AUDIT"], "${{ inputs.upload-audit }}");
+    let condition = action_step(&action, "audit")["if"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        condition.contains("steps.rotate.outputs.upload-audit == 'true'"),
+        "{condition}"
+    );
+}
+
+// SHA-348 T5 (AC5): in a full apply step the decision is an output before
+// rotate first runs, so the upload step has it even if the step is killed.
+#[cfg(feature = "test-providers")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sha348_t5_apply_step_decides_upload_before_rotate_runs() {
+    if !tools_present() {
+        return;
+    }
+    // A MockServer dropped each round: see common::without_coop_budget.
+    crate::common::without_coop_budget(apply_step_upload_cases()).await;
+}
+
+#[cfg(feature = "test-providers")]
+async fn apply_step_upload_cases() {
+    let secret = ghp_canary();
+    let token = token_canary();
+    for (visibility, want) in [("private", "true"), ("public", "false")] {
+        let rec = CallRecorder::start().await;
+        let (mut run, _) = apply_after_plan(&rec, &token, &secret, json!({})).await;
+        run.set("REPOSITORY_VISIBILITY", visibility);
+        let output = run.run("run.sh", &[]);
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(run
+            .output_before_rotate()
+            .unwrap()
+            .contains(&format!("upload-audit={want}\n")));
+        assert_eq!(run.outputs()["upload-audit"], want);
+        assert_eq!(
+            stderr.contains("::notice title=rotate::The audit artifact will not be uploaded"),
+            want == "false",
+            "{stderr}"
+        );
+    }
+}
+
+// SHA-348 T6 (AC6): replacement-env naming a credential, a runner
+// variable or not a name exits 2 before any download or request, and
+// never repeats the name.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha348_t6_replacement_env_refused_before_any_request() {
+    if !tools_present() {
+        return;
+    }
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let sentinel = "npm_action_sha348_sentinel_value";
+    let mut names: Vec<&str> = rotate::input::DENIED_REPLACEMENT_VARS.to_vec();
+    names.extend([
+        "ALERTS_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "RUNNER_TEMP",
+        "RUNNER_TOOL_CACHE",
+    ]);
+    for name in names {
+        for args in [&[][..], &["--check-inputs"][..]] {
+            let mut run = ActionRun::new(&rec.uri(), &token);
+            run.apply_inputs(scratch.path());
+            run.set("REPLACEMENT_ENV", name);
+            if name != "ALERTS_TOKEN" && name != "RUNNER_TEMP" {
+                run.set(name, sentinel);
+            }
+            let output = run.run("run.sh", args);
+            assert_bad_input(&run, &output, "replacement-env", name);
+            let stderr = text(&output.stderr);
+            assert!(stderr.contains("such as NEW_TOKEN"), "{stderr}");
+            assert!(!stderr.contains(sentinel), "{stderr}");
+            assert!(!stderr.contains(&token), "{stderr}");
+        }
+    }
+    for bad in [
+        "NEW-TOKEN",
+        "1NEW",
+        "npm-action-sha348-pasted-value",
+        "NEW TOKEN",
+        "NEW_TOKEN\n::warning::injected",
+    ] {
+        for args in [&[][..], &["--check-inputs"][..]] {
+            let mut run = ActionRun::new(&rec.uri(), &token);
+            run.apply_inputs(scratch.path());
+            run.set("REPLACEMENT_ENV", bad);
+            let output = run.run("run.sh", args);
+            assert_bad_input(&run, &output, "replacement-env", bad);
+        }
+    }
+    // install.sh never ran: the inputs step stops the job first; and
+    // run.sh made no request of its own.
+    assert_eq!(requests(&rec).await, Vec::<String>::new());
+
+    // A name of the operator's own passes.
+    let mut run = ActionRun::new(&rec.uri(), &token);
+    run.apply_inputs(scratch.path());
+    for good in [
+        "NEW_TOKEN",
+        "ROTATE_REPLACEMENT",
+        "MY_GITHUB_TOKEN",
+        "github_token",
+    ] {
+        run.set("REPLACEMENT_ENV", good);
+        let output = run.run("run.sh", &["--check-inputs"]);
+        assert_eq!(output.status.code(), Some(0), "{good}: {output:?}");
+    }
+    let action = action_yml();
+    let ids: Vec<String> = action["runs"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids[..2], ["inputs", "install"]);
+    assert_eq!(
+        action_step(&action, "inputs")["env"]["REPLACEMENT_ENV"],
+        "${{ inputs.replacement-env }}"
+    );
 }

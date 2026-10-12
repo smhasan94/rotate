@@ -66,17 +66,21 @@ inputs:
     required: false
     default: "false"
   replacement-env:
-    description: "apply: name of the environment variable holding a replacement you created by hand, for providers in manual replacement mode (rotate --replacement-from-env). One rotation per run."
+    description: "apply: name of the environment variable holding a replacement you created by hand, for providers in manual replacement mode (rotate --replacement-from-env). One rotation per run. Refused: the credential variables rotate and this Action read (ROTATE_GITHUB_TOKEN, GITHUB_TOKEN, GH_TOKEN, ROTATE_NPM_TOKEN, NPM_TOKEN, NODE_AUTH_TOKEN, ROTATE_NPM_OTP, OPENAI_ADMIN_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_CONTAINER_AUTHORIZATION_TOKEN, ALERTS_TOKEN) and names starting with ACTIONS_ or RUNNER_."
     required: false
     default: ""
   max-wait:
-    description: "apply: the longest overlap window the step waits out, below the job's timeout-minutes. A longer window: no revoke, exit 3 with the revoke time."
+    description: "apply: the longest overlap window the step waits out. Keep it below the job's timeout-minutes; GitHub-hosted jobs stop at 6 hours. A longer window: no revoke, exit 3 with the revoke time."
     required: false
     default: "5h"
   upload-audit:
-    description: "apply: upload the state directory's .rotate/ (audit log and state file, fingerprints only) as the artifact rotate-audit-<run id>-<attempt>, kept 30 days. Set false on a public repository."
+    description: "apply: auto, true or false. Upload the state directory's .rotate/ (audit log and state file, fingerprints only) as the artifact rotate-audit-<run id>-<attempt>, kept 30 days. auto uploads only when the repository is private or internal, and skips with a notice when it is public or its visibility cannot be read."
     required: false
-    default: "true"
+    default: auto
+  audit-suffix:
+    description: "apply: appended to the audit artifact's name as rotate-audit-<run id>-<attempt>-<suffix>, so two apply steps in one run do not collide. 1 to 40 letters, digits, '.', '_' or '-'."
+    required: false
+    default: ""
 
 outputs:
   rotation-ids:
@@ -116,6 +120,7 @@ runs:
         REPLACEMENT_ENV: ${{ inputs.replacement-env }}
         MAX_WAIT: ${{ inputs.max-wait }}
         UPLOAD_AUDIT: ${{ inputs.upload-audit }}
+        AUDIT_SUFFIX: ${{ inputs.audit-suffix }}
       run: bash "$GITHUB_ACTION_PATH/action/run.sh" --check-inputs
     - id: install
       shell: bash
@@ -141,15 +146,22 @@ runs:
         REPLACEMENT_ENV: ${{ inputs.replacement-env }}
         MAX_WAIT: ${{ inputs.max-wait }}
         UPLOAD_AUDIT: ${{ inputs.upload-audit }}
+        AUDIT_SUFFIX: ${{ inputs.audit-suffix }}
+        # SHA-348: upload-audit auto. Absent on some events (schedule);
+        # run.sh then asks the API.
+        REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
         ROTATE_ACTOR: github-actions/${{ github.repository }}/${{ github.run_id }}
       run: bash "$GITHUB_ACTION_PATH/action/run.sh"
     # SHA-338: the audit trail of an apply, kept after the runner is gone,
     # also when apply failed. Fingerprints, ids and references only.
+    # SHA-348: run.sh decides upload-audit (auto: not on a public
+    # repository) before anything else, and audit-suffix is checked by the
+    # inputs step, so a step that never started uploads nothing.
     - id: audit
-      if: ${{ always() && inputs.mode == 'apply' && inputs.upload-audit == 'true' && steps.rotate.outputs.state-dir != '' }}
+      if: ${{ always() && inputs.mode == 'apply' && steps.rotate.outputs.upload-audit == 'true' && steps.rotate.outputs.state-dir != '' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: rotate-audit-${{ github.run_id }}-${{ github.run_attempt }}
+        name: rotate-audit-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.audit-suffix != '' && format('-{0}', inputs.audit-suffix) || '' }}
         path: ${{ steps.rotate.outputs.state-dir }}/.rotate/
         include-hidden-files: true
         if-no-files-found: error
