@@ -70,14 +70,54 @@ pub fn read_secret(reader: impl Read) -> Result<Finding, InputError> {
 /// reallocates and leaves a copy behind.
 pub const REPLACEMENT_MAX: usize = 4000;
 
+/// Environment variables `--replacement-from-env` refuses by name
+/// (SHA-348): those rotate reads as an operator credential or one-time
+/// password (`github::TOKEN_VARS`, `npm::TOKEN_VARS`, `npm::OTP_VAR`, the
+/// default `providers.openai.admin_key_env`, and the credential variables
+/// of the AWS default chain), and the workflow token `GITHUB_TOKEN`.
+/// Naming one would copy that credential into every consumer of the leaked
+/// secret.
+pub const DENIED_REPLACEMENT_VARS: [&str; 10] = [
+    "ROTATE_GITHUB_TOKEN",
+    "GITHUB_TOKEN",
+    "ROTATE_NPM_TOKEN",
+    "NPM_TOKEN",
+    "ROTATE_NPM_OTP",
+    "OPENAI_ADMIN_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+];
+
+/// Prefixes of the variables a GitHub Actions runner sets for itself
+/// (`ACTIONS_ID_TOKEN_REQUEST_TOKEN`, `ACTIONS_RUNTIME_TOKEN`, ...), which
+/// `--replacement-from-env` refuses too.
+pub const DENIED_REPLACEMENT_PREFIXES: [&str; 2] = ["ACTIONS_", "RUNNER_"];
+
 /// Why a supplied replacement (SHA-257) was refused. Never includes the
-/// value, the variable name or the path: a secret pasted in the wrong place
-/// must not be echoed back.
+/// value or the path, and names a variable only when the name is one of
+/// rotate's own ([`DENIED_REPLACEMENT_VARS`], the configured admin key
+/// variable, a [`DENIED_REPLACEMENT_PREFIXES`] prefix): a secret pasted in
+/// the wrong place must not be echoed back.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplacementInputError {
     /// `--replacement-from-env` names a variable that is not set.
     #[error("the --replacement-from-env variable is not set; nothing was changed")]
     EnvUnset,
+    /// `--replacement-from-env` is not a variable name
+    /// (`[A-Za-z_][A-Za-z0-9_]*`). Not repeated: it may be the value.
+    #[error(
+        "the --replacement-from-env argument is not an environment variable name (letters, digits and _, not starting with a digit); pass the name of the variable, never the value; nothing was changed"
+    )]
+    EnvBadName,
+    /// `--replacement-from-env` names a variable rotate reads as an
+    /// operator credential, or one the runner sets (SHA-348). Holds the
+    /// deny-list entry or `a variable starting with <prefix>`.
+    #[error(
+        "--replacement-from-env names {0}, which rotate reads as an operator credential or the runner sets; put the replacement in a variable of its own, such as NEW_TOKEN; nothing was changed"
+    )]
+    EnvDenied(String),
     /// `--replacement-file` could not be opened or read.
     #[error("could not read the --replacement-file file ({0}); nothing was changed")]
     Read(io::ErrorKind),
@@ -123,13 +163,59 @@ pub fn normalize_replacement(value: SecretValue) -> Result<SecretValue, Replacem
     Ok(trimmed.unwrap_or(value))
 }
 
+/// Checks a `--replacement-from-env` name before anything reads it
+/// (SHA-348): it must be `[A-Za-z_][A-Za-z0-9_]*`, not in
+/// [`DENIED_REPLACEMENT_VARS`] or `also_denied` (the configured
+/// `providers.openai.admin_key_env`), and not start with a
+/// [`DENIED_REPLACEMENT_PREFIXES`] prefix. Names are compared exactly, as
+/// the environment does.
+pub fn check_replacement_env(
+    name: &std::ffi::OsStr,
+    also_denied: &[&str],
+) -> Result<(), ReplacementInputError> {
+    let name = name
+        .to_str()
+        .filter(|n| is_env_name(n))
+        .ok_or(ReplacementInputError::EnvBadName)?;
+    if let Some(denied) = DENIED_REPLACEMENT_VARS
+        .iter()
+        .chain(also_denied)
+        .find(|denied| **denied == name)
+    {
+        return Err(ReplacementInputError::EnvDenied((*denied).to_owned()));
+    }
+    if let Some(prefix) = DENIED_REPLACEMENT_PREFIXES
+        .iter()
+        .find(|prefix| name.starts_with(**prefix))
+    {
+        return Err(ReplacementInputError::EnvDenied(format!(
+            "a variable starting with {prefix}"
+        )));
+    }
+    Ok(())
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Reads the replacement from the environment variable `name`
-/// (`--replacement-from-env`). The bytes move into a [`SecretValue`]
-/// without a copy; the process environment keeps its own.
+/// (`--replacement-from-env`), once [`check_replacement_env`] accepts the
+/// name. The bytes move into a [`SecretValue`] without a copy; the process
+/// environment keeps its own.
 #[cfg(unix)]
-pub fn replacement_from_env(name: &std::ffi::OsStr) -> Result<SecretValue, ReplacementInputError> {
+pub fn replacement_from_env(
+    name: &std::ffi::OsStr,
+    also_denied: &[&str],
+) -> Result<SecretValue, ReplacementInputError> {
     use std::os::unix::ffi::OsStringExt;
 
+    check_replacement_env(name, also_denied)?;
     let value = std::env::var_os(name).ok_or(ReplacementInputError::EnvUnset)?;
     normalize_replacement(SecretValue::new(value.into_vec()))
 }
@@ -367,23 +453,133 @@ mod tests {
     fn replacement_env_rules() {
         let name = std::ffi::OsStr::new("ROTATE_INPUT_UNIT_REPLACEMENT");
         assert_eq!(
-            replacement_from_env(name).unwrap_err(),
+            replacement_from_env(name, &[]).unwrap_err(),
             ReplacementInputError::EnvUnset
         );
         std::env::set_var(name, "npm_input_unit_env_value\n");
         assert_eq!(
-            replacement_from_env(name).unwrap(),
+            replacement_from_env(name, &[]).unwrap(),
             SecretValue::from("npm_input_unit_env_value")
         );
         std::env::set_var(name, " \n");
         assert_eq!(
-            replacement_from_env(name).unwrap_err(),
+            replacement_from_env(name, &[]).unwrap_err(),
             ReplacementInputError::Empty
         );
         std::env::remove_var(name);
         assert!(!ReplacementInputError::EnvUnset
             .to_string()
             .contains("ROTATE_INPUT_UNIT"));
+    }
+
+    // SHA-348 T3 (AC3): every operator credential rotate reads is on the
+    // deny list.
+    #[test]
+    fn deny_list_holds_every_operator_credential_variable() {
+        let admin = crate::config::OpenAiConfig::default().admin_key_env;
+        let read: Vec<&str> = crate::github::TOKEN_VARS
+            .into_iter()
+            .chain(crate::provider::npm::TOKEN_VARS)
+            .chain([crate::provider::npm::OTP_VAR, admin.as_str()])
+            .collect();
+        for name in read {
+            assert!(DENIED_REPLACEMENT_VARS.contains(&name), "{name}");
+        }
+    }
+
+    // SHA-348 T3 (AC3)
+    #[test]
+    fn replacement_env_refuses_credentials_runner_and_bad_names() {
+        use std::ffi::OsStr;
+
+        for name in DENIED_REPLACEMENT_VARS {
+            let err = check_replacement_env(OsStr::new(name), &[]).unwrap_err();
+            assert_eq!(err, ReplacementInputError::EnvDenied(name.to_owned()));
+            assert!(err.to_string().contains(name), "{err}");
+        }
+        for (name, prefix) in [
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_"),
+            ("ACTIONS_RUNTIME_TOKEN", "ACTIONS_"),
+            ("RUNNER_TEMP", "RUNNER_"),
+            ("RUNNER_", "RUNNER_"),
+        ] {
+            let err = check_replacement_env(OsStr::new(name), &[]).unwrap_err();
+            assert_eq!(
+                err,
+                ReplacementInputError::EnvDenied(format!("a variable starting with {prefix}"))
+            );
+        }
+        let err =
+            check_replacement_env(OsStr::new("ROTATE_OPENAI_ADMIN"), &["ROTATE_OPENAI_ADMIN"])
+                .unwrap_err();
+        assert!(err.to_string().contains("ROTATE_OPENAI_ADMIN"), "{err}");
+
+        for bad in [
+            "",
+            "1TOKEN",
+            "NEW-TOKEN",
+            "NEW TOKEN",
+            "NEW_TOKEN=x",
+            "sk-proj-input-unit-pasted-value",
+            "TOKÉN",
+            "NEW_TOKEN\n",
+        ] {
+            let err = check_replacement_env(OsStr::new(bad), &[]).unwrap_err();
+            assert_eq!(err, ReplacementInputError::EnvBadName, "{bad:?}");
+            if !bad.is_empty() {
+                assert!(!err.to_string().contains(bad), "{err}");
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                check_replacement_env(OsStr::from_bytes(b"NEW\xffTOKEN"), &[]).unwrap_err(),
+                ReplacementInputError::EnvBadName
+            );
+        }
+
+        // Case and near misses are other variables, as in the environment.
+        for good in [
+            "NEW_TOKEN",
+            "_NEW",
+            "github_token",
+            "MY_GITHUB_TOKEN",
+            "ROTATE_GITHUB_TOKEN_NEW",
+            "RUNNERS_TOKEN",
+            "ACTIONS",
+            "ROTATE_OPENAI_ADMIN",
+        ] {
+            assert_eq!(
+                check_replacement_env(OsStr::new(good), &[]),
+                Ok(()),
+                "{good}"
+            );
+        }
+    }
+
+    // SHA-348 T3 (AC3): a refused variable is never read, so its value
+    // cannot reach the error.
+    #[test]
+    fn refused_replacement_env_is_never_read() {
+        let name = std::ffi::OsStr::new("RUNNER_ROTATE_INPUT_UNIT_SENTINEL");
+        let sentinel = "npm_input_unit_sentinel_value";
+        std::env::set_var(name, sentinel);
+        for also in [&[][..], &["ROTATE_INPUT_UNIT_ADMIN"][..]] {
+            let err = replacement_from_env(name, also).unwrap_err();
+            assert!(matches!(err, ReplacementInputError::EnvDenied(_)));
+            assert!(!err.to_string().contains(sentinel), "{err}");
+        }
+        let admin = std::ffi::OsStr::new("ROTATE_INPUT_UNIT_ADMIN");
+        std::env::set_var(admin, sentinel);
+        let err = replacement_from_env(admin, &["ROTATE_INPUT_UNIT_ADMIN"]).unwrap_err();
+        assert_eq!(
+            err,
+            ReplacementInputError::EnvDenied("ROTATE_INPUT_UNIT_ADMIN".to_owned())
+        );
+        assert!(!err.to_string().contains(sentinel), "{err}");
+        std::env::remove_var(name);
+        std::env::remove_var(admin);
     }
 
     #[test]

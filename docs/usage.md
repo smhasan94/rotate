@@ -436,7 +436,7 @@ Global flags work before or after the command.
 | `--confirm <ROTATION_ID>` | apply, rollback | Confirm this rotation without a prompt. Repeatable. |
 | `--all` | apply | Confirm every rotation with one prompt. |
 | `--all` | status | Also list finished rotations. |
-| `--replacement-from-env <VAR>` | apply | Manual mode: read the replacement from this environment variable. |
+| `--replacement-from-env <VAR>` | apply | Manual mode: read the replacement from this environment variable. Refuses (exit 2) a malformed name, the operator credential variables rotate reads, `GITHUB_TOKEN`, and names starting with `ACTIONS_` or `RUNNER_`; see [non-interactive.md](non-interactive.md). |
 | `--replacement-file <PATH>` | apply | Manual mode: read the replacement from this file (mode 600). |
 | `--force` | apply | Revoke even if some consumers could not be updated. |
 | `--wait` | apply | Wait out the overlap window in this run, then revoke. |

@@ -79,6 +79,25 @@ The value is read before anything else happens, never printed and never
 stored; the state file records `replacement_ref: manual` and its
 fingerprint.
 
+`--replacement-from-env` refuses, with exit 2 before any provider call and
+before the variable is read:
+
+- a name that is not an environment variable name
+  (`[A-Za-z_][A-Za-z0-9_]*`). The error does not repeat it: it may be the
+  value pasted in the wrong place;
+- a variable rotate reads as an operator credential or one-time password,
+  or the workflow token: `ROTATE_GITHUB_TOKEN`, `GITHUB_TOKEN`,
+  `ROTATE_NPM_TOKEN`, `NPM_TOKEN`, `ROTATE_NPM_OTP`, `OPENAI_ADMIN_KEY` and
+  the name set in `providers.openai.admin_key_env`, `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN`. Naming one would copy that
+  credential into every consumer;
+- a variable whose name starts with `ACTIONS_` or `RUNNER_`, which a GitHub
+  Actions runner sets for itself.
+
+The error names the refused variable (or the prefix), never its value. Put
+the replacement in a variable of its own, such as `NEW_TOKEN`.
+
 ## Machine-readable output: `--json`
 
 `--json` is a global flag, accepted before or after the command.
