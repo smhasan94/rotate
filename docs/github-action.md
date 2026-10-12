@@ -31,7 +31,7 @@ revoke in a later workflow run, or run on Windows runners.
     ROTATE_GITHUB_TOKEN: ${{ secrets.ROTATE_GITHUB_TOKEN }}
 ```
 
-The Action is in the repository from the release after 0.2.0. Pin a tag
+The Action is in the repository from release 0.3.0. Pin a tag
 (`@vX.Y.Z`) or, better, the full commit SHA of that tag: a commit SHA is
 the only reference GitHub treats as immutable. There is no floating `v1`
 tag before rotate 1.0. With a tag, `version` defaults to the same release,

@@ -36,7 +36,7 @@ with `brew install smhasan94/rotate/rotate`.
 Or build from source with Rust stable 1.94.1 or newer:
 
 ```sh
-cargo install --git https://github.com/smhasan94/rotate --tag v0.2.0 --locked
+cargo install --git https://github.com/smhasan94/rotate --tag v0.3.0 --locked
 rotate --version
 rotate --help
 ```
