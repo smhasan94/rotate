@@ -213,7 +213,8 @@ rotate apply trufflehog-report.json
 `--confirm <rotation-id>` (repeatable) confirms without a prompt, for
 scripts. An id that is not in the plan exits 2. When the plan has nothing
 to apply, `--confirm` exits 0 ("Nothing to apply.") only if every id it
-names is already `revoked` in the state file (a re-run), and 2 otherwise:
+names is already finished in the state file (`revoked`, no rollback in
+progress: a re-run), and 2 otherwise:
 
 <!-- test: first-run -->
 ```sh
@@ -448,7 +449,7 @@ Global flags work before or after the command.
 | --- | --- |
 | 0 | Everything requested was done. `plan` exits 0 even when it lists blockers. |
 | 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. Also `rollback` that finished with the old secret still revoked: the restored consumers hold a revoked secret. |
-| 2 | Bad arguments, bad configuration, a wrong or unknown rotation id (on a plan with nothing to apply, any `--confirm` id not already `revoked`), a refused `--replacement-from-env` name, a state file held by another rotate process, or a rollback input that matches no rotation. Nothing was changed. |
+| 2 | Bad arguments, bad configuration, a wrong or unknown rotation id (on a plan with nothing to apply, any `--confirm` id not already finished (`revoked`, no rollback in progress)), a refused `--replacement-from-env` name, a state file held by another rotate process, or a rollback input that matches no rotation. Nothing was changed. |
 | 3 | Work is pending: `apply` recorded a revoke waiting for its overlap window, or `status` found a rotation that is pending, failed, needs rollback or waits for a revoke by hand. |
 | 4 | `apply`: the replacement is live and verified, but rotate cannot revoke the old secret; delete it by hand as the summary says, then re-run `apply` to record it. |
 | 101 | rotate panicked. This is a bug; the message is redacted like all other output. |

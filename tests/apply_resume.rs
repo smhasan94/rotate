@@ -753,48 +753,60 @@ fn sha348_t1_empty_plan_with_revoked_ids_is_nothing_to_apply() {
     }
 }
 
-// SHA-348 T2 (AC2): an unknown id, or one at a step that is not final,
-// on an empty plan exits 2 with the unknown-rotation error, calling
-// nothing and writing no audit entry.
+const UNKNOWN_ON_EMPTY: &str =
+    "error: a --confirm id is not a rotation in this plan (rotations: none); nothing was changed";
+const NOT_FINISHED: &str =
+    "error: a --confirm id is a rotation that is not finished in the state file";
+
+// SHA-348 T2 (AC2): on an empty plan, an id the state file does not know
+// exits 2 with the unknown-rotation error, and one it records at any step
+// that is not finished (or revoked with a rollback in progress) exits 2
+// with the not-finished error. Nothing is called, no audit entry written.
 #[test]
 fn sha348_t2_empty_plan_with_unknown_or_unfinished_id_exits_2() {
     let value = "npm_resume_sha348_t2_value";
-    for step in [
+    let other = "npm_resume_sha348_t2_other";
+    let unfinished: Vec<(&str, Value)> = [
         "planned",
         "created",
         "consumers_updated",
+        "verified",
         "pending_revoke",
         "failed",
-    ] {
+        "needs_rollback",
+        "revoke_manual",
+        "rolled_back",
+    ]
+    .into_iter()
+    .map(|step| (step, record("rot-3482a002", other, step, json!([]))))
+    .chain([("revoked, rolling back", {
+        let mut rolling = record("rot-3482a002", other, "revoked", json!([]));
+        rolling["rollback"] = json!({ "restore_done": false, "revoke_done": false });
+        rolling
+    })])
+    .collect();
+    for (step, rotation) in unfinished {
         let run = Run::new(value);
         run.seed(json!([
             record("rot-3482a001", value, "revoked", json!([])),
-            record(
-                "rot-3482a002",
-                "npm_resume_sha348_t2_other",
-                step,
-                json!([])
-            ),
+            rotation,
         ]));
         let state = run.read(".rotate/state.json");
-        for ids in [
-            &["rot-3482ffff"][..],
-            &["rot-3482a002"][..],
-            &["rot-3482a001", "rot-3482a002"][..],
-            &["rot-3482a001", "rot-3482ffff"][..],
+        for (ids, want) in [
+            (&["rot-3482ffff"][..], UNKNOWN_ON_EMPTY),
+            (&["rot-3482a001", "rot-3482ffff"][..], UNKNOWN_ON_EMPTY),
+            (&["rot-3482a002", "rot-3482ffff"][..], UNKNOWN_ON_EMPTY),
+            (&["rot-3482a002"][..], NOT_FINISHED),
+            (&["rot-3482a001", "rot-3482a002"][..], NOT_FINISHED),
         ] {
             let output = apply_confirming(&run, ids);
             let err = stderr(&output);
             assert_eq!(output.status.code(), Some(2), "{step} {ids:?}: {err}");
-            assert!(
-                err.contains(
-                    "error: a --confirm id is not a rotation in this plan (rotations: none); \
-                     nothing was changed"
-                ),
-                "{step} {ids:?}: {err}"
-            );
+            assert!(err.contains(want), "{step} {ids:?}: {err}");
             assert!(!err.contains("Nothing to apply."), "{err}");
-            assert!(!err.contains("rot-3482ffff"), "typed id echoed: {err}");
+            for id in ids {
+                assert!(!err.contains(id), "typed id echoed: {err}");
+            }
             assert!(run.mutating().is_empty(), "{:?}", run.mutating());
             assert!(run.calls().is_empty(), "{:?}", run.calls());
             assert!(run.audit().is_empty(), "{:?}", run.audit());

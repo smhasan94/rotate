@@ -490,6 +490,12 @@ pub enum ConfirmError {
         /// The ids in the plan, comma separated, or `none`.
         known: String,
     },
+    /// A plan with nothing to apply, and a `--confirm` id the state file
+    /// records but not as finished (SHA-348). The id is not repeated.
+    #[error(
+        "a --confirm id is a rotation that is not finished in the state file (not revoked, or being rolled back), but this plan has nothing to apply: the input no longer holds a secret to rotate for it; run `rotate status --all`; nothing was changed"
+    )]
+    NotFinished,
     /// No answer could be read.
     #[error(transparent)]
     Prompt(#[from] PromptError),
@@ -559,23 +565,28 @@ pub fn confirm(
 }
 
 /// `--confirm` on a plan with nothing to apply (SHA-348): accepted only when
-/// every id is a rotation the state file records as `revoked`, so re-running
-/// a finished apply stays idempotent. Any other id, unknown or at an
-/// unfinished step, is the same [`ConfirmError::Unknown`] a non-empty plan
-/// gives, with no rotation to list. Reads the state only; the typed ids are
+/// every id is a rotation the state file records as finished
+/// ([`Rotation::is_finished`]: revoked, no rollback started), so re-running
+/// a finished apply stays idempotent. An id the state file does not know is
+/// the same [`ConfirmError::Unknown`] a non-empty plan gives, with no
+/// rotation to list; a known but unfinished one is
+/// [`ConfirmError::NotFinished`]. Reads the state only; the typed ids are
 /// never repeated.
 pub fn confirm_finished(ids: &[String], store: &StateStore) -> Result<(), ConfirmError> {
-    let finished = ids.iter().all(|id| {
-        store
-            .get(id)
-            .is_some_and(|rotation| rotation.step == Step::Revoked)
-    });
-    if finished {
+    let stored: Vec<Option<&Rotation>> = ids.iter().map(|id| store.get(id)).collect();
+    if stored.iter().any(Option::is_none) {
+        return Err(ConfirmError::Unknown {
+            known: "none".to_owned(),
+        });
+    }
+    if stored
+        .iter()
+        .flatten()
+        .all(|rotation| rotation.is_finished())
+    {
         Ok(())
     } else {
-        Err(ConfirmError::Unknown {
-            known: "none".to_owned(),
-        })
+        Err(ConfirmError::NotFinished)
     }
 }
 

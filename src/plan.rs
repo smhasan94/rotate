@@ -670,7 +670,7 @@ pub fn split_already_rotated(
             .iter()
             .filter(|r| r.fingerprint == fingerprint)
             .max_by_key(|r| r.updated_at);
-        let Some(done) = latest.filter(|r| r.step == Step::Revoked && !r.is_rolling_back()) else {
+        let Some(done) = latest.filter(|r| r.is_finished()) else {
             kept.push(finding);
             continue;
         };
