@@ -377,6 +377,14 @@ fn apply(console: &mut Console, findings: Vec<Finding>, args: &ApplyArgs, config
         .filter(|s| s.reason == plan::REVOKED_BY_HAND)
         .collect();
     if plan.rotations.is_empty() && by_hand.is_empty() {
+        // An empty plan takes --confirm only for rotations already revoked
+        // (an idempotent re-run, SHA-348); any other id is an error.
+        if !args.confirm.is_empty() {
+            if let Err(err) = apply::confirm_finished(&args.confirm, &store) {
+                let _ = writeln!(console.err(), "error: {err}");
+                return Exit::Usage;
+            }
+        }
         let _ = writeln!(console.err(), "Nothing to apply.");
         return Exit::Ok;
     }

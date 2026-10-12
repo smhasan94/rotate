@@ -1778,7 +1778,9 @@ const MOCK_GITHUB_REPLACEMENT: &str = "ghp_github-replacement-1";
 // ---------------------------------------------------------------------------
 
 /// The alert was resolved while the job waited for approval: rotate finds
-/// nothing to apply and exits 0. The step must not report Done.
+/// nothing to apply. The confirmed id is only `planned` in the state file,
+/// so rotate itself refuses it with exit 2 (SHA-348). The step must not
+/// report Done.
 #[cfg(feature = "test-providers")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sha338_exit_0_without_applying_is_not_done() {
@@ -1805,20 +1807,19 @@ async fn sha338_exit_0_without_applying_is_not_done() {
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains(&format!(
-            "::error title=rotate::The confirmed rotations {id} were not applied"
-        )),
+        stderr.contains("error: a --confirm id is not a rotation in this plan (rotations: none)"),
         "{stderr}"
     );
+    assert!(
+        stderr
+            .contains("::error title=rotate::rotate apply exited with code 2; nothing was changed"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Nothing to apply."), "{stderr}");
     assert_no_mutating(&run);
     let summary = run.summary();
     assert!(!summary.contains("**Done.**"), "{summary}");
-    assert!(
-        summary.contains(&format!(
-            "**Not applied.** rotate apply exited 0 but did not apply `{id}`"
-        )),
-        "{summary}"
-    );
+    assert!(summary.contains("**Nothing was changed.**"), "{summary}");
     assert_eq!(run.outputs()["exit-code"], "2");
 }
 

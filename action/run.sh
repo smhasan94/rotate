@@ -541,10 +541,11 @@ if [ "$MODE" = apply ]; then
   if [ "$status_rc" -ne 0 ] && [ "$status_rc" -ne 3 ]; then
     rm -f "$status_path"
   fi
-  # rotate exits 0 with "Nothing to apply." when the alerts fetched again
-  # plan nothing, for example when an alert was resolved or a secret
-  # revoked while the job waited for approval. Done means every confirmed
-  # rotation is revoked; anything else is reported as not applied, exit 2.
+  # When the alerts fetched again plan nothing (an alert was resolved or a
+  # secret revoked while the job waited for approval), rotate exits 0 only
+  # if every confirmed rotation is already revoked, and 2 otherwise
+  # (SHA-348). Done still means every confirmed rotation is revoked;
+  # anything else is reported as not applied, exit 2.
   not_applied=
   if [ "$rotate_status" -eq 0 ]; then
     if [ -s "$status_path" ]; then

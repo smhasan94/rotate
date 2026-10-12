@@ -26,6 +26,13 @@ more. Only the rotations named run; the others in the plan are left alone.
 An id that is not in the plan exits 2 having changed nothing, and the error
 lists the ids that are.
 
+When the plan has nothing to apply (every secret already rotated or no
+longer valid), `--confirm` passes with "Nothing to apply." and exit 0 only
+if every id it names is a rotation the state file records as `revoked`, so
+re-running a finished apply is safe. Any other id, unknown or at a step
+that is not finished, exits 2 with the same error (`rotations: none`),
+with no provider call and no audit entry.
+
 The rotation id comes from the plan. It is stored in the state file, so it
 stays the same between `plan` and `apply` when both run in the same
 directory (or with the same `--state-file`):
@@ -137,7 +144,7 @@ Set `ROTATE_ACTOR` so the audit log says which job acted, for example
 | --- | --- | --- |
 | 0 | Everything requested was done. `plan` exits 0 even when it lists blockers. | Continue. |
 | 1 | A rotation step failed. The old secret is still valid unless the output says otherwise. Also `rollback` that finished with the old secret still revoked, so the restored consumers hold a revoked secret. A revoke the provider rate-limited (GitHub allows 60 revocation requests an hour) also exits 1, naming when to re-run. | Stop and page a human; run `rotate status --all`. After such a rollback, create a new credential and run `rotate apply`. After a rate-limited revoke, re-run the same `rotate apply` after the time it printed. |
-| 2 | Bad arguments or configuration, an unknown rotation id, an unanswerable prompt, a state file held by another rotate process, `--json` on apply or rollback, or a rollback input that matches no rotation. Nothing was changed. | Fix the invocation. |
+| 2 | Bad arguments or configuration, an unknown rotation id (on a plan with nothing to apply, any id not already `revoked`), a refused `--replacement-from-env` name, an unanswerable prompt, a state file held by another rotate process, `--json` on apply or rollback, or a rollback input that matches no rotation. Nothing was changed. | Fix the invocation. |
 | 3 | Work is pending: `apply` recorded a revoke waiting for its overlap window, or `status` found a rotation that is pending, failed, needs rollback or waits for a revoke by hand. | Re-run the same `rotate apply` after the time it printed, or schedule it. |
 | 4 | `apply`: the replacement is live and verified, but rotate cannot revoke the old secret. | A human deletes the old secret as the summary says, then re-runs `rotate apply`. |
 | 101 | rotate panicked (a bug). | Stop; report it. |

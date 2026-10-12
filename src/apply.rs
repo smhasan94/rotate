@@ -558,6 +558,27 @@ pub fn confirm(
     }
 }
 
+/// `--confirm` on a plan with nothing to apply (SHA-348): accepted only when
+/// every id is a rotation the state file records as `revoked`, so re-running
+/// a finished apply stays idempotent. Any other id, unknown or at an
+/// unfinished step, is the same [`ConfirmError::Unknown`] a non-empty plan
+/// gives, with no rotation to list. Reads the state only; the typed ids are
+/// never repeated.
+pub fn confirm_finished(ids: &[String], store: &StateStore) -> Result<(), ConfirmError> {
+    let finished = ids.iter().all(|id| {
+        store
+            .get(id)
+            .is_some_and(|rotation| rotation.step == Step::Revoked)
+    });
+    if finished {
+        Ok(())
+    } else {
+        Err(ConfirmError::Unknown {
+            known: "none".to_owned(),
+        })
+    }
+}
+
 /// Why apply cannot run a rotation. Nothing is called for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {

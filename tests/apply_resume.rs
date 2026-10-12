@@ -702,3 +702,103 @@ fn resume_never_leaks() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// SHA-348: --confirm on an empty plan
+// ---------------------------------------------------------------------------
+
+/// `apply --stdin` with every id in `ids` confirmed.
+fn apply_confirming(run: &Run, ids: &[&str]) -> Output {
+    let mut args = vec!["apply", "--stdin"];
+    for id in ids {
+        args.extend_from_slice(&["--confirm", id]);
+    }
+    run.run(&args)
+}
+
+// SHA-348 T1 (AC1): every confirmed id is revoked in the state file, so a
+// re-run with nothing to apply passes, calling nothing.
+#[test]
+fn sha348_t1_empty_plan_with_revoked_ids_is_nothing_to_apply() {
+    let value = "npm_resume_sha348_t1_value";
+    let run = Run::new(value);
+    run.seed(json!([
+        record("rot-3481a001", value, "revoked", json!([])),
+        record(
+            "rot-3481a002",
+            "npm_resume_sha348_t1_other",
+            "revoked",
+            json!([])
+        ),
+    ]));
+    let state = run.read(".rotate/state.json");
+    for ids in [
+        &["rot-3481a001"][..],
+        &["rot-3481a002"][..],
+        &["rot-3481a001", "rot-3481a002"][..],
+    ] {
+        let output = apply_confirming(&run, ids);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{ids:?}: {}",
+            stderr(&output)
+        );
+        assert!(stdout(&output).contains("already rotated"));
+        assert!(stderr(&output).contains("Nothing to apply."), "{ids:?}");
+        assert!(run.mutating().is_empty(), "{:?}", run.mutating());
+        assert!(run.calls().is_empty(), "{:?}", run.calls());
+        assert!(run.audit().is_empty(), "{:?}", run.audit());
+        assert_eq!(run.read(".rotate/state.json"), state);
+    }
+}
+
+// SHA-348 T2 (AC2): an unknown id, or one at a step that is not final,
+// on an empty plan exits 2 with the unknown-rotation error, calling
+// nothing and writing no audit entry.
+#[test]
+fn sha348_t2_empty_plan_with_unknown_or_unfinished_id_exits_2() {
+    let value = "npm_resume_sha348_t2_value";
+    for step in [
+        "planned",
+        "created",
+        "consumers_updated",
+        "pending_revoke",
+        "failed",
+    ] {
+        let run = Run::new(value);
+        run.seed(json!([
+            record("rot-3482a001", value, "revoked", json!([])),
+            record(
+                "rot-3482a002",
+                "npm_resume_sha348_t2_other",
+                step,
+                json!([])
+            ),
+        ]));
+        let state = run.read(".rotate/state.json");
+        for ids in [
+            &["rot-3482ffff"][..],
+            &["rot-3482a002"][..],
+            &["rot-3482a001", "rot-3482a002"][..],
+            &["rot-3482a001", "rot-3482ffff"][..],
+        ] {
+            let output = apply_confirming(&run, ids);
+            let err = stderr(&output);
+            assert_eq!(output.status.code(), Some(2), "{step} {ids:?}: {err}");
+            assert!(
+                err.contains(
+                    "error: a --confirm id is not a rotation in this plan (rotations: none); \
+                     nothing was changed"
+                ),
+                "{step} {ids:?}: {err}"
+            );
+            assert!(!err.contains("Nothing to apply."), "{err}");
+            assert!(!err.contains("rot-3482ffff"), "typed id echoed: {err}");
+            assert!(run.mutating().is_empty(), "{:?}", run.mutating());
+            assert!(run.calls().is_empty(), "{:?}", run.calls());
+            assert!(run.audit().is_empty(), "{:?}", run.audit());
+            assert_eq!(run.read(".rotate/state.json"), state);
+        }
+    }
+}

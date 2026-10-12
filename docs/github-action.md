@@ -411,18 +411,21 @@ consumers could not all be updated is not revoked unless `force: true`.
 
 The job summary is built from `rotate --json status --all` and the exit
 code: one row per confirmed rotation with its step, consumers updated,
-revoke time, next step and error. The step's exit code is rotate's, with
-one exception: rotate exits 0 with "Nothing to apply." when the alerts it
-fetches again plan nothing, for example when an alert was resolved or the
-secret revoked while the job waited for approval. The step passes only
-when every confirmed rotation is at `revoked` in the state file;
-otherwise it exits 2 and names the rotations that were not applied.
+revoke time, next step and error. The step's exit code is rotate's. When
+the alerts it fetches again plan nothing, for example when an alert was
+resolved or the secret revoked while the job waited for approval, rotate
+exits 0 ("Nothing to apply.") only if every confirmed rotation is already
+at `revoked` in the state file (a re-run of a finished apply), and 2 with
+"a --confirm id is not a rotation in this plan" otherwise, having called
+nothing. As a second check, the step passes only when every confirmed
+rotation is at `revoked`; when rotate exits 0 without that, the step exits
+2 and names the rotations that were not applied.
 
 | Exit | Meaning | The step | The summary says |
 | --- | --- | --- | --- |
 | 0 | Every confirmed rotation finished: `rotate status` shows each at `revoked`. | passes | Done. |
 | 1 | A step failed; rotate stopped before the revoke. | fails | The old secret is still valid, with each rotation's step and error. |
-| 2 | Nothing was changed: a configuration error, an id not in the state file, a manual replacement missing; or rotate exited 0 without applying a confirmed rotation. | fails | rotate's error, or "Not applied" with the rotation ids. |
+| 2 | Nothing was changed: a configuration error, an id not in the state file, a confirmed id not in a plan of nothing to apply and not yet revoked, a manual replacement missing or refused; or rotate exited 0 without applying a confirmed rotation. | fails | rotate's error, or "Not applied" with the rotation ids. |
 | 3 | The overlap window is longer than `max-wait`. Created, updated and verified, not revoked. | fails | The time after which the old secret may be revoked. |
 | 4 | rotate cannot revoke the old secret. | fails | The provider's instructions for revoking it by hand. |
 
