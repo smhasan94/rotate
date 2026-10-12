@@ -6,6 +6,31 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The GitHub Action's `audit-suffix` input, appended to the audit
+  artifact's name so two apply steps in one run do not collide. (SHA-348)
+
+### Changed
+
+- `rotate apply --confirm <ids>` on a plan with nothing to apply exits 0
+  only when every confirmed rotation is finished (revoked, no rollback
+  started). An id rotate does not know, or a rotation that is not
+  finished, exits 2 with nothing changed; it used to exit 0. (SHA-348)
+- The GitHub Action's `upload-audit` defaults to `auto`: the audit
+  artifact is uploaded for a private or internal repository and skipped,
+  with a notice, for a public one or when the visibility cannot be read.
+  `true` and `false` work as before. (SHA-348)
+
+### Security
+
+- `--replacement-from-env` and the Action's `replacement-env` refuse
+  rotate's own credential variables (such as `ROTATE_GITHUB_TOKEN`,
+  `GITHUB_TOKEN`, `GH_TOKEN` and the AWS credential variables), the
+  configured OpenAI admin key variable and `ACTIONS_` and `RUNNER_`
+  variables, with exit 2 before any call. A wrong name would have written
+  an operator credential into every consumer. (SHA-348)
+
 ## [0.3.0] - 2026-10-11
 
 The GitHub Action, two more report formats and faster incident response.
