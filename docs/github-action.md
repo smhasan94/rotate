@@ -165,9 +165,10 @@ check it with `gh attestation verify` when `gh` is available.)
 | `confirm` | `""` | Apply only, required: the rotation ids to apply, comma-separated, each `rot-` and 8 hex digits. Pass the plan job's `rotation-ids` output. |
 | `state-dir` | `""` | Apply only, required: the directory the plan job's state artifact was downloaded to. It holds `.rotate/state.json`, which maps the ids to the leaked secrets. |
 | `force` | `false` | Apply only: `true` revokes the old secret even if some consumers could not be updated (`rotate --force`), recorded in the audit log. Never skips a failed create or verify. |
-| `replacement-env` | `""` | Apply only: the name (not the value) of an environment variable holding a replacement you created by hand, for a provider in manual replacement mode (`rotate --replacement-from-env`). One rotation per run. |
-| `max-wait` | `5h` | Apply only: the longest overlap window the step waits out. Keep it below the job's `timeout-minutes`. A longer window: no revoke, exit 3 with the revoke time. |
-| `upload-audit` | `true` | Apply only: upload `.rotate/` of the state directory (audit log and state file) as the artifact `rotate-audit-<run id>-<attempt>`, kept 30 days. Set `false` on a public repository. |
+| `replacement-env` | `""` | Apply only: the name (not the value) of an environment variable holding a replacement you created by hand, for a provider in manual replacement mode (`rotate --replacement-from-env`). One rotation per run. Refused with exit 2, before anything is downloaded or fetched, when it is not a variable name or names a credential rotate or the Action reads ([Manual replacements](#manual-replacements)). |
+| `max-wait` | `5h` | Apply only: the longest overlap window the step waits out. GitHub-hosted jobs stop at 6 hours, so keep it below the job's `timeout-minutes` with room for the rest of the job. A longer window: no revoke, exit 3 with the revoke time. |
+| `upload-audit` | `auto` | Apply only: `auto`, `true` or `false`. Upload `.rotate/` of the state directory (audit log and state file) as the artifact `rotate-audit-<run id>-<attempt>`, kept 30 days. `auto` uploads only when the repository is private or internal, and skips with a notice when it is public or its visibility cannot be read ([The audit artifact](#the-audit-artifact)). |
+| `audit-suffix` | `""` | Apply only: appended to the audit artifact's name, `rotate-audit-<run id>-<attempt>-<suffix>`, so two apply steps in one run do not collide. 1 to 40 letters, digits, `.`, `_` or `-`. |
 
 Inputs reach the scripts through environment variables, never through
 `run:` text, so a hostile `client_payload` cannot inject shell. They are
@@ -191,8 +192,9 @@ value.
 Everything lives under `$RUNNER_TEMP/rotate/`, readable by the runner's
 user only, and is discarded with the runner. The state directory and
 `plan.json` hold no secret value but name your consumers and key ids, so
-keep artifact retention short, and on a public repository, where anyone
-with read access can download artifacts, turn `upload-audit` off.
+keep artifact retention short. On a public repository, where anyone with
+read access can download artifacts, `upload-audit: auto` (the default)
+uploads no audit artifact.
 
 ## The job summary
 
@@ -435,7 +437,10 @@ A runner cannot come back later, so the step waits out the overlap window
 (`--wait`) and then revokes, in the same job. Keep the window short and
 below the job's `timeout-minutes` (at most 360 minutes, the default, on
 GitHub-hosted runners), and set `max-wait` below the timeout with room
-for the rest of the job. Before it fetches anything, the step asks rotate
+for the rest of the job. The default `max-wait` of `5h` leaves an hour of
+a 6-hour GitHub-hosted job for everything else; with a shorter
+`timeout-minutes`, lower `max-wait` with it, or the job is cancelled in
+the middle of the wait, before the revoke. Before it fetches anything, the step asks rotate
 for the window it will use (`overlap`, else `ROTATE_OVERLAP`, else
 `rotate.yaml`). When the window is longer than `max-wait`, the step does
 not wait: it creates, updates and verifies, then fails with exit 3 and
@@ -455,19 +460,31 @@ fails before rotate runs; "Re-run all jobs" plans again and hands over a
 fresh state. To continue a failed or pending rotation, download the failed
 run's audit artifact and use rotate by hand (`rotate status`, `rotate
 apply` or `rotate rollback` with `--state-file` and `--audit-log`
-pointing into it). With `upload-audit: false` there is no such artifact:
-after an exit 3 or 4 no state is left to resume from, and the old secret
-must be revoked by hand at the provider.
+pointing into it). Without that artifact (`upload-audit: false`, or
+`auto` on a public repository) no state is left to resume from after an
+exit 3 or 4, and the old secret must be revoked by hand at the provider.
 
 ### The audit artifact
 
 After apply, also when it failed, the Action uploads `.rotate/` of its
 state directory (`audit.jsonl` and `state.json`) as the artifact
-`rotate-audit-<run id>-<attempt>`, kept 30 days. It holds what the audit
-log holds: rotation ids, fingerprints, key ids, consumer references, the
-actor and redacted errors, never a secret value ([security.md](security.md)).
+`rotate-audit-<run id>-<attempt>`, or `rotate-audit-<run id>-<attempt>-<suffix>`
+with `audit-suffix` (use it when one run has more than one apply step),
+kept 30 days. It holds what the audit log holds: rotation ids,
+fingerprints, key ids, consumer references, the actor and redacted errors,
+never a secret value ([security.md](security.md)).
+
 Anyone with read access to the repository can download a workflow's
-artifacts, so on a public repository set `upload-audit: false`; the job
+artifacts, and on a public repository that is anyone. So `upload-audit:
+auto`, the default, uploads only when the run's repository is private or
+internal. The step reads the visibility from the event
+(`github.event.repository.visibility`, passed to the script through
+`env:`), and when the event has none (a `schedule` run) from `GET
+/repos/{owner}/{repo}` on `api-url` with the alerts token. A public
+repository, or one whose visibility cannot be read, gets no artifact and
+a notice saying why: the step fails closed. The decision is made before
+anything is fetched, so it holds even when the step is cancelled during
+the wait. `upload-audit: true` uploads in any case, `false` never; the job
 log and summary are then the record.
 
 ### Manual replacements
@@ -492,6 +509,17 @@ rotation per run, and delete the secret afterwards:
 
 rotate checks that the replacement belongs to the same account as the
 leaked secret before it touches any consumer.
+
+`replacement-env` must be a variable name (`[A-Za-z_][A-Za-z0-9_]*`) of
+your own. The step refuses, with exit 2 before anything is downloaded or
+fetched and without repeating the name, a variable rotate or the Action
+reads as a credential (`ROTATE_GITHUB_TOKEN`, `GITHUB_TOKEN`,
+`ROTATE_NPM_TOKEN`, `NPM_TOKEN`, `ROTATE_NPM_OTP`, `OPENAI_ADMIN_KEY`,
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, `ALERTS_TOKEN`) and any name starting
+with `ACTIONS_` or `RUNNER_`: the replacement would be that credential.
+rotate applies the same rule, and also refuses the name set in
+`providers.openai.admin_key_env` ([non-interactive.md](non-interactive.md)).
 
 ## The `repository_dispatch` contract
 

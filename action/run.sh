@@ -11,8 +11,11 @@
 # summary, the outputs) comes from rotate's output, which never holds a
 # secret value.
 #
-#   run.sh                 validate the inputs, fetch, plan or apply, summarize
-#   run.sh --check-inputs  validate the inputs only
+#   run.sh                    validate the inputs, fetch, plan or apply,
+#                             summarize
+#   run.sh --check-inputs     validate the inputs only
+#   run.sh --upload-decision  validate the inputs, then set only the
+#                             upload-audit output (SHA-348)
 #
 # Environment (set by action.yml from the inputs):
 #   ALERT_NUMBER        "", or alert numbers separated by commas
@@ -23,7 +26,10 @@
 #   MODE                plan or apply
 #   VERBOSE             0 to 3
 #   OVERLAP             "", or an overlap window such as 30m (--overlap)
-#   UPLOAD_AUDIT        true or false (action.yml uploads the audit log)
+#   UPLOAD_AUDIT        auto, true or false: whether action.yml uploads
+#                       the audit log (the upload-audit output)
+#   AUDIT_SUFFIX        apply: "", or the audit artifact's name suffix
+#   REPOSITORY_VISIBILITY  github.event.repository.visibility, or ""
 #   CONFIRM             apply: rotation ids from the plan, comma-separated
 #   FORCE               apply: true or false (--force)
 #   REPLACEMENT_ENV     apply: "", or the name of the variable that holds
@@ -33,6 +39,9 @@
 #   ROTATE_BIN          the rotate binary (from install.sh)
 # and by the runner: RUNNER_TEMP, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY,
 # GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID.
+#
+# Outputs set before any fetch: state-dir, and in apply mode upload-audit
+# (true or false), which the audit upload step reads.
 #
 # Exit codes: 2 for a bad input (before any request), 1 when the alerts
 # could not be fetched (rotate is not run), otherwise rotate's own code.
@@ -56,6 +65,12 @@ PERMISSION_HINT="the token needs Secret scanning alerts: read; GITHUB_TOKEN cann
 # rotate's duration grammar (`overlap_window`), at most 9 digits a group.
 DURATION='^([0-9]{1,9}[dhms])+$'
 
+# Variables replacement-env refuses (SHA-348): those rotate reads as an
+# operator credential or one-time password (src/input.rs,
+# DENIED_REPLACEMENT_VARS), the workflow token, and this Action's alerts
+# token. Names starting with ACTIONS_ or RUNNER_ are refused too.
+DENIED_REPLACEMENT_VARS="ROTATE_GITHUB_TOKEN GITHUB_TOKEN ROTATE_NPM_TOKEN NPM_TOKEN ROTATE_NPM_OTP OPENAI_ADMIN_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN ALERTS_TOKEN"
+
 # A workflow command's message, escaped so it stays one command:
 # `%`, CR and LF are encoded as GitHub documents.
 annotate() {
@@ -63,7 +78,7 @@ annotate() {
   message=${message//%/%25}
   message=${message//$'\r'/%0D}
   message=${message//$'\n'/%0A}
-  printf '::error title=rotate::%s\n' "$message" >&2
+  printf '::%s title=rotate::%s\n' "${2:-error}" "$message" >&2
 }
 
 # One line naming the input, exit 2 (AC6). Never echoes the raw input.
@@ -114,10 +129,13 @@ check_inputs() {
   if [ -n "${OVERLAP:-}" ] && ! [[ $OVERLAP =~ $DURATION ]]; then
     bad_input "overlap: must be a duration such as 30m or 1h30m"
   fi
-  case ${UPLOAD_AUDIT:-true} in
-    true | false) ;;
-    *) bad_input "upload-audit: must be true or false" ;;
+  case ${UPLOAD_AUDIT:-auto} in
+    auto | true | false) ;;
+    *) bad_input "upload-audit: must be auto, true or false" ;;
   esac
+  if [ -n "${AUDIT_SUFFIX:-}" ] && ! [[ $AUDIT_SUFFIX =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
+    bad_input "audit-suffix: must be 1 to 40 letters, digits, '.', '_' or '-'"
+  fi
   case ${FORCE:-false} in
     true | false) ;;
     *) bad_input "force: must be true or false" ;;
@@ -127,6 +145,16 @@ check_inputs() {
   fi
   if [ -n "${REPLACEMENT_ENV:-}" ] && ! [[ $REPLACEMENT_ENV =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
     bad_input "replacement-env: must be the name of an environment variable, such as NEW_TOKEN"
+  fi
+  if [ -n "${REPLACEMENT_ENV:-}" ]; then
+    local denied
+    for denied in $DENIED_REPLACEMENT_VARS ACTIONS_ RUNNER_; do
+      case $denied in
+        *_) [[ $REPLACEMENT_ENV == "$denied"* ]] || continue ;;
+        *) [ "$REPLACEMENT_ENV" = "$denied" ] || continue ;;
+      esac
+      bad_input "replacement-env: names a credential rotate or this Action reads, or a runner variable (ACTIONS_*, RUNNER_*); put the replacement in a variable of its own, such as NEW_TOKEN"
+    done
   fi
   if ! [[ ${MAX_WAIT:-5h} =~ $DURATION ]]; then
     bad_input "max-wait: must be a duration such as 30m or 1h30m"
@@ -139,6 +167,7 @@ check_inputs() {
     [ -z "${CONFIRM:-}" ] || bad_input "confirm: only with mode: apply"
     [ -z "${PLAN_STATE_DIR:-}" ] || bad_input "state-dir: only with mode: apply"
     [ -z "${REPLACEMENT_ENV:-}" ] || bad_input "replacement-env: only with mode: apply"
+    [ -z "${AUDIT_SUFFIX:-}" ] || bad_input "audit-suffix: only with mode: apply"
     [ "${FORCE:-false}" = false ] || bad_input "force: only with mode: apply"
     return 0
   fi
@@ -157,10 +186,79 @@ check_inputs() {
   fi
 }
 
+output() {
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+  fi
+}
+
+# The visibility of the run's repository, where the audit artifact is
+# stored, from `GET /repos/{owner}/{repo}` with the alerts token (on curl's
+# stdin, as in fetch_alerts): public, private or internal on stdout, or
+# nothing when it cannot be read.
+repository_visibility() {
+  local repo=${GITHUB_REPOSITORY:-} api=${API_URL%/}
+  local proto=(--proto '=https' --proto-redir '=https')
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 0
+  case $api in
+    https://*) ;;
+    *) proto=(--proto '=https,http' --proto-redir '=https,http') ;;
+  esac
+  printf 'header = "Authorization: Bearer %s"\n' "$ALERTS_TOKEN" |
+    curl --disable --config - --silent --fail --location --max-redirs 3 \
+      "${proto[@]}" --connect-timeout 20 --max-time 30 \
+      --user-agent rotate-action \
+      --header 'Accept: application/vnd.github+json' \
+      --header 'X-GitHub-Api-Version: 2022-11-28' \
+      "$api/repos/$repo" 2> /dev/null |
+    jq -r 'if (.visibility | type) == "string" then .visibility
+           elif .private == true then "private"
+           elif .private == false then "public"
+           else empty end' 2> /dev/null || true
+}
+
+# SHA-348: whether action.yml uploads the audit artifact, as the
+# upload-audit output. true and false are taken as given. auto uploads only
+# to a repository known to be private or internal: the event's visibility,
+# else the API's. Public or unknown: no upload (fail closed), and a notice
+# says why.
+decide_upload() {
+  local visibility=
+  if [ "${MODE:-plan}" != apply ]; then
+    output upload-audit false
+    return 0
+  fi
+  case ${UPLOAD_AUDIT:-auto} in
+    true | false)
+      output upload-audit "$UPLOAD_AUDIT"
+      return 0
+      ;;
+  esac
+  case ${REPOSITORY_VISIBILITY:-} in
+    public | private | internal) visibility=$REPOSITORY_VISIBILITY ;;
+    *) visibility=$(repository_visibility) ;;
+  esac
+  case $visibility in
+    private | internal) output upload-audit true ;;
+    public)
+      annotate "The audit artifact will not be uploaded: the repository is public, and anyone who can see it could download the artifact. Set upload-audit: true to upload it anyway." notice
+      output upload-audit false
+      ;;
+    *)
+      annotate "The audit artifact will not be uploaded: the repository's visibility could not be read (no event visibility, and GET /repos/{owner}/{repo} with the alerts token failed), so it is treated as public. Set upload-audit: true to upload it anyway, or false to skip it without this notice." notice
+      output upload-audit false
+      ;;
+  esac
+}
+
 check_inputs
-if [ "${1:-}" = --check-inputs ]; then
-  exit 0
-fi
+case ${1:-} in
+  --check-inputs) exit 0 ;;
+  --upload-decision)
+    decide_upload
+    exit 0
+    ;;
+esac
 
 # Everything this step writes is readable by the runner's user only.
 umask 077
@@ -187,16 +285,13 @@ chmod 0700 "$state_dir"
 rm -rf "$probe_dir"
 rm -f "$plan_path" "$status_path" "$summary_path" "$status_file" "$log_file"
 
-output() {
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then
-    printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
-  fi
-}
-
 # Set before any fetch, probe or apply: the audit upload in action.yml
-# runs on always() and needs it even when this step is killed or times
+# runs on always() and needs both even when this step is killed or times
 # out in the middle of a --wait.
 output state-dir "$state_dir"
+if [ "$MODE" = apply ]; then
+  decide_upload
+fi
 
 # The summary goes to the job summary and to the log.
 publish_summary() {
