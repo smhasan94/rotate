@@ -1819,12 +1819,15 @@ async fn sha338_exit_0_without_applying_is_not_done() {
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("error: a --confirm id is not a rotation in this plan (rotations: none)"),
+        stderr
+            .contains("error: a --confirm id is a rotation that is not finished in the state file"),
         "{stderr}"
     );
     assert!(
-        stderr
-            .contains("::error title=rotate::rotate apply exited with code 2; nothing was changed"),
+        stderr.contains(&format!(
+            "::error title=rotate::rotate apply exited with code 2; nothing was changed. \
+             Not applied: {id}. See the job summary."
+        )),
         "{stderr}"
     );
     assert!(!stderr.contains("Nothing to apply."), "{stderr}");
@@ -1917,6 +1920,11 @@ async fn sha338_unknown_confirmed_id_exits_2() {
     let output = run.run("run.sh", &[]);
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
+    // SHA-348: the annotation lists the confirmed ids not applied.
+    assert!(
+        stderr.contains(&format!("nothing was changed. Not applied: {unknown}.")),
+        "{stderr}"
+    );
     assert_no_mutating(&run);
     let summary = run.summary();
     assert!(summary.contains("**Nothing was changed.**"), "{summary}");
@@ -2195,10 +2203,15 @@ async fn sha348_t5_upload_decision_fails_closed() {
     if !tools_present() {
         return;
     }
+    // Many awaits, then a MockServer drop, also on a failed assert: run
+    // outside the coop budget so a failure fails instead of hanging.
+    crate::common::without_coop_budget(upload_decision_cases()).await;
+}
+
+async fn upload_decision_cases() {
     let token = token_canary();
     let scratch = tempfile::tempdir().unwrap();
-    // One server for the whole test, reset between cases: dropping a
-    // MockServer after many awaits can spin on an exhausted tokio budget.
+    // One server for the whole test, reset between cases.
     let rec = CallRecorder::start().await;
     let public_notice = "::notice title=rotate::The audit artifact will not be uploaded: \
                          the repository is public";
@@ -2311,6 +2324,36 @@ async fn sha348_t5_upload_decision_fails_closed() {
         assert!(text(&output.stderr).starts_with(unknown_notice));
     }
 
+    // The lookup is for the run's repository (GITHUB_REPOSITORY), and a
+    // value that is not owner/repo, or has a `.` or `..` segment, is not
+    // requested at all: unknown, no upload.
+    for repo in [
+        "acme/..",
+        "../api",
+        "./api",
+        "acme/.",
+        "acme",
+        "acme/api/x",
+        "",
+    ] {
+        rec.server().reset().await;
+        serve_repository(
+            &rec,
+            &token,
+            ResponseTemplate::new(200).set_body_json(json!({ "visibility": "private" })),
+        )
+        .await;
+        let mut run = ActionRun::new(&rec.uri(), &token);
+        run.apply_inputs(scratch.path());
+        run.set("REPOSITORY_VISIBILITY", "");
+        run.set("GITHUB_REPOSITORY", repo);
+        let output = run.run("run.sh", &["--upload-decision"]);
+        assert_eq!(output.status.code(), Some(0), "{repo}: {output:?}");
+        assert_eq!(run.outputs()["upload-audit"], "false", "{repo}");
+        assert!(text(&output.stderr).starts_with(unknown_notice), "{repo}");
+        assert_eq!(requests(&rec).await, Vec::<String>::new(), "{repo}");
+    }
+
     // Explicit true and false are taken as given, with no request.
     for (upload, visibility) in [
         ("true", "public"),
@@ -2357,8 +2400,6 @@ async fn sha348_t5_upload_decision_fails_closed() {
         condition.contains("steps.rotate.outputs.upload-audit == 'true'"),
         "{condition}"
     );
-    tokio::task::yield_now().await;
-    drop(rec);
 }
 
 // SHA-348 T5 (AC5): in a full apply step the decision is an output before
@@ -2369,6 +2410,12 @@ async fn sha348_t5_apply_step_decides_upload_before_rotate_runs() {
     if !tools_present() {
         return;
     }
+    // A MockServer dropped each round: see common::without_coop_budget.
+    crate::common::without_coop_budget(apply_step_upload_cases()).await;
+}
+
+#[cfg(feature = "test-providers")]
+async fn apply_step_upload_cases() {
     let secret = ghp_canary();
     let token = token_canary();
     for (visibility, want) in [("private", "true"), ("public", "false")] {
@@ -2388,8 +2435,6 @@ async fn sha348_t5_apply_step_decides_upload_before_rotate_runs() {
             want == "false",
             "{stderr}"
         );
-        tokio::task::yield_now().await;
-        drop(rec);
     }
 }
 

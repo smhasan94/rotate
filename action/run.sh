@@ -67,9 +67,10 @@ DURATION='^([0-9]{1,9}[dhms])+$'
 
 # Variables replacement-env refuses (SHA-348): those rotate reads as an
 # operator credential or one-time password (src/input.rs,
-# DENIED_REPLACEMENT_VARS), the workflow token, and this Action's alerts
+# DENIED_REPLACEMENT_VARS), the workflow token, the common operator token
+# names GH_TOKEN and NODE_AUTH_TOKEN, and this Action's alerts
 # token. Names starting with ACTIONS_ or RUNNER_ are refused too.
-DENIED_REPLACEMENT_VARS="ROTATE_GITHUB_TOKEN GITHUB_TOKEN ROTATE_NPM_TOKEN NPM_TOKEN ROTATE_NPM_OTP OPENAI_ADMIN_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN ALERTS_TOKEN"
+DENIED_REPLACEMENT_VARS="ROTATE_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN ROTATE_NPM_TOKEN NPM_TOKEN NODE_AUTH_TOKEN ROTATE_NPM_OTP OPENAI_ADMIN_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN ALERTS_TOKEN"
 
 # A workflow command's message, escaped so it stays one command:
 # `%`, CR and LF are encoded as GitHub documents.
@@ -199,7 +200,12 @@ output() {
 repository_visibility() {
   local repo=${GITHUB_REPOSITORY:-} api=${API_URL%/}
   local proto=(--proto '=https' --proto-redir '=https')
+  # owner/repo with no `.` or `..` segment, as check_inputs requires of
+  # the repository input; anything else is an unknown visibility.
   [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 0
+  case /$repo/ in
+    */./* | */../*) return 0 ;;
+  esac
   case $api in
     https://*) ;;
     *) proto=(--proto '=https,http' --proto-redir '=https,http') ;;
@@ -639,27 +645,29 @@ if [ "$MODE" = apply ]; then
   # When the alerts fetched again plan nothing (an alert was resolved or a
   # secret revoked while the job waited for approval), rotate exits 0 only
   # if every confirmed rotation is already revoked, and 2 otherwise
-  # (SHA-348). Done still means every confirmed rotation is revoked;
-  # anything else is reported as not applied, exit 2.
+  # (SHA-348). Done still means every confirmed rotation is finished, as
+  # rotate counts it: revoked, with no rollback in progress; anything else
+  # is reported as not applied, exit 2.
+  unfinished=$CONFIRM
+  if [ -s "$status_path" ]; then
+    unfinished=$(jq -r --arg ids "$CONFIRM" \
+      '[.[] | select(.step == "revoked" and (.rollback_in_progress | not)) | .rotation_id] as $done
+       | [$ids | split(",")[] | select(. as $id | $done | index($id) | not)]
+       | join(",")' "$status_path" 2>/dev/null) || unfinished=$CONFIRM
+  fi
   not_applied=
-  if [ "$rotate_status" -eq 0 ]; then
-    if [ -s "$status_path" ]; then
-      not_applied=$(jq -r --arg ids "$CONFIRM" \
-        '[.[] | select(.step == "revoked") | .rotation_id] as $done
-         | [$ids | split(",")[] | select(. as $id | $done | index($id) | not)]
-         | join(",")' "$status_path" 2>/dev/null) || not_applied=$CONFIRM
-    else
-      not_applied=$CONFIRM
-    fi
-    if [ -n "$not_applied" ]; then
-      rotate_status=2
-    fi
+  if [ "$rotate_status" -eq 0 ] && [ -n "$unfinished" ]; then
+    not_applied=$unfinished
+    rotate_status=2
   fi
   case $rotate_status in
     0) ;;
     2)
       if [ -n "$not_applied" ]; then
         annotate "The confirmed rotations $not_applied were not applied: rotate apply found nothing to do for them. See the job summary."
+      elif [ -n "$unfinished" ]; then
+        # rot- ids only (checked by check_inputs or read from the status file).
+        annotate "rotate apply exited with code 2; nothing was changed. Not applied: $unfinished. See the job summary."
       else
         annotate "rotate apply exited with code 2; nothing was changed. See the job summary."
       fi

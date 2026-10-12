@@ -77,6 +77,19 @@ impl fmt::Debug for RecordedCall {
     }
 }
 
+/// Runs `body` outside tokio's cooperative budget (SHA-348).
+///
+/// Dropping a wiremock `MockServer` blocks on a tokio lock with
+/// `futures::executor::block_on`. Once a test task has used up its budget
+/// (many awaits without yielding), that lock never reports ready inside the
+/// drop and the drop spins forever, including when a failed assert unwinds
+/// through it, so CI would hang instead of failing. A test that awaits many
+/// times and drops a server, or might panic holding one, runs its body
+/// through this.
+pub async fn without_coop_budget<F: std::future::Future>(body: F) -> F::Output {
+    tokio::task::unconstrained(body).await
+}
+
 /// A wiremock server that answers every request with 200 unless a test
 /// mounts something more specific, and classifies what it received.
 pub struct CallRecorder {

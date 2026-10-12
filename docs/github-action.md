@@ -417,11 +417,14 @@ revoke time, next step and error. The step's exit code is rotate's. When
 the alerts it fetches again plan nothing, for example when an alert was
 resolved or the secret revoked while the job waited for approval, rotate
 exits 0 ("Nothing to apply.") only if every confirmed rotation is already
-at `revoked` in the state file (a re-run of a finished apply), and 2 with
-"a --confirm id is not a rotation in this plan" otherwise, having called
-nothing. As a second check, the step passes only when every confirmed
-rotation is at `revoked`; when rotate exits 0 without that, the step exits
-2 and names the rotations that were not applied.
+finished in the state file (`revoked`, no rollback in progress: a re-run
+of a finished apply), and 2 otherwise, having called nothing: "a
+--confirm id is a rotation that is not finished in the state file", or
+"... is not a rotation in this plan" for an id the state file does not
+know. The step's annotation then lists the confirmed rotations that are
+not finished. As a second check, the step passes only when every
+confirmed rotation is finished; when rotate exits 0 without that, the
+step exits 2 and names the rotations that were not applied.
 
 | Exit | Meaning | The step | The summary says |
 | --- | --- | --- | --- |
@@ -480,7 +483,10 @@ auto`, the default, uploads only when the run's repository is private or
 internal. The step reads the visibility from the event
 (`github.event.repository.visibility`, passed to the script through
 `env:`), and when the event has none (a `schedule` run) from `GET
-/repos/{owner}/{repo}` on `api-url` with the alerts token. A public
+/repos/{owner}/{repo}` on `api-url` with the alerts token. That request
+asks about the run's repository (`GITHUB_REPOSITORY`, where the artifact
+is stored), not the `repository` input: an alerts token that cannot read
+it means no upload, and a notice. A public
 repository, or one whose visibility cannot be read, gets no artifact and
 a notice saying why: the step fails closed. The decision is made before
 anything is fetched, so it holds even when the step is cancelled during
@@ -513,8 +519,9 @@ leaked secret before it touches any consumer.
 `replacement-env` must be a variable name (`[A-Za-z_][A-Za-z0-9_]*`) of
 your own. The step refuses, with exit 2 before anything is downloaded or
 fetched and without repeating the name, a variable rotate or the Action
-reads as a credential (`ROTATE_GITHUB_TOKEN`, `GITHUB_TOKEN`,
-`ROTATE_NPM_TOKEN`, `NPM_TOKEN`, `ROTATE_NPM_OTP`, `OPENAI_ADMIN_KEY`,
+reads as a credential, or a common operator token name
+(`ROTATE_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `ROTATE_NPM_TOKEN`,
+`NPM_TOKEN`, `NODE_AUTH_TOKEN`, `ROTATE_NPM_OTP`, `OPENAI_ADMIN_KEY`,
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `ALERTS_TOKEN`) and any name starting
 with `ACTIONS_` or `RUNNER_`: the replacement would be that credential.

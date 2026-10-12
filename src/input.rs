@@ -74,14 +74,18 @@ pub const REPLACEMENT_MAX: usize = 4000;
 /// (SHA-348): those rotate reads as an operator credential or one-time
 /// password (`github::TOKEN_VARS`, `npm::TOKEN_VARS`, `npm::OTP_VAR`, the
 /// default `providers.openai.admin_key_env`, and the credential variables
-/// of the AWS default chain), and the workflow token `GITHUB_TOKEN`.
+/// of the AWS default chain), the workflow token `GITHUB_TOKEN`, and the
+/// names workflows commonly give an operator token, `GH_TOKEN` (the `gh`
+/// CLI) and `NODE_AUTH_TOKEN` (`actions/setup-node`).
 /// Naming one would copy that credential into every consumer of the leaked
 /// secret.
-pub const DENIED_REPLACEMENT_VARS: [&str; 10] = [
+pub const DENIED_REPLACEMENT_VARS: [&str; 12] = [
     "ROTATE_GITHUB_TOKEN",
     "GITHUB_TOKEN",
+    "GH_TOKEN",
     "ROTATE_NPM_TOKEN",
     "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
     "ROTATE_NPM_OTP",
     "OPENAI_ADMIN_KEY",
     "AWS_ACCESS_KEY_ID",

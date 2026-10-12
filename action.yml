@@ -66,7 +66,7 @@ inputs:
     required: false
     default: "false"
   replacement-env:
-    description: "apply: name of the environment variable holding a replacement you created by hand, for providers in manual replacement mode (rotate --replacement-from-env). One rotation per run. Refused: the credential variables rotate and this Action read (ROTATE_GITHUB_TOKEN, GITHUB_TOKEN, ROTATE_NPM_TOKEN, NPM_TOKEN, ROTATE_NPM_OTP, OPENAI_ADMIN_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_CONTAINER_AUTHORIZATION_TOKEN, ALERTS_TOKEN) and names starting with ACTIONS_ or RUNNER_."
+    description: "apply: name of the environment variable holding a replacement you created by hand, for providers in manual replacement mode (rotate --replacement-from-env). One rotation per run. Refused: the credential variables rotate and this Action read (ROTATE_GITHUB_TOKEN, GITHUB_TOKEN, GH_TOKEN, ROTATE_NPM_TOKEN, NPM_TOKEN, NODE_AUTH_TOKEN, ROTATE_NPM_OTP, OPENAI_ADMIN_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_CONTAINER_AUTHORIZATION_TOKEN, ALERTS_TOKEN) and names starting with ACTIONS_ or RUNNER_."
     required: false
     default: ""
   max-wait:
