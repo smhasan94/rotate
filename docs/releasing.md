@@ -50,9 +50,12 @@ the OIDC token of the `attest` job, it says the file with that sha256 was
 built by `.github/workflows/release.yml` of this repository at the tag. The
 attestations are stored with the repository
 ([Actions, Attestations](https://github.com/smhasan94/rotate/attestations))
-and need no setup: the repository is public. `actions/attest-build-provenance`
-is pinned by commit SHA; when you update it, pin the new release's commit
-and keep the `# vX.Y.Z` comment (`tests/action.rs` checks both).
+and need no setup: the repository is public. Every action the `attest` job
+uses (`actions/download-artifact`, `actions/attest-build-provenance`) is
+pinned by commit SHA; when you update one, pin the new release's commit
+and keep the `# vX.Y.Z` comment (`tests/action.rs` checks both). The
+`verify release` and `Action install` jobs have `attestations: read`, which
+a token may need to read its own repository's attestations.
 
 To check a release by hand (`scripts/verify-release.sh vX.Y.Z` does this
 for all five files, and skips releases before 0.4.0, which have none):
@@ -62,14 +65,15 @@ gh release download vX.Y.Z -R smhasan94/rotate -D /tmp/rotate-X.Y.Z
 cd /tmp/rotate-X.Y.Z
 for file in rotate-*.tar.gz SHA256SUMS; do
   gh attestation verify "$file" --repo smhasan94/rotate \
-    --signer-workflow smhasan94/rotate/.github/workflows/release.yml \
-    --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+    --cert-identity https://github.com/smhasan94/rotate/.github/workflows/release.yml@refs/tags/vX.Y.Z \
+    --deny-self-hosted-runners
 done
 ```
 
 If `attest` fails, nothing is published; re-run the failed jobs of the
-release run. The GitHub Action and the README check these attestations on
-install (docs/github-action.md, "What the download check proves").
+release run. The GitHub Action checks these attestations on install
+(docs/github-action.md, "What the download check proves"); the README
+offers an optional command.
 
 ## Homebrew tap
 

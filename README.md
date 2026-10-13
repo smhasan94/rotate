@@ -305,17 +305,21 @@ mkdir -p ~/.local/bin && install -m 0755 rotate ~/.local/bin/rotate
 <!-- install:end -->
 
 The checksum catches a corrupted download, but `SHA256SUMS` comes from the
-same release as the tarball. From 0.4.0 on, each release also carries
-build provenance: a Sigstore-signed attestation that the tarball was
-built by this repository's release workflow at that tag. To check it,
-run this in the same shell and directory after the block (it needs the
-[GitHub CLI](https://cli.github.com), signed in), and delete
-`~/.local/bin/rotate` if it fails:
+same release as the tarball, so it cannot catch a release whose assets
+were replaced. From 0.4.0 on, each release also carries build provenance:
+a Sigstore-signed attestation that the tarball was built by this
+repository's release workflow at that tag. Releases before 0.4.0 have
+none. The block above does not check it, and by the time it ends it has
+already extracted, installed and run the binary. To check the attestation
+before anything runs, run the block's lines one at a time up to and
+including the `grep ... SHA256SUMS` checksum line, then this command
+(it needs the [GitHub CLI](https://cli.github.com), signed in), and run
+the `tar`, `install` and `--version` lines only if it succeeds:
 
 ```sh
 gh attestation verify "$NAME.tar.gz" --repo smhasan94/rotate \
-  --signer-workflow smhasan94/rotate/.github/workflows/release.yml \
-  --source-ref "refs/tags/v$VERSION" --deny-self-hosted-runners
+  --cert-identity "https://github.com/smhasan94/rotate/.github/workflows/release.yml@refs/tags/v$VERSION" \
+  --deny-self-hosted-runners
 ```
 
 Add `~/.local/bin` to your `PATH` if it is not there already. The Linux

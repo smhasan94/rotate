@@ -18,9 +18,13 @@
 #                        notice saying why not; true fails with exit 2,
 #                        before downloading, when it cannot; false skips it
 #   GH_TOKEN             token for gh (the workflow token); handed to gh
-#                        only, through its environment
+#                        only, through its environment. Empty: the
+#                        attestation cannot be checked
 #   ROTATE_RELEASE_BASE  where the release assets are (test hook); default
 #                        https://github.com/smhasan94/rotate/releases/download/v$ROTATE_VERSION
+#   ROTATE_ATTEST_BACKOFF  seconds to wait before each retry of a failed
+#                        `gh attestation verify` (test hook); default "2 5",
+#                        so three tries
 #   RUNNER_TEMP, GITHUB_SERVER_URL  set by the runner
 #
 # Works with bash 3.2 and both GNU and BSD tools.
@@ -84,10 +88,13 @@ attestation_unavailable() {
     echo "this runner is not on github.com, so the workflow token cannot read the attestation there"
   elif ! command -v gh >/dev/null 2>&1; then
     echo "gh is not installed"
+  elif [ -z "$gh_token" ]; then
+    # Rather than an authentication error that reads like tampering.
+    echo "GH_TOKEN is empty, so gh has no token to read the attestation with"
   else
     # An old gh has no `attestation` command, or lacks a flag used below.
     help=$(GH_NO_UPDATE_NOTIFIER=1 gh attestation verify --help 2>/dev/null) || help=
-    for flag in --signer-workflow --source-ref --deny-self-hosted-runners; do
+    for flag in --cert-identity --deny-self-hosted-runners; do
       case $help in
         *"$flag"*) ;;
         *)
@@ -106,6 +113,9 @@ case $ATTESTATION in
   auto | true | false) ;;
   *) fail "input verify-attestation: must be auto, true or false" 2 ;;
 esac
+BACKOFF=${ROTATE_ATTEST_BACKOFF:-2 5}
+[[ $BACKOFF =~ ^([0-9]{1,3}( [0-9]{1,3})*)?$ ]] ||
+  fail "ROTATE_ATTEST_BACKOFF: expected seconds separated by spaces" 2
 
 if [ -n "${ROTATE_BINARY:-}" ]; then
   # The path goes into GITHUB_OUTPUT, so no newline or other control
@@ -125,7 +135,9 @@ if [ -n "${ROTATE_BINARY:-}" ]; then
 fi
 
 VERSION=${ROTATE_VERSION:-}
-[[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] ||
+# At most 9 digits a component, so the version gate's arithmetic never
+# overflows.
+[[ $VERSION =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(-[0-9A-Za-z.]+)?$ ]] ||
   fail "input version: expected a release version such as 0.2.0" 2
 
 # Keep in step with the README install block (tests/action.rs checks).
@@ -192,21 +204,33 @@ fi
 echo "checksum ok: $NAME.tar.gz"
 
 # Build provenance (SHA-389): signed by release.yml in this repository at
-# this version's tag, on a GitHub-hosted runner. gh's output goes to the
-# log; the token only to gh's environment.
+# exactly this version's tag, on a GitHub-hosted runner. gh's output goes
+# to the log; the token only to gh's environment. A failure is retried
+# after each wait in BACKOFF (a flaky API or Sigstore TUF fetch), then
+# fails the step.
+verify_attestation() {
+  GH_TOKEN=$gh_token GH_HOST=github.com GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh attestation verify "$download/$NAME.tar.gz" \
+    --repo "$REPO" \
+    --cert-identity "https://github.com/$SIGNER_WORKFLOW@refs/tags/v$VERSION" \
+    --deny-self-hosted-runners 2>&1
+}
 if [ "$ATTESTATION" = false ]; then
   :
 elif [ -n "$unavailable" ]; then
   notice "The attestation of $NAME.tar.gz was not checked: $unavailable. Its checksum matches SHA256SUMS, which comes from the same release. Set verify-attestation: true to fail instead, or false to skip this notice."
 else
-  if ! GH_TOKEN=$gh_token GH_HOST=github.com GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
-    gh attestation verify "$download/$NAME.tar.gz" \
-    --repo "$REPO" \
-    --signer-workflow "$SIGNER_WORKFLOW" \
-    --source-ref "refs/tags/v$VERSION" \
-    --deny-self-hosted-runners 2>&1; then
-    fail "attestation check failed for $NAME.tar.gz; nothing was installed"
-  fi
+  verified=false
+  for delay in $BACKOFF -; do
+    if verify_attestation; then
+      verified=true
+      break
+    fi
+    [ "$delay" != - ] || break
+    echo "attestation check failed for $NAME.tar.gz; retrying in ${delay}s"
+    sleep "$delay"
+  done
+  $verified || fail "attestation check failed for $NAME.tar.gz; nothing was installed"
   echo "attestation ok: $NAME.tar.gz"
 fi
 

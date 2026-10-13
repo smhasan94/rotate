@@ -154,16 +154,20 @@ runs
 
 ```sh
 gh attestation verify <tarball> --repo smhasan94/rotate \
-  --signer-workflow smhasan94/rotate/.github/workflows/release.yml \
-  --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+  --cert-identity https://github.com/smhasan94/rotate/.github/workflows/release.yml@refs/tags/vX.Y.Z \
+  --deny-self-hosted-runners
 ```
 
 with the workflow token (`github.token`) in gh's environment only, never
-on its command line and never seen by the downloaded binary. A tarball
-replaced after the release, or uploaded by anyone or anything but that
-workflow at that tag, has no such attestation, and the step fails with
-"attestation check failed for <tarball>; nothing was installed" before the
-binary is extracted or run. What it does not prove: that the source at the
+on its command line and never seen by the downloaded binary.
+`--cert-identity` must match the signing certificate exactly: that
+workflow file, run for exactly that tag. A tarball replaced after the
+release, or uploaded by anyone or anything but that workflow at that tag,
+has no such attestation. A failed check is tried twice more, after 2 and
+then 5 seconds, in case the API or Sigstore had a transient error; then
+the step fails with
+"attestation check failed for <tarball>; nothing was installed" before
+the binary is extracted or run. What it does not prove: that the source at the
 tag is benign, or that the workflow itself was not changed by someone with
 write access to this repository; the attestation names the commit, so the
 tag still has to be one you trust. Pinning the Action by commit SHA, or
@@ -175,20 +179,27 @@ strongest options.
 - `auto` (the default) checks when it can. It cannot for a release before
   0.4.0, which has no attestation, on a runner whose GitHub is not
   github.com (GitHub Enterprise Server, GHE.com: the workflow token cannot
-  read github.com), or where `gh` is missing or too old to have
-  `gh attestation verify --signer-workflow --source-ref
-  --deny-self-hosted-runners`. Then the step prints a notice, "The
-  attestation of <tarball> was not checked: <why>", and installs on the
-  checksum alone.
+  read github.com), where `gh` is missing or too old to have
+  `gh attestation verify --cert-identity --deny-self-hosted-runners`, or
+  where the install step has no token for gh (`GH_TOKEN` empty). Then the
+  step prints a notice, "The attestation of <tarball> was not checked:
+  <why>", and installs on the checksum alone.
 - `true` requires the check: in any of those cases the step fails with
   exit code 2 before anything is downloaded.
 - `false` skips it, with no notice. Set it when you install a release
-  before 0.4.0 and do not want the notice, or when gh cannot reach
-  github.com from your runners.
+  before 0.4.0 and do not want the notice, or when your runners' egress
+  rules keep gh from reaching the two hosts the check needs:
+  `api.github.com`, for the attestations, and
+  `tuf-repo-cdn.sigstore.dev`, for Sigstore's trusted root.
 
-The workflow token needs no extra permission: the attestations of a public
-repository are public. GitHub-hosted runners have `gh`; self-hosted ones
-need it on `PATH` for the check.
+The workflow token needs no extra permission to read rotate's
+attestations: they belong to a public repository, and any token can read
+those. (A job that verifies attestations of its own repository may need
+`permissions: attestations: read`; rotate's release workflow grants it to
+its verify jobs.) The `action` workflow checks this on every pull request
+that changes the Action: a job whose token has `contents: read` only
+verifies a public `cli/cli` release asset. GitHub-hosted runners have
+`gh`; self-hosted ones need it on `PATH` for the check.
 
 ## Inputs
 

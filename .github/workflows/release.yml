@@ -149,7 +149,8 @@ jobs:
     # signed with this run's OIDC token through Sigstore public good and
     # stored with the repository's attestations. Tag pushes only, so a pull
     # request attests nothing. The only job that can mint an OIDC token or
-    # write attestations; publish waits for it.
+    # write attestations; publish waits for it. Every action it uses is
+    # pinned by commit SHA.
     name: attest
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [version, checksums]
@@ -159,12 +160,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: sha256sums
           path: dist
@@ -248,10 +249,14 @@ jobs:
 
   verify:
     # SHA-271 T1 to T3 against the published release, on Linux x86_64 and
-    # macOS aarch64.
+    # macOS aarch64. SHA-389: attestations: read, which this repository's
+    # token may need to read its own attestations.
     name: verify release (${{ matrix.os }})
     needs: [version, publish]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
     strategy:
       fail-fast: false
       matrix:
@@ -276,7 +281,8 @@ jobs:
           norm() { sed -e 's/[[:space:]]*$//' "$1" | awk 'NF { for (; b > 0; b--) print ""; print; next } { b++ }'; }
           diff <(norm notes.md) <(norm body.md)
       # SHA-389: also gh attestation verify for every tarball and
-      # SHA256SUMS, pinned to this repository, release.yml and the tag.
+      # SHA256SUMS, with --repo and an exact --cert-identity
+      # (release.yml at this tag).
       - name: checksums, attestations, --version and the plan smoke check (T2, T3)
         shell: bash
         run: scripts/verify-release.sh "$TAG"
@@ -322,10 +328,14 @@ jobs:
     # downloads the published release for the runner, checks it against
     # SHA256SUMS and prints `rotate <version>`, on Linux and macOS. SHA-389:
     # with verify-attestation true, so it also proves the attestation
-    # check passes, with the workflow token as the Action passes it.
+    # check passes, with the workflow token as the Action passes it
+    # (attestations: read, as in verify).
     name: Action install (${{ matrix.os }})
     needs: [version, publish]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
     strategy:
       fail-fast: false
       matrix:

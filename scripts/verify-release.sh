@@ -20,6 +20,11 @@
 set -euo pipefail
 
 tag=${1:?usage: scripts/verify-release.sh vX.Y.Z}
+# At most 9 digits a component, as action/install.sh requires.
+if ! [[ $tag =~ ^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(-[0-9A-Za-z.]+)?$ ]]; then
+  echo "verify-release: expected a tag such as v0.4.0" >&2
+  exit 2
+fi
 version=${tag#v}
 repo=${ROTATE_REPO:-smhasan94/rotate}
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -66,8 +71,7 @@ if [ $((10#$major)) -gt 0 ] || [ $((10#$minor)) -gt 3 ] ||
   for file in $tarballs SHA256SUMS; do
     GH_HOST=github.com GH_PROMPT_DISABLED=1 gh attestation verify "$file" \
       --repo "$repo" \
-      --signer-workflow "$repo/.github/workflows/release.yml" \
-      --source-ref "refs/tags/$tag" \
+      --cert-identity "https://github.com/$repo/.github/workflows/release.yml@refs/tags/$tag" \
       --deny-self-hosted-runners >/dev/null ||
       fail "no valid attestation for $file from $repo/.github/workflows/release.yml at $tag"
     echo "attestation ok: $file"

@@ -8,6 +8,12 @@
 # upload and download and `mode: apply` rotates the planned secret with
 # the mocks, uploading the audit log, checked the same way. No
 # credentials, no network beyond the loopback and the artifact service.
+#
+# SHA-389: `attestation-token` shows that a workflow token with
+# `contents: read` only can read another repository's public attestations,
+# as the Action's install step does in a caller's workflow: it verifies a
+# fixed, attested cli/cli release asset (network: github.com and
+# Sigstore's TUF CDN).
 name: action
 
 on:
@@ -34,6 +40,32 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  attestation-token:
+    # SHA-389: the consumer's case. No attestations permission, another
+    # repository's attestation, the flags install.sh uses.
+    name: gh attestation verify with a contents-read token
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ASSET: gh_2.101.0_linux_amd64.tar.gz
+      URL: https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_linux_amd64.tar.gz
+      SHA256: 9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+      IDENTITY: https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk
+    steps:
+      - name: download and verify a cli/cli release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh --version
+          curl --disable -fsSL --proto '=https' --proto-redir '=https' -o "$ASSET" "$URL"
+          echo "$SHA256  $ASSET" | sha256sum -c -
+          GH_HOST=github.com GH_PROMPT_DISABLED=1 gh attestation verify "$ASSET" \
+            --repo cli/cli \
+            --cert-identity "$IDENTITY" \
+            --deny-self-hosted-runners
+
   plan:
     name: uses ./ (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
