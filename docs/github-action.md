@@ -207,6 +207,13 @@ line "Dry run: nothing was changed." With no open alert in poll mode, it
 says "No open secret-scanning alerts of the supported types." The same
 Markdown is printed to the step log.
 
+An alert from a public repository is often `invalid` by the time the
+Action runs: GitHub revokes its own tokens (personal access tokens, OAuth
+and GitHub App tokens) as soon as they are pushed to a public repository
+or gist, npm revokes npm tokens the same way, and other providers may too.
+rotate does not rotate a secret that is already invalid, so update the
+places that used it by hand.
+
 The step exits with rotate's exit code: 0 when the plan was made, even
 with blockers or skipped alerts; 2 for a configuration error, whose
 message is in the summary.
@@ -291,12 +298,23 @@ In the repository's Settings, Environments, create an environment named
 
 1. **Required reviewers**: the people who may approve a rotation.
 2. **Prevent self-review**: on, so whoever started the run cannot approve
-   it.
+   it. With a single reviewer, leave it off: nobody else could approve
+   a run that reviewer started.
 3. **Deployment branches and tags**: the default branch only, so a
    workflow on another branch cannot use the environment or its secrets.
 4. **Environment secrets**: the write-capable operator credentials, which
    only the approved job can read. Keep the plan job's read-only ones as
    repository secrets.
+
+**Required reviewers depend on the GitHub plan.** On GitHub Free they
+work for public repositories only; a private or internal repository needs
+GitHub Pro, Team or Enterprise. Elsewhere, GitHub refuses the rule with
+HTTP 422, "Please ensure the billing plan supports the required reviewers
+protection rule", and may still create the environment without it. An
+environment without required reviewers approves nothing: delete it, keep
+the write-capable credentials out of GitHub, run only the plan job in the
+workflow, and run `rotate apply` from your own machine after reading the
+plan ([usage.md](usage.md)).
 
 | Provider or consumer | Write-capable credentials for the apply job |
 | --- | --- |
