@@ -130,6 +130,7 @@ Not scheduled. Nice-to-haves and deferred decisions. No estimates.
 | SHA-206 | Later: notifications on completion or failure (Slack, email) |
 | SHA-208 | Later: Windows support |
 | SHA-273 | Later: license allowlist decision for MPL-2.0 and ring before adding reqwest (blocked by SHA-212, blocks SHA-221) |
+| SHA-389 | Later: build provenance attestations for release tarballs, verified by verify-release.sh and the Action's install (`verify-attestation`) |
 
 ## Totals
 

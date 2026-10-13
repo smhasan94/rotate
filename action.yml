@@ -37,6 +37,10 @@ inputs:
     description: "Path to a rotate binary to run instead of downloading a release."
     required: false
     default: ""
+  verify-attestation:
+    description: "auto, true or false. Check the downloaded release's build provenance with gh attestation verify (releases 0.4.0 and later), after its checksum. auto checks when gh is installed and the release has attestations, and otherwise prints a notice saying why not; true fails the step instead, before downloading; false skips the check. Ignored when rotate-binary is set."
+    required: false
+    default: auto
   config:
     description: "Path to rotate.yaml. A missing file is an error unless it is the default."
     required: false
@@ -121,12 +125,17 @@ runs:
         MAX_WAIT: ${{ inputs.max-wait }}
         UPLOAD_AUDIT: ${{ inputs.upload-audit }}
         AUDIT_SUFFIX: ${{ inputs.audit-suffix }}
+        VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
       run: bash "$GITHUB_ACTION_PATH/action/run.sh" --check-inputs
+    # SHA-389: the workflow token reads the release's attestations; install.sh
+    # hands it to gh only.
     - id: install
       shell: bash
       env:
         ROTATE_VERSION: ${{ inputs.version }}
         ROTATE_BINARY: ${{ inputs.rotate-binary }}
+        ROTATE_VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
+        GH_TOKEN: ${{ github.token }}
       run: bash "$GITHUB_ACTION_PATH/action/install.sh"
     - id: rotate
       shell: bash

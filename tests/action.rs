@@ -10,6 +10,10 @@
 //! `sha338_t5`: a plan job, its state directory handed over as the
 //! artifact download leaves it, and an apply job in a fresh runner temp.
 //!
+//! SHA-389 (release attestations) adds `sha389_*`: `install.sh` with a
+//! stand-in `gh` on a `PATH` the test controls, and the release workflow,
+//! `scripts/verify-release.sh` and the README checked as text.
+//!
 //! The scripts need bash, curl and jq. Without them a test prints why and
 //! returns, except under CI (`CI` set), where a missing tool fails.
 
@@ -581,7 +585,8 @@ fn target() -> &'static str {
 }
 
 /// A release tarball whose `rotate` is a script that prints the version
-/// and, when `ROTATE_RAN_MARKER` is set, creates that file.
+/// and, when `ROTATE_RAN_MARKER` is set, writes that file: `token:set`
+/// when it saw `GH_TOKEN`, else `token:` (SHA-389).
 fn release_tarball(dir: &Path, version: &str) -> Vec<u8> {
     let stage = dir.join("stage");
     std::fs::create_dir_all(&stage).unwrap();
@@ -589,7 +594,7 @@ fn release_tarball(dir: &Path, version: &str) -> Vec<u8> {
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nif [ -n \"${{ROTATE_RAN_MARKER:-}}\" ]; then : > \"$ROTATE_RAN_MARKER\"; fi\necho \"rotate {version}\"\n"
+            "#!/bin/sh\nif [ -n \"${{ROTATE_RAN_MARKER:-}}\" ]; then echo \"token:${{GH_TOKEN:+set}}\" > \"$ROTATE_RAN_MARKER\"; fi\necho \"rotate {version}\"\n"
         ),
     )
     .unwrap();
@@ -1040,6 +1045,8 @@ fn sha198_t8_action_version_targets_and_doc_agree() {
         "upload-audit",
         // SHA-348
         "audit-suffix",
+        // SHA-389
+        "verify-attestation",
     ];
     let mut want_outputs = vec![
         "rotation-ids",
@@ -2518,4 +2525,650 @@ async fn sha348_t6_replacement_env_refused_before_any_request() {
         action_step(&action, "inputs")["env"]["REPLACEMENT_ENV"],
         "${{ inputs.replacement-env }}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// SHA-389: build provenance, checked on install
+// ---------------------------------------------------------------------------
+
+/// The first release with attestations.
+const ATTESTED: &str = "0.4.0";
+const SIGNER_WORKFLOW: &str = "smhasan94/rotate/.github/workflows/release.yml";
+
+/// What `install.sh` runs, `gh` aside. Each is linked into a directory of
+/// its own so a test decides whether `gh` is on `PATH`.
+const INSTALL_TOOLS: &str = "bash sh curl tar gzip uname mktemp rm mkdir sed grep install \
+sha256sum shasum perl cat cut tr head env dirname chmod";
+
+/// An install run of `version` against a release on `rec` with a good
+/// `SHA256SUMS` (or `sums`), `GH_TOKEN` set to `token` and `PATH` holding
+/// only the tools above: no `gh` until `stub_gh` adds one.
+struct Install {
+    run: ActionRun,
+    name: String,
+}
+
+impl Install {
+    async fn new(rec: &CallRecorder, token: &str, version: &str, sums: Option<&str>) -> Self {
+        let name = format!("rotate-{version}-{}.tar.gz", target());
+        let scratch = tempfile::tempdir().unwrap();
+        let tarball = release_tarball(scratch.path(), version);
+        let sums = match sums {
+            Some(sums) => sums.to_owned(),
+            None => format!("{}  {name}\n", hex(&Sha256::digest(&tarball))),
+        };
+        let base = format!("/download/v{version}");
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+            .with_priority(1)
+            .mount(rec.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/SHA256SUMS")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sums))
+            .with_priority(1)
+            .mount(rec.server())
+            .await;
+        let mut run = ActionRun::new(&rec.uri(), token);
+        run.set("ROTATE_VERSION", version);
+        run.set("ROTATE_BINARY", "");
+        run.set("ROTATE_RELEASE_BASE", &format!("{}{base}", rec.uri()));
+        run.set("GH_TOKEN", token);
+        let marker = run.path("ran");
+        run.set("ROTATE_RAN_MARKER", &marker.display().to_string());
+        let bin = run.path("inputs/bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        for tool in INSTALL_TOOLS.split_whitespace() {
+            if let Some(found) = std::env::split_paths(&path)
+                .map(|dir| dir.join(tool))
+                .find(|p| p.is_file())
+            {
+                std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
+            }
+        }
+        run.set("PATH", &bin.display().to_string());
+        Self { run, name }
+    }
+
+    /// Puts a stand-in `gh` on `PATH`. `gh attestation verify --help`
+    /// prints the flags `install.sh` needs (only `--repo` when `old`);
+    /// `gh attestation verify <file> ...` exits `code`. Every call appends
+    /// its argv, whether `GH_TOKEN` was set and `GH_HOST` to `gh.log`.
+    fn stub_gh(&self, code: i32, old: bool) {
+        let flags = if old {
+            "--repo"
+        } else {
+            "--repo --signer-workflow --source-ref --deny-self-hosted-runners"
+        };
+        let script = format!(
+            r#"#!/bin/sh
+{{
+  printf 'argv:'
+  for arg in "$@"; do printf ' %s' "$arg"; done
+  printf '\ntoken:%s host:%s\n' "${{GH_TOKEN:+set}}" "${{GH_HOST:-}}"
+}} >> '{log}'
+case " $* " in
+  *" --help "*) echo "{flags}"; exit 0 ;;
+esac
+[ -f "$3" ] || {{ echo "stub gh: no file $3" >&2; exit 3; }}
+echo "stub gh: exit {code}" >&2
+exit {code}
+"#,
+            log = self.gh_log().display(),
+        );
+        let gh = self.run.path("inputs/bin/gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn gh_log(&self) -> PathBuf {
+        self.run.path("inputs/gh.log")
+    }
+
+    /// The stand-in's log; `None` when `gh` was never called.
+    fn gh_calls(&self) -> Option<String> {
+        std::fs::read_to_string(self.gh_log()).ok()
+    }
+
+    fn install(&self) -> Output {
+        self.run.run("install.sh", &[])
+    }
+
+    fn marker(&self) -> Option<String> {
+        std::fs::read_to_string(self.run.path("ran")).ok()
+    }
+
+    /// `token` (the `GH_TOKEN` canary) nowhere in the streams or the files.
+    fn sweep(&self, output: &Output, token: &str) {
+        self.run.sweep(output, &[Canary::new("GH_TOKEN", token)]);
+    }
+
+    /// Installed: exit 0, the binary under `$RUNNER_TEMP/rotate/bin`, run,
+    /// and without `GH_TOKEN` in its environment.
+    fn assert_installed(&self, output: &Output) {
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert!(text(&output.stdout).contains("checksum ok"));
+        let bin = self.run.path("runner_temp/rotate/bin/rotate");
+        assert_eq!(self.run.outputs()["path"], bin.display().to_string());
+        assert_eq!(binaries_under(&self.run.path("runner_temp")), vec![bin]);
+        assert_eq!(self.marker().as_deref(), Some("token:\n"));
+    }
+
+    /// Nothing installed or run, and no download left behind.
+    fn assert_nothing_installed(&self) {
+        assert_eq!(self.marker(), None, "the binary ran");
+        assert!(!self.run.outputs().contains_key("path"));
+        let mut files = Vec::new();
+        let mut dirs = vec![self.run.path("runner_temp")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        assert_eq!(files, Vec::<PathBuf>::new(), "left behind");
+    }
+}
+
+/// The `::notice` line of an install, if any (never more than one).
+fn notice(output: &Output) -> Option<String> {
+    let stderr = text(&output.stderr);
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("::notice"))
+        .collect();
+    assert!(notices.len() <= 1, "{stderr}");
+    notices.first().map(|l| (*l).to_owned())
+}
+
+/// The `argv:` lines of the stand-in `gh`'s log.
+fn gh_argv(calls: &str) -> Vec<&str> {
+    calls.lines().filter(|l| l.starts_with("argv:")).collect()
+}
+
+// T1 (AC4): auto (or true), an attested release and gh present: gh
+// verifies the download after the checksum; a failed check installs and
+// runs nothing. The token reaches gh through its environment only, and the
+// installed binary never sees it.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha389_t1_auto_verifies_after_the_checksum() {
+    if !tools_present() {
+        return;
+    }
+    for (mode, code) in [("auto", 0), ("", 0), ("true", 0), ("auto", 1), ("true", 1)] {
+        let token = token_canary();
+        let rec = CallRecorder::start().await;
+        let mut install = Install::new(&rec, &token, ATTESTED, None).await;
+        install.stub_gh(code, false);
+        install.run.set("ROTATE_VERIFY_ATTESTATION", mode);
+        let output = install.install();
+        let stderr = text(&output.stderr);
+        let stdout = text(&output.stdout);
+        let calls = install.gh_calls().expect("gh was not called");
+        let argv = gh_argv(&calls);
+        assert_eq!(argv.len(), 2, "{calls}");
+        assert_eq!(argv[0], "argv: attestation verify --help");
+        let args: Vec<&str> = argv[1].split(' ').collect();
+        assert_eq!(args[1..3], ["attestation", "verify"], "{calls}");
+        let download = install.run.path("runner_temp/rotate");
+        assert!(
+            args[3].starts_with(&format!("{}/download.", download.display())),
+            "{calls}"
+        );
+        assert!(args[3].ends_with(&format!("/{}", install.name)), "{calls}");
+        let source_ref = format!("refs/tags/v{ATTESTED}");
+        for (flag, value) in [
+            ("--repo", "smhasan94/rotate"),
+            ("--signer-workflow", SIGNER_WORKFLOW),
+            ("--source-ref", source_ref.as_str()),
+        ] {
+            let at = args.iter().position(|a| *a == flag).expect(flag);
+            assert_eq!(args[at + 1], value, "{calls}");
+        }
+        assert!(args.contains(&"--deny-self-hosted-runners"), "{calls}");
+        // The verify call had the token and the host in its environment.
+        let env = calls.lines().skip_while(|l| *l != argv[1]).nth(1);
+        assert_eq!(env, Some("token:set host:github.com"), "{calls}");
+        assert!(!calls.contains(&token), "token in gh's argv: {calls}");
+        assert_eq!(notice(&output), None, "{stderr}");
+        if code == 0 {
+            install.assert_installed(&output);
+            assert!(
+                stdout.contains(&format!("attestation ok: {}", install.name)),
+                "{stdout}"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "attestation check failed for {}; nothing was installed",
+                    install.name
+                )),
+                "{stderr}"
+            );
+            // gh's own output reaches the log, on stdout.
+            assert!(stdout.contains("stub gh: exit 1"), "{stdout}");
+            install.assert_nothing_installed();
+        }
+        install.sweep(&output, &token);
+    }
+
+    // The checksum comes first: a mismatch stops before gh verifies.
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    let name = format!("rotate-{ATTESTED}-{}.tar.gz", target());
+    let wrong = format!("{}  {name}\n", hex(&Sha256::digest(b"tampered")));
+    let mut install = Install::new(&rec, &token, ATTESTED, Some(&wrong)).await;
+    install.stub_gh(0, false);
+    install.run.set("ROTATE_VERIFY_ATTESTATION", "true");
+    let output = install.install();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+    let calls = install.gh_calls().unwrap_or_default();
+    assert_eq!(
+        gh_argv(&calls),
+        ["argv: attestation verify --help"],
+        "{calls}"
+    );
+    install.assert_nothing_installed();
+}
+
+/// (version, stand-in gh: `None`, or `Some(old)`, GITHUB_SERVER_URL, the
+/// reason the attestation cannot be checked).
+const UNCHECKABLE: &[(&str, Option<bool>, &str, &str)] = &[
+    (ATTESTED, None, "https://github.com", "gh is not installed"),
+    ("0.3.0", Some(false), "https://github.com", "before 0.4.0"),
+    ("0.1.0", None, "https://github.com", "before 0.4.0"),
+    (
+        ATTESTED,
+        Some(false),
+        "https://ghes.example.com",
+        "not on github.com",
+    ),
+    (ATTESTED, Some(true), "https://github.com", "update gh"),
+];
+
+// T2 (AC5): auto when the attestation cannot be checked: a notice says so
+// and why, and the release installs on its checksum. gh is never asked to
+// verify, and not asked at all for a release without attestations or off
+// github.com.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha389_t2_auto_without_gh_or_attestation_notices_and_installs() {
+    if !tools_present() {
+        return;
+    }
+    for (version, gh, server, reason) in UNCHECKABLE {
+        let token = token_canary();
+        let rec = CallRecorder::start().await;
+        let mut install = Install::new(&rec, &token, version, None).await;
+        if let Some(old) = gh {
+            install.stub_gh(0, *old);
+        }
+        install.run.set("GITHUB_SERVER_URL", server);
+        install.run.set("ROTATE_VERIFY_ATTESTATION", "auto");
+        let output = install.install();
+        let stderr = text(&output.stderr);
+        install.assert_installed(&output);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        let notice = notice(&output).unwrap_or_else(|| panic!("{version}: no notice: {stderr}"));
+        assert!(
+            notice.contains(&format!("attestation of {} was not checked", install.name)),
+            "{notice}"
+        );
+        assert!(notice.contains(reason), "{version}: {notice}");
+        assert!(notice.contains("SHA256SUMS"), "{notice}");
+        let calls = install.gh_calls();
+        if reason.contains("gh") {
+            let calls = calls.unwrap_or_default();
+            assert!(
+                gh_argv(&calls)
+                    .iter()
+                    .all(|l| *l == "argv: attestation verify --help"),
+                "{calls}"
+            );
+        } else {
+            assert_eq!(calls, None, "{version}: gh was called");
+        }
+        install.sweep(&output, &token);
+    }
+}
+
+// T3 (AC6): true when the attestation cannot be checked exits 2 before
+// anything is downloaded; false never asks gh and says nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha389_t3_true_refuses_and_false_skips() {
+    if !tools_present() {
+        return;
+    }
+    for (version, gh, server, reason) in UNCHECKABLE {
+        let token = token_canary();
+        let rec = CallRecorder::start().await;
+        let mut install = Install::new(&rec, &token, version, None).await;
+        if let Some(old) = gh {
+            install.stub_gh(0, *old);
+        }
+        install.run.set("GITHUB_SERVER_URL", server);
+        install.run.set("ROTATE_VERIFY_ATTESTATION", "true");
+        let output = install.install();
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{version}: {stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.starts_with("::error title=rotate install::input verify-attestation:"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(reason), "{version}: {stderr}");
+        assert_eq!(requests(&rec).await, Vec::<String>::new(), "{version}");
+        install.assert_nothing_installed();
+        if !reason.contains("gh") {
+            assert_eq!(install.gh_calls(), None, "{version}: gh was called");
+        }
+    }
+
+    // false: no gh call, no notice, installed on the checksum.
+    for (version, gh) in [(ATTESTED, true), (ATTESTED, false), ("0.3.0", true)] {
+        let token = token_canary();
+        let rec = CallRecorder::start().await;
+        let mut install = Install::new(&rec, &token, version, None).await;
+        if gh {
+            install.stub_gh(0, false);
+        }
+        install.run.set("ROTATE_VERIFY_ATTESTATION", "false");
+        let output = install.install();
+        install.assert_installed(&output);
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        assert_eq!(install.gh_calls(), None, "{version}: gh was called");
+    }
+}
+
+// The version gate (decision 3): a release is attested when its version
+// without the pre-release suffix is above 0.3.0, with no API request. Told
+// apart by the reason `true` gives with no gh on PATH.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha389_version_gate() {
+    if !tools_present() {
+        return;
+    }
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    for (version, attested) in [
+        ("0.0.1", false),
+        ("0.2.9", false),
+        ("0.3.0", false),
+        ("0.3.0-rc.1", false),
+        ("00.03.00", false),
+        ("0.3.1", true),
+        ("0.3.10", true),
+        ("0.4.0-rc.1", true),
+        ("0.4.0", true),
+        ("0.10.0", true),
+        ("0.08.0", true),
+        ("1.0.0", true),
+        ("1.0.0-alpha", true),
+    ] {
+        let mut install = Install::new(&rec, &token, version, None).await;
+        install.run.set("ROTATE_VERIFY_ATTESTATION", "true");
+        let output = install.install();
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{version}: {stderr}");
+        let want = if attested {
+            "gh is not installed"
+        } else {
+            "before 0.4.0"
+        };
+        assert!(stderr.contains(want), "{version}: {stderr}");
+    }
+    assert_eq!(requests(&rec).await, Vec::<String>::new());
+}
+
+// T4 (AC7): a bad verify-attestation exits 2 with one line naming the
+// input, in the inputs step and in install.sh, before any request.
+#[tokio::test(flavor = "multi_thread")]
+async fn sha389_t4_bad_verify_attestation_exits_2_before_any_request() {
+    if !tools_present() {
+        return;
+    }
+    let token = token_canary();
+    let rec = CallRecorder::start().await;
+    for bad in ["maybe", "AUTO", "TRUE", "1", "auto\n::warning::injected"] {
+        for args in [&[][..], &["--check-inputs"][..]] {
+            let mut run = ActionRun::new(&rec.uri(), &token);
+            run.set("VERIFY_ATTESTATION", bad);
+            let output = run.run("run.sh", args);
+            assert_bad_input(&run, &output, "verify-attestation", bad);
+            assert!(text(&output.stderr).contains("must be auto, true or false"));
+        }
+        let mut install = Install::new(&rec, &token, ATTESTED, None).await;
+        install.stub_gh(0, false);
+        install.run.set("ROTATE_VERIFY_ATTESTATION", bad);
+        let output = install.install();
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{bad:?}: {stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.starts_with(
+                "::error title=rotate install::input verify-attestation: must be auto, true or false"
+            ),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("injected") && !stderr.contains("maybe"));
+        assert_eq!(install.gh_calls(), None);
+        install.assert_nothing_installed();
+    }
+    assert_eq!(requests(&rec).await, Vec::<String>::new());
+    for good in ["auto", "true", "false", ""] {
+        let mut run = ActionRun::new(&rec.uri(), &token);
+        run.set("VERIFY_ATTESTATION", good);
+        let output = run.run("run.sh", &["--check-inputs"]);
+        assert_eq!(output.status.code(), Some(0), "{good}: {output:?}");
+    }
+
+    // action.yml: the input, checked by the inputs step and used by the
+    // install step, with the workflow token in env: and nothing in run:.
+    let action = action_yml();
+    assert_eq!(action["inputs"]["verify-attestation"]["default"], "auto");
+    assert_eq!(
+        action_step(&action, "inputs")["env"]["VERIFY_ATTESTATION"],
+        "${{ inputs.verify-attestation }}"
+    );
+    let install = action_step(&action, "install");
+    assert_eq!(
+        install["env"]["ROTATE_VERIFY_ATTESTATION"],
+        "${{ inputs.verify-attestation }}"
+    );
+    assert_eq!(install["env"]["GH_TOKEN"], "${{ github.token }}");
+    assert!(!install["run"].as_str().unwrap().contains("${{"));
+}
+
+fn release_workflow() -> Value {
+    serde_norway::from_str(&read(".github/workflows/release.yml")).unwrap()
+}
+
+/// A job's `needs`, as a list.
+fn needs(job: &Value) -> Vec<String> {
+    match &job["needs"] {
+        Value::String(one) => vec![one.clone()],
+        Value::Array(many) => many
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+// T5 (AC1, AC2): the attest job runs on tag pushes only, after the
+// checksums and before publish, pins its action by commit SHA, and is the
+// only job that can mint an OIDC token or write attestations.
+#[test]
+fn sha389_t5_release_workflow_attests_on_tags_only() {
+    let workflow = release_workflow();
+    let text = read(".github/workflows/release.yml");
+    // Pull requests run the workflow, so the job's condition matters.
+    assert!(!workflow["on"]["pull_request"].is_null());
+    let jobs = workflow["jobs"].as_object().unwrap();
+    let attest = &jobs["attest"];
+    let condition = attest["if"].as_str().unwrap();
+    assert!(
+        condition.contains("github.event_name == 'push'")
+            && condition.contains("github.ref_type == 'tag'"),
+        "{condition}"
+    );
+    assert!(!condition.contains("||"), "{condition}");
+    assert!(needs(attest).contains(&"checksums".to_owned()));
+    assert!(needs(&jobs["publish"]).contains(&"attest".to_owned()));
+
+    // Two subjects: the four tarballs by SHA256SUMS, and SHA256SUMS.
+    let uses: Vec<&Value> = attest["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            s["uses"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("actions/attest-build-provenance@"))
+        })
+        .collect();
+    assert_eq!(uses.len(), 2);
+    for step in &uses {
+        let reference = step["uses"].as_str().unwrap();
+        let sha = reference.split_once('@').unwrap().1;
+        assert!(
+            sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{reference}"
+        );
+        let line = text.lines().find(|l| l.contains(reference)).unwrap();
+        assert!(line.contains(" # v"), "no version comment: {line}");
+    }
+    assert_eq!(uses[0]["with"]["subject-checksums"], "dist/SHA256SUMS");
+    assert_eq!(uses[1]["with"]["subject-path"], "dist/SHA256SUMS");
+
+    // The two write permissions: the attest job's alone.
+    let permissions = attest["permissions"].as_object().unwrap();
+    assert_eq!(permissions["id-token"], "write");
+    assert_eq!(permissions["attestations"], "write");
+    assert_eq!(permissions["contents"], "read");
+    assert_eq!(permissions.len(), 3);
+    let top = workflow["permissions"].as_object().unwrap();
+    assert!(!top.contains_key("id-token") && !top.contains_key("attestations"));
+    for (name, job) in jobs {
+        if name == "attest" {
+            continue;
+        }
+        if let Some(permissions) = job["permissions"].as_object() {
+            for key in ["id-token", "attestations"] {
+                assert!(!permissions.contains_key(key), "{name} has {key}");
+            }
+        }
+    }
+}
+
+/// `gh attestation verify` with the repository, the signer workflow and
+/// the tag's ref pinned, as `text` spells it on one logical line.
+fn assert_pinned_verify(what: &str, text: &str, repo: &str, workflow: &str, source_ref: &str) {
+    let joined = text.replace("\\\n", " ");
+    let line = joined
+        .lines()
+        .find(|l| l.contains("gh attestation verify ") && l.contains(" --repo "))
+        .unwrap_or_else(|| panic!("{what} has no gh attestation verify --repo"));
+    let args: Vec<&str> = line.split_whitespace().collect();
+    for (flag, value) in [
+        ("--repo", repo),
+        ("--signer-workflow", workflow),
+        ("--source-ref", source_ref),
+    ] {
+        let at = args
+            .iter()
+            .position(|a| *a == flag)
+            .unwrap_or_else(|| panic!("{what}: no {flag}: {line}"));
+        assert_eq!(args[at + 1], value, "{what}: {line}");
+    }
+    assert!(
+        args.contains(&"--deny-self-hosted-runners"),
+        "{what}: {line}"
+    );
+}
+
+// T6 (AC3), the part that runs without a release: the verify job runs
+// scripts/verify-release.sh, which verifies every tarball and SHA256SUMS
+// with the repository, release.yml and the tag pinned; the Action install
+// job requires the attestation. The live run is the next tag's release.
+#[test]
+fn sha389_t6_verify_release_pins_repo_and_workflow() {
+    let script = read("scripts/verify-release.sh");
+    assert_pinned_verify(
+        "scripts/verify-release.sh",
+        &script,
+        "\"$repo\"",
+        "\"$repo/.github/workflows/release.yml\"",
+        "\"refs/tags/$tag\"",
+    );
+    assert!(script.contains("for file in $tarballs SHA256SUMS; do"));
+    let workflow = release_workflow();
+    let verify = &workflow["jobs"]["verify"];
+    assert_eq!(verify["env"]["GH_TOKEN"], "${{ github.token }}");
+    assert!(verify["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["run"].as_str() == Some("scripts/verify-release.sh \"$TAG\"")));
+    let step = workflow["jobs"]["action-install"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("action/install.sh"))
+        })
+        .unwrap()
+        .clone();
+    assert_eq!(step["env"]["ROTATE_VERIFY_ATTESTATION"], "true");
+    assert_eq!(step["env"]["GH_TOKEN"], "${{ github.token }}");
+    let install = read("action/install.sh");
+    assert_pinned_verify(
+        "action/install.sh",
+        &install,
+        "\"$REPO\"",
+        "\"$SIGNER_WORKFLOW\"",
+        "\"refs/tags/v$VERSION\"",
+    );
+    assert!(install.contains("\nREPO=smhasan94/rotate\n"));
+    assert!(install.contains("\nSIGNER_WORKFLOW=$REPO/.github/workflows/release.yml\n"));
+}
+
+// T7 (AC8): the README's tested install block stays checksum-only and the
+// optional verify command follows it; the Action doc explains it.
+#[test]
+fn sha389_t7_readme_has_the_optional_verify_command() {
+    let readme = read("README.md");
+    let (before, after) = readme.split_once("<!-- install:end -->").unwrap();
+    let block = before.split("<!-- install:start -->").nth(1).unwrap();
+    assert!(!block.contains("attestation"), "{block}");
+    let section = &after[..after.find("\n### ").unwrap()];
+    assert_pinned_verify(
+        "README.md",
+        section,
+        "smhasan94/rotate",
+        SIGNER_WORKFLOW,
+        "\"refs/tags/v$VERSION\"",
+    );
+    let doc = read("docs/github-action.md");
+    for needle in [
+        "gh attestation verify",
+        "--signer-workflow",
+        "Sigstore",
+        "attestation check failed for <tarball>; nothing was installed",
+        "was not checked",
+    ] {
+        assert!(doc.contains(needle), "docs/github-action.md lacks {needle}");
+    }
 }

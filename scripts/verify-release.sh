@@ -5,6 +5,10 @@
 #
 # 1. Downloads the four tarballs and SHA256SUMS, checks SHA256SUMS lists
 #    exactly those four and that every checksum verifies (AC2).
+#    SHA-389: `gh attestation verify` for each tarball and SHA256SUMS,
+#    signed by .github/workflows/release.yml of the repository at the tag.
+#    Needs gh, signed in or with GH_TOKEN. Releases up to 0.3.0 have no
+#    attestations; for them this step says so and is skipped.
 # 2. Extracts the tarball for this host and checks `rotate --version`
 #    prints `rotate <version>` (AC2).
 # 3. Smoke check (AC3): `rotate plan` on tests/fixtures/trufflehog.ndjson
@@ -50,6 +54,27 @@ listed=$(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort)
 [ "$listed" = "$expected" ] || fail "SHA256SUMS does not list exactly the four tarballs: $listed"
 sha256_check SHA256SUMS
 echo "checksums: ok"
+
+# Build provenance (SHA-389), after 0.3.0 (pre-release suffix aside), as
+# action/install.sh decides.
+core=${version%%-*}
+major=${core%%.*} rest=${core#*.}
+minor=${rest%%.*} patch=${rest#*.}
+if [ $((10#$major)) -gt 0 ] || [ $((10#$minor)) -gt 3 ] ||
+  { [ $((10#$minor)) -eq 3 ] && [ $((10#$patch)) -gt 0 ]; }; then
+  tarballs=$(for target in $targets; do echo "rotate-$version-$target.tar.gz"; done)
+  for file in $tarballs SHA256SUMS; do
+    GH_HOST=github.com GH_PROMPT_DISABLED=1 gh attestation verify "$file" \
+      --repo "$repo" \
+      --signer-workflow "$repo/.github/workflows/release.yml" \
+      --source-ref "refs/tags/$tag" \
+      --deny-self-hosted-runners >/dev/null ||
+      fail "no valid attestation for $file from $repo/.github/workflows/release.yml at $tag"
+    echo "attestation ok: $file"
+  done
+else
+  echo "attestations: none before v0.4.0, skipped"
+fi
 
 # 2. The host's binary.
 case "$(uname -s)-$(uname -m)" in

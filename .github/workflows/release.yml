@@ -1,8 +1,9 @@
 # Release binaries for Linux and macOS (SHA-215).
 #
 # A tag push `v*` builds four targets, checks the tag matches Cargo.toml,
-# and publishes a GitHub Release with four tarballs and SHA256SUMS and the
-# CHANGELOG.md section as its notes. Then it downloads them back and
+# attests their build provenance (SHA-389), and publishes a GitHub Release
+# with four tarballs and SHA256SUMS and the CHANGELOG.md section as its
+# notes. Then it downloads them back and
 # verifies them on Linux and macOS (scripts/verify-release.sh), and runs
 # the README install block on a clean Linux container and on macOS
 # (SHA-271), and installs it through the GitHub Action's install script
@@ -11,7 +12,8 @@
 # installs rotate from the tap on macOS (SHA-339).
 #
 # A pull request that changes this workflow, or a manual run, does the same
-# build, smoke test, packaging and checksums but never publishes.
+# build, smoke test, packaging and checksums but never attests or
+# publishes.
 name: release
 
 on:
@@ -142,6 +144,48 @@ jobs:
           path: dist/SHA256SUMS
           if-no-files-found: error
 
+  attest:
+    # SHA-389: build provenance for the four tarballs and SHA256SUMS,
+    # signed with this run's OIDC token through Sigstore public good and
+    # stored with the repository's attestations. Tag pushes only, so a pull
+    # request attests nothing. The only job that can mint an OIDC token or
+    # write attestations; publish waits for it.
+    name: attest
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+          path: dist
+      - name: SHA256SUMS lists the four tarballs
+        shell: bash
+        working-directory: dist
+        run: |
+          set -- ./rotate-*.tar.gz
+          if [ "$#" -ne 4 ] || [ "$(wc -l < SHA256SUMS)" -ne 4 ]; then
+            echo "expected 4 tarballs, each in SHA256SUMS"
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+      # The four tarballs, by the digests in SHA256SUMS.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/SHA256SUMS
+
   notes:
     # SHA-271: the release notes are the CHANGELOG.md section for this
     # version. Runs on pull requests too, so a missing section fails early.
@@ -170,11 +214,13 @@ jobs:
           if-no-files-found: error
 
   publish:
-    # AC1. The only job with write access, and the only one that runs on a
-    # tag alone. No third-party actions here.
+    # AC1. The only job with write access to the repository's contents, and
+    # with attest the only ones that run on a tag alone. No third-party
+    # actions here. Waits for attest (SHA-389), so nothing is published
+    # without its attestations.
     name: publish
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [version, build, checksums, notes]
+    needs: [version, build, checksums, attest, notes]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -229,7 +275,9 @@ jobs:
           # Trailing spaces, CRs and blank lines at the end do not count.
           norm() { sed -e 's/[[:space:]]*$//' "$1" | awk 'NF { for (; b > 0; b--) print ""; print; next } { b++ }'; }
           diff <(norm notes.md) <(norm body.md)
-      - name: checksums, --version and the plan smoke check (T2, T3)
+      # SHA-389: also gh attestation verify for every tarball and
+      # SHA256SUMS, pinned to this repository, release.yml and the tag.
+      - name: checksums, attestations, --version and the plan smoke check (T2, T3)
         shell: bash
         run: scripts/verify-release.sh "$TAG"
 
@@ -272,7 +320,9 @@ jobs:
   action-install:
     # SHA-198 T9: action/install.sh, the GitHub Action's install step,
     # downloads the published release for the runner, checks it against
-    # SHA256SUMS and prints `rotate <version>`, on Linux and macOS.
+    # SHA256SUMS and prints `rotate <version>`, on Linux and macOS. SHA-389:
+    # with verify-attestation true, so it also proves the attestation
+    # check passes, with the workflow token as the Action passes it.
     name: Action install (${{ matrix.os }})
     needs: [version, publish]
     runs-on: ${{ matrix.os }}
@@ -289,6 +339,8 @@ jobs:
         env:
           ROTATE_VERSION: ${{ needs.version.outputs.version }}
           ROTATE_BINARY: ""
+          ROTATE_VERIFY_ATTESTATION: "true"
+          GH_TOKEN: ${{ github.token }}
         run: |
           out=$(bash action/install.sh)
           echo "$out"

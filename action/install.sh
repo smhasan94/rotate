@@ -3,19 +3,37 @@
 #
 # With ROTATE_BINARY set, checks that binary runs and uses it. Otherwise
 # downloads the release tarball for this runner and SHA256SUMS, checks the
-# checksum, and installs the binary under $RUNNER_TEMP/rotate/bin. A
-# checksum mismatch removes the download and fails before the binary is
-# run. Writes `path=<binary>` to $GITHUB_OUTPUT.
+# checksum, checks the tarball's build provenance with `gh attestation
+# verify` (SHA-389), and installs the binary under $RUNNER_TEMP/rotate/bin.
+# A checksum mismatch or a failed attestation check removes the download
+# and fails before the binary is run. Writes `path=<binary>` to
+# $GITHUB_OUTPUT.
 #
 # Environment:
 #   ROTATE_VERSION       release to install, such as 0.2.0
 #   ROTATE_BINARY        a binary to use instead of downloading one
+#   ROTATE_VERIFY_ATTESTATION
+#                        auto (also when empty), true or false. auto checks
+#                        the attestation when it can and otherwise prints a
+#                        notice saying why not; true fails with exit 2,
+#                        before downloading, when it cannot; false skips it
+#   GH_TOKEN             token for gh (the workflow token); handed to gh
+#                        only, through its environment
 #   ROTATE_RELEASE_BASE  where the release assets are (test hook); default
 #                        https://github.com/smhasan94/rotate/releases/download/v$ROTATE_VERSION
-#   RUNNER_TEMP          set by the runner
+#   RUNNER_TEMP, GITHUB_SERVER_URL  set by the runner
 #
 # Works with bash 3.2 and both GNU and BSD tools.
 set -euo pipefail
+
+REPO=smhasan94/rotate
+# The workflow that builds, attests and publishes a release.
+SIGNER_WORKFLOW=$REPO/.github/workflows/release.yml
+
+# gh gets the token in its own environment; nothing else this script runs,
+# the downloaded binary included, sees it.
+gh_token=${GH_TOKEN:-}
+unset GH_TOKEN
 
 # An error annotation, escaped so it stays one workflow command, then exit.
 fail() {
@@ -27,13 +45,67 @@ fail() {
   exit "${2:-1}"
 }
 
+notice() {
+  local message=$1
+  message=${message//%/%25}
+  message=${message//$'\r'/%0D}
+  message=${message//$'\n'/%0A}
+  printf '::notice title=rotate install::%s\n' "$message" >&2
+}
+
 output() {
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
   fi
 }
 
+# Whether release $1 has attestations: those after 0.3.0, the last one
+# published before the release workflow attested (SHA-389). The
+# pre-release suffix does not count, so 0.4.0-rc.1 has them. No API
+# request.
+attested_version() {
+  local core=${1%%-*}
+  local major=${core%%.*} rest=${core#*.}
+  local minor=${rest%%.*} patch=${rest#*.}
+  major=$((10#$major))
+  minor=$((10#$minor))
+  patch=$((10#$patch))
+  [ "$major" -gt 0 ] || [ "$minor" -gt 3 ] || { [ "$minor" -eq 3 ] && [ "$patch" -gt 0 ]; }
+}
+
+# Why the attestation of release $1 cannot be checked here, or nothing
+# when it can.
+attestation_unavailable() {
+  local help flag
+  if ! attested_version "$1"; then
+    echo "rotate $1 was released before 0.4.0, the first release with attestations"
+  elif [ -n "${GITHUB_SERVER_URL:-}" ] && [ "$GITHUB_SERVER_URL" != https://github.com ]; then
+    # GHES or GHE.com: the workflow token cannot read github.com.
+    echo "this runner is not on github.com, so the workflow token cannot read the attestation there"
+  elif ! command -v gh >/dev/null 2>&1; then
+    echo "gh is not installed"
+  else
+    # An old gh has no `attestation` command, or lacks a flag used below.
+    help=$(GH_NO_UPDATE_NOTIFIER=1 gh attestation verify --help 2>/dev/null) || help=
+    for flag in --signer-workflow --source-ref --deny-self-hosted-runners; do
+      case $help in
+        *"$flag"*) ;;
+        *)
+          echo "this gh has no gh attestation verify $flag; update gh"
+          return 0
+          ;;
+      esac
+    done
+  fi
+}
+
 [ -n "${RUNNER_TEMP:-}" ] || fail "RUNNER_TEMP is not set"
+
+ATTESTATION=${ROTATE_VERIFY_ATTESTATION:-auto}
+case $ATTESTATION in
+  auto | true | false) ;;
+  *) fail "input verify-attestation: must be auto, true or false" 2 ;;
+esac
 
 if [ -n "${ROTATE_BINARY:-}" ]; then
   # The path goes into GITHUB_OUTPUT, so no newline or other control
@@ -65,8 +137,17 @@ case "$(uname -s)-$(uname -m)" in
   *) fail "no rotate release binary for $(uname -s) $(uname -m)" ;;
 esac
 NAME="rotate-$VERSION-$TARGET"
-BASE=${ROTATE_RELEASE_BASE:-https://github.com/smhasan94/rotate/releases/download/v$VERSION}
+BASE=${ROTATE_RELEASE_BASE:-https://github.com/$REPO/releases/download/v$VERSION}
 BASE=${BASE%/}
+
+# SHA-389: decided before anything is downloaded, so `true` fails first.
+unavailable=
+if [ "$ATTESTATION" != false ]; then
+  unavailable=$(attestation_unavailable "$VERSION")
+fi
+if [ "$ATTESTATION" = true ] && [ -n "$unavailable" ]; then
+  fail "input verify-attestation: is true, but the attestation of $NAME.tar.gz cannot be checked: $unavailable" 2
+fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256_check() { sha256sum -c -; }
@@ -109,6 +190,25 @@ if ! (cd "$download" && printf '%s\n' "$line" | sha256_check >/dev/null 2>&1); t
   fail "checksum mismatch for $NAME.tar.gz: SHA256SUMS does not match the download; nothing was installed"
 fi
 echo "checksum ok: $NAME.tar.gz"
+
+# Build provenance (SHA-389): signed by release.yml in this repository at
+# this version's tag, on a GitHub-hosted runner. gh's output goes to the
+# log; the token only to gh's environment.
+if [ "$ATTESTATION" = false ]; then
+  :
+elif [ -n "$unavailable" ]; then
+  notice "The attestation of $NAME.tar.gz was not checked: $unavailable. Its checksum matches SHA256SUMS, which comes from the same release. Set verify-attestation: true to fail instead, or false to skip this notice."
+else
+  if ! GH_TOKEN=$gh_token GH_HOST=github.com GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh attestation verify "$download/$NAME.tar.gz" \
+    --repo "$REPO" \
+    --signer-workflow "$SIGNER_WORKFLOW" \
+    --source-ref "refs/tags/v$VERSION" \
+    --deny-self-hosted-runners 2>&1; then
+    fail "attestation check failed for $NAME.tar.gz; nothing was installed"
+  fi
+  echo "attestation ok: $NAME.tar.gz"
+fi
 
 tar -xzf "$download/$NAME.tar.gz" -C "$download" rotate ||
   fail "$NAME.tar.gz has no rotate binary"
