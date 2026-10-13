@@ -10,6 +10,11 @@ All notable changes to rotate are recorded here. The format follows
 
 - The GitHub Action's `audit-suffix` input, appended to the audit
   artifact's name so two apply steps in one run do not collide. (SHA-348)
+- The GitHub Action's `verify-attestation` input, `auto` by default: the
+  install step checks the release tarball's build provenance with
+  `gh attestation verify` after the checksum, and prints a notice when it
+  cannot (no `gh`, no token, a release before 0.4.0). `true` fails instead;
+  `false` skips the check. (SHA-389)
 
 ### Changed
 
@@ -30,6 +35,11 @@ All notable changes to rotate are recorded here. The format follows
   configured OpenAI admin key variable and `ACTIONS_` and `RUNNER_`
   variables, with exit 2 before any call. A wrong name would have written
   an operator credential into every consumer. (SHA-348)
+- Release tarballs and `SHA256SUMS` carry a build provenance attestation
+  from the release workflow, from 0.4.0 on. A checksum only proves the
+  download matches a file in the same release; the attestation proves
+  `release.yml` built it at that tag. The README shows how to check it
+  with `gh attestation verify`. (SHA-389)
 
 ## [0.3.0] - 2026-10-11
 
