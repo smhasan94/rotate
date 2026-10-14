@@ -138,15 +138,68 @@ provider's default, but by then the requests have been made.
 - Keep `alerts-token` and the operator credentials in an environment or
   repository secret that pull requests from forks cannot read.
 
-**What the download check proves.** `install.sh` compares the tarball with
-the release's `SHA256SUMS`. Both files come from the same GitHub Release,
-so the check detects a corrupted or truncated download, not a release
-whose assets were replaced: whoever can replace the tarball can replace
-`SHA256SUMS` too. The release workflow publishes no signature or build
-attestation today. Until it does, pin the Action by commit SHA, or build
-rotate yourself and pass it in `rotate-binary`. (Follow-up: publish build
-provenance with `actions/attest-build-provenance` and have `install.sh`
-check it with `gh attestation verify` when `gh` is available.)
+**What the download check proves.** `install.sh` first compares the
+tarball with the release's `SHA256SUMS`. Both files come from the same
+GitHub Release, so the checksum detects a corrupted or truncated download,
+not a release whose assets were replaced: whoever can replace the tarball
+can replace `SHA256SUMS` too.
+
+From 0.4.0 on, the release workflow also attests each tarball's build
+provenance with `actions/attest-build-provenance`: a statement, signed
+with a short-lived Sigstore certificate issued to the workflow run and
+logged in Sigstore's public transparency log, that the tarball with this
+digest was built by `.github/workflows/release.yml` in
+`smhasan94/rotate` at the release tag. After the checksum, `install.sh`
+runs
+
+```sh
+gh attestation verify <tarball> --repo smhasan94/rotate \
+  --cert-identity https://github.com/smhasan94/rotate/.github/workflows/release.yml@refs/tags/vX.Y.Z \
+  --deny-self-hosted-runners
+```
+
+with the workflow token (`github.token`) in gh's environment only, never
+on its command line and never seen by the downloaded binary.
+`--cert-identity` must match the signing certificate exactly: that
+workflow file, run for exactly that tag. A tarball replaced after the
+release, or uploaded by anyone or anything but that workflow at that tag,
+has no such attestation. A failed check is tried twice more, after 2 and
+then 5 seconds, in case the API or Sigstore had a transient error; then
+the step fails with
+"attestation check failed for <tarball>; nothing was installed" before
+the binary is extracted or run. What it does not prove: that the source at the
+tag is benign, or that the workflow itself was not changed by someone with
+write access to this repository; the attestation names the commit, so the
+tag still has to be one you trust. Pinning the Action by commit SHA, or
+building rotate yourself and passing it in `rotate-binary`, remain the
+strongest options.
+
+`verify-attestation` decides what happens when the check cannot run:
+
+- `auto` (the default) checks when it can. It cannot for a release before
+  0.4.0, which has no attestation, on a runner whose GitHub is not
+  github.com (GitHub Enterprise Server, GHE.com: the workflow token cannot
+  read github.com), where `gh` is missing or too old to have
+  `gh attestation verify --cert-identity --deny-self-hosted-runners`, or
+  where the install step has no token for gh (`GH_TOKEN` empty). Then the
+  step prints a notice, "The attestation of <tarball> was not checked:
+  <why>", and installs on the checksum alone.
+- `true` requires the check: in any of those cases the step fails with
+  exit code 2 before anything is downloaded.
+- `false` skips it, with no notice. Set it when you install a release
+  before 0.4.0 and do not want the notice, or when your runners' egress
+  rules keep gh from reaching the two hosts the check needs:
+  `api.github.com`, for the attestations, and
+  `tuf-repo-cdn.sigstore.dev`, for Sigstore's trusted root.
+
+The workflow token needs no extra permission to read rotate's
+attestations: they belong to a public repository, and any token can read
+those. (A job that verifies attestations of its own repository may need
+`permissions: attestations: read`; rotate's release workflow grants it to
+its verify jobs.) The `action` workflow checks this on every pull request
+that changes the Action: a job whose token has `contents: read` only
+verifies a public `cli/cli` release asset. GitHub-hosted runners have
+`gh`; self-hosted ones need it on `PATH` for the check.
 
 ## Inputs
 
@@ -158,6 +211,7 @@ check it with `gh attestation verify` when `gh` is available.)
 | `api-url` | `${{ github.api_url }}` | GitHub REST API base URL; set for GitHub Enterprise Server. `https`, or `http` to a loopback address only. |
 | `version` | the release the Action is pinned to | rotate release to download. Ignored when `rotate-binary` is set. |
 | `rotate-binary` | `""` | Path to a rotate binary to run instead of downloading one, for self-hosted runners and mirrors. |
+| `verify-attestation` | `auto` | `auto`, `true` or `false`. After the checksum, check the downloaded release's build provenance with `gh attestation verify` (releases 0.4.0 and later). `auto` checks when it can and otherwise prints a notice saying why not; `true` fails with exit 2, before downloading, when it cannot; `false` skips the check. Ignored when `rotate-binary` is set ([What the download check proves](#security)). |
 | `config` | `rotate.yaml` | Path to `rotate.yaml`, relative to the workspace. A missing file is an error unless it is the default. Take it from a trusted ref only ([Security](#security)). |
 | `mode` | `plan` | `plan` makes no change. `apply` applies the confirmed rotations; use it only in a job behind an environment approval ([Apply behind an approval](#apply-behind-an-approval)). |
 | `verbose` | `0` | rotate's log verbosity, `0` to `3` (`-v` to `-vvv`). Logs are redacted at every level. |
@@ -174,8 +228,10 @@ Inputs reach the scripts through environment variables, never through
 `run:` text, so a hostile `client_payload` cannot inject shell. They are
 checked before anything is downloaded or fetched: an `alert-number` that is
 not digits and commas, a `repository` that is not `owner/repo`, an empty
-`alerts-token`, a `confirm` that is not rotation ids, an apply-only input
-in plan mode, or an apply without `confirm` or `state-dir` fails the step
+`alerts-token`, a `confirm` that is not rotation ids, a
+`verify-attestation` that is not `auto`, `true` or `false`, an apply-only
+input in plan mode, or an apply without `confirm` or `state-dir` fails the
+step
 with exit code 2 and one line naming the input. The line never repeats the
 value.
 
@@ -586,5 +642,8 @@ and commas before using it.
   run.
 - Linux and macOS runners (x86_64 and aarch64). Self-hosted runners need
   `bash`, `curl`, `jq`, `tar` and `sha256sum` or `shasum`, all present on
-  GitHub-hosted runners.
+  GitHub-hosted runners, and `gh` for the attestation check
+  (`verify-attestation`).
+- Releases before 0.4.0 have no attestation; `verify-attestation: auto`
+  installs them on the checksum alone, with a notice.
 - No marketplace listing yet.

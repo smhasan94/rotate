@@ -30,16 +30,50 @@ published to crates.io (the name `rotate` is taken there).
 | `version check` | Fails unless the tag is `v` plus the `Cargo.toml` version. |
 | `build` | Builds and smoke-tests `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, and packs `rotate-<version>-<target>.tar.gz`. |
 | `checksums` | Writes `SHA256SUMS` for the four tarballs. |
+| `attest` | Tag pushes only. Checks `SHA256SUMS` against the four tarballs and attests their build provenance, and that of `SHA256SUMS`, with `actions/attest-build-provenance` (below). The only job with `id-token: write` and `attestations: write`. |
 | `release notes` | Takes the `CHANGELOG.md` section as the notes and checks the README install block names the version. |
-| `publish` | Creates the GitHub Release with the four tarballs and `SHA256SUMS`. The only job with write access to this repository. |
-| `verify release` | Downloads the published assets on Linux and macOS, checks every checksum, `rotate --version` and a `rotate plan` smoke run. |
+| `publish` | Creates the GitHub Release with the four tarballs and `SHA256SUMS`, after `attest`. The only job with write access to this repository's contents. |
+| `verify release` | Downloads the published assets on Linux and macOS, checks every checksum and every attestation, `rotate --version` and a `rotate plan` smoke run. |
 | `README install` | Runs the README install block on Debian and macOS. |
-| `Action install` | Runs `action/install.sh`, as the GitHub Action does, on Linux and macOS and checks it prints `rotate <version>`. |
+| `Action install` | Runs `action/install.sh`, as the GitHub Action does, with `verify-attestation` `true`, on Linux and macOS and checks it prints `rotate <version>`. |
 | `homebrew tap` | Updates `Formula/rotate.rb` in the tap (below). |
 | `brew install` | Runs `brew install smhasan94/rotate/rotate` on macOS, checks `rotate --version` prints the new version and runs `brew test`. |
 
 A pull request that changes the workflow or `scripts/` runs everything up
-to `release notes` and publishes nothing.
+to `release notes` and attests and publishes nothing.
+
+## Build provenance
+
+From 0.4.0 on, every release tarball and `SHA256SUMS` has a build
+provenance attestation (SHA-389): signed through Sigstore public good with
+the OIDC token of the `attest` job, it says the file with that sha256 was
+built by `.github/workflows/release.yml` of this repository at the tag. The
+attestations are stored with the repository
+([Actions, Attestations](https://github.com/smhasan94/rotate/attestations))
+and need no setup: the repository is public. Every action the `attest` job
+uses (`actions/download-artifact`, `actions/attest-build-provenance`) is
+pinned by commit SHA; when you update one, pin the new release's commit
+and keep the `# vX.Y.Z` comment (`tests/action.rs` checks both). The
+`verify release` and `Action install` jobs have `attestations: read`, which
+a token may need to read its own repository's attestations.
+
+To check a release by hand (`scripts/verify-release.sh vX.Y.Z` does this
+for all five files, and skips releases before 0.4.0, which have none):
+
+```sh
+gh release download vX.Y.Z -R smhasan94/rotate -D /tmp/rotate-X.Y.Z
+cd /tmp/rotate-X.Y.Z
+for file in rotate-*.tar.gz SHA256SUMS; do
+  gh attestation verify "$file" --repo smhasan94/rotate \
+    --cert-identity https://github.com/smhasan94/rotate/.github/workflows/release.yml@refs/tags/vX.Y.Z \
+    --deny-self-hosted-runners
+done
+```
+
+If `attest` fails, nothing is published; re-run the failed jobs of the
+release run. The GitHub Action checks these attestations on install
+(docs/github-action.md, "What the download check proves"); the README
+offers an optional command.
 
 ## Homebrew tap
 

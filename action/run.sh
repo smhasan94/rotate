@@ -29,6 +29,8 @@
 #   UPLOAD_AUDIT        auto, true or false: whether action.yml uploads
 #                       the audit log (the upload-audit output)
 #   AUDIT_SUFFIX        apply: "", or the audit artifact's name suffix
+#   VERIFY_ATTESTATION  auto, true or false: install.sh's attestation check
+#                       (SHA-389); only validated here
 #   REPOSITORY_VISIBILITY  github.event.repository.visibility, or ""
 #   CONFIRM             apply: rotation ids from the plan, comma-separated
 #   FORCE               apply: true or false (--force)
@@ -133,6 +135,10 @@ check_inputs() {
   case ${UPLOAD_AUDIT:-auto} in
     auto | true | false) ;;
     *) bad_input "upload-audit: must be auto, true or false" ;;
+  esac
+  case ${VERIFY_ATTESTATION:-auto} in
+    auto | true | false) ;;
+    *) bad_input "verify-attestation: must be auto, true or false" ;;
   esac
   if [ -n "${AUDIT_SUFFIX:-}" ] && ! [[ $AUDIT_SUFFIX =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
     bad_input "audit-suffix: must be 1 to 40 letters, digits, '.', '_' or '-'"
