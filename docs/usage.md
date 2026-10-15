@@ -38,7 +38,7 @@ checks the tarball was built by the release workflow. With Homebrew
 Or build from source with Rust stable 1.94.1 or newer:
 
 ```sh
-cargo install --git https://github.com/smhasan94/rotate --tag v0.3.0 --locked
+cargo install --git https://github.com/smhasan94/rotate --tag v0.4.0 --locked
 rotate --version
 rotate --help
 ```

@@ -20,10 +20,11 @@ OpenAI API keys.
 
 ## Status
 
-The latest release is v0.3.0, the first with the GitHub Action. v0.1.0
-was the first release: the MVP flow end to end, with prebuilt Linux and
-macOS binaries (see [Install](#install)). What changed in each version is
-in [CHANGELOG.md](CHANGELOG.md).
+The latest release is v0.4.0, the first with build provenance
+attestations on its binaries. v0.3.0 was the first with the GitHub
+Action. v0.1.0 was the first release: the MVP flow end to end, with
+prebuilt Linux and macOS binaries (see [Install](#install)). What changed
+in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 What works now:
 
@@ -287,7 +288,7 @@ checksum and installs it in `~/.local/bin`:
 
 <!-- install:start -->
 ```sh
-VERSION=0.3.0
+VERSION=0.4.0
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) TARGET=x86_64-unknown-linux-gnu ;;
   Linux-aarch64) TARGET=aarch64-unknown-linux-gnu ;;

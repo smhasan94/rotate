@@ -6,6 +6,17 @@ All notable changes to rotate are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+Verifiable release binaries and a safer apply Action. Every release
+tarball now carries a build provenance attestation from the release
+workflow, and the GitHub Action checks it on install by default. The
+Action's apply refuses to write rotate's own credentials into consumers
+and, by default, uploads the audit artifact only for private or internal
+repositories. One change can affect scripts: `rotate apply --confirm` on
+a plan with nothing to apply now exits 2 unless every confirmed rotation
+is finished.
+
 ### Added
 
 - The GitHub Action's `audit-suffix` input, appended to the audit
@@ -40,6 +51,37 @@ All notable changes to rotate are recorded here. The format follows
   download matches a file in the same release; the attestation proves
   `release.yml` built it at that tag. The README shows how to check it
   with `gh attestation verify`. (SHA-389)
+- rustls 0.23.46, for RUSTSEC-2026-0346 and RUSTSEC-2026-0347. rotate
+  configures no Encrypted Client Hello and never prints TLS session
+  values, so neither affected it. (SHA-390)
+
+### Known limits
+
+- Only the GitHub Actions secret consumer has been tested against the live
+  service (`ROTATE_LIVE_TESTS=1`, see docs/live-tests.md). AWS, npm and
+  OpenAI are tested against mock servers built from the providers'
+  documentation. Run `rotate plan` first and review the plan before
+  `rotate apply`.
+- GitHub and npm tokens are rotated in manual replacement mode: you create
+  the new token and paste it. OpenAI keys are manual too, unless you opt in
+  to a broader replacement. In the GitHub Action the replacement comes from
+  the `replacement-env` input.
+- npm revoke needs an `npm login` session token as the operator token,
+  which lasts two hours. An account that asks for a one-time password
+  needs a terminal or `ROTATE_NPM_OTP` at the moment of the revoke, so an
+  unattended run with an overlap window cannot revoke it.
+- AWS keys are deactivated, not deleted. After a rollback the replacement
+  key stays inactive on the IAM user; delete it yourself.
+- OpenAI keys without an Admin API key, GitHub App installation tokens and
+  legacy-format GitHub tokens end in revoke by hand.
+- The GitHub Action's apply waits out the overlap window inside the job
+  (up to `max-wait`); a pending revoke is not resumed by a later workflow
+  run. It reads at most 100 alerts per poll and is not on the Marketplace.
+- The Homebrew formula and the README install block check only the
+  checksum. The attestation is checked by the GitHub Action, by
+  `scripts/verify-release.sh` and by the optional `gh attestation verify`
+  command in the README.
+- No `--json` for `apply` or `rollback` yet. No Windows build.
 
 ## [0.3.0] - 2026-10-11
 
@@ -258,7 +300,8 @@ revoked secret, for four providers and two consumers.
   needs `rotate rollback`, then `rotate apply` again.
 - No `--json` for `apply` or `rollback` yet. No Windows build.
 
-[Unreleased]: https://github.com/smhasan94/rotate/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/smhasan94/rotate/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/smhasan94/rotate/releases/tag/v0.4.0
 [0.3.0]: https://github.com/smhasan94/rotate/releases/tag/v0.3.0
 [0.2.0]: https://github.com/smhasan94/rotate/releases/tag/v0.2.0
 [0.1.0]: https://github.com/smhasan94/rotate/releases/tag/v0.1.0
